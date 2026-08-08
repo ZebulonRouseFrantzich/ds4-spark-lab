@@ -1,0 +1,8 @@
+[submodule "engine/ds4"]
+	path = engine/ds4
+	url = https://github.com/ZebulonRouseFrantzich/ds4.git
+	branch = spark
+[submodule "spark/ds4-on-spark"]
+	path = spark/ds4-on-spark
+	url = https://github.com/ZebulonRouseFrantzich/ds4-on-spark.git
+	branch = spark
