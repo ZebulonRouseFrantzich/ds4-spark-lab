@@ -106,6 +106,7 @@ tool-versions:
     rsync --version | sed -n '1p'
     shellcheck --version | sed -n '1,2p'
     treefmt --version
+    printf '\n'
 
 # Initialize submodules and configure their required public remotes.
 submodules:
@@ -120,13 +121,13 @@ submodules:
         local expected="$2"
         local actual
 
-        if ! actual="$(git -C "$path" remote get-url origin 2>/dev/null)"; then
+        if ! actual="$(git -C "$path" remote get-url --all origin 2>/dev/null)"; then
             printf 'submodules: missing origin remote for %s\n' "$path" >&2
             return 1
         fi
         if [[ "$actual" != "$expected" ]]; then
-            printf 'submodules: origin URL mismatch for %s: expected %s, got %s\n' \
-                "$path" "$expected" "$actual" >&2
+            printf 'submodules: origin URL mismatch for %s: expected %s\n' \
+                "$path" "$expected" >&2
             return 1
         fi
     }
@@ -137,10 +138,10 @@ submodules:
         local expected="$3"
         local actual
 
-        if actual="$(git -C "$path" remote get-url "$name" 2>/dev/null)"; then
+        if actual="$(git -C "$path" remote get-url --all "$name" 2>/dev/null)"; then
             if [[ "$actual" != "$expected" ]]; then
-                printf 'submodules: %s URL mismatch for %s: expected %s, got %s\n' \
-                    "$name" "$path" "$expected" "$actual" >&2
+                printf 'submodules: %s URL mismatch for %s: expected %s\n' \
+                    "$name" "$path" "$expected" >&2
                 return 1
             fi
             return 0
@@ -166,13 +167,13 @@ remotes-check:
         local expected="$3"
         local actual
 
-        if ! actual="$(git -C "$path" remote get-url "$name" 2>/dev/null)"; then
+        if ! actual="$(git -C "$path" remote get-url --all "$name" 2>/dev/null)"; then
             printf '%s %s expected=%s actual=<missing>\n' "$path" "$name" "$expected" >&2
             return 1
         fi
         if [[ "$actual" != "$expected" ]]; then
-            printf '%s %s expected=%s actual=%s\n' \
-                "$path" "$name" "$expected" "$actual" >&2
+            printf '%s %s expected=%s\n' \
+                "$path" "$name" "$expected" >&2
             return 1
         fi
         printf '%s %s %s\n' "$path" "$name" "$actual"
