@@ -114,8 +114,6 @@ submodules:
     set -euo pipefail
     cd '{{ ROOT }}'
 
-    git submodule update --init --recursive
-
     verify_origin() {
         local path="$1"
         local expected="$2"
@@ -148,6 +146,50 @@ submodules:
         fi
         git -C "$path" remote add "$name" "$expected"
     }
+
+    verify_registered_submodule_url() {
+        local name="$1"
+        local expected="$2"
+        local actual
+        local status
+
+        if actual="$(git config --local --get-all "submodule.${name}.url" 2>/dev/null)"; then
+            if [[ "$actual" != "$expected" ]]; then
+                printf 'submodules: registered URL mismatch for %s: expected %s\n' \
+                    "$name" "$expected" >&2
+                return 1
+            fi
+        else
+            status=$?
+            if [[ "$status" -ne 1 ]]; then
+                printf 'submodules: unable to read registered URL for %s\n' "$name" >&2
+                return "$status"
+            fi
+        fi
+    }
+
+    verify_initialized_origin() {
+        local path="$1"
+        local expected="$2"
+
+        if [[ -e "$path/.git" ]]; then
+            verify_origin "$path" "$expected"
+        fi
+    }
+
+    preflight_submodule() {
+        local name="$1"
+        local path="$2"
+        local expected="$3"
+
+        verify_registered_submodule_url "$name" "$expected"
+        verify_initialized_origin "$path" "$expected"
+    }
+
+    preflight_submodule engine/ds4 engine/ds4 https://github.com/ZebulonRouseFrantzich/ds4.git
+    preflight_submodule spark/ds4-on-spark spark/ds4-on-spark https://github.com/ZebulonRouseFrantzich/ds4-on-spark.git
+
+    git submodule update --init --recursive
 
     verify_origin engine/ds4 https://github.com/ZebulonRouseFrantzich/ds4.git
     ensure_additional_remote engine/ds4 upstream https://github.com/Entrpi/ds4.git
