@@ -23,15 +23,17 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
 
 
-def _snapshot(entries: int = 1) -> dict[str, object]:
+def _snapshot(entries: int = 1, *, paths: tuple[str, ...] | None = None) -> dict[str, object]:
     repositories = [
         {"name": "lab", "head": "a" * 40, "pinned_head": None, "dirty": False, "status_sha256": "b" * 64, "tracked_diff_sha256": "c" * 64},
         {"name": "engine", "head": "d" * 40, "pinned_head": "e" * 40, "dirty": False, "status_sha256": "f" * 64, "tracked_diff_sha256": "0" * 64},
         {"name": "integration", "head": "1" * 40, "pinned_head": "2" * 40, "dirty": False, "status_sha256": "3" * 64, "tracked_diff_sha256": "4" * 64},
     ]
+    if paths is None:
+        paths = tuple(f"src/file-{index:06d}.py" for index in range(entries))
     inventory = [
-        {"path": f"src/file-{index:06d}.py", "type": "file", "executable": 0, "size": index, "sha256": _digest(f"entry-{index}"), "origin": "tracked"}
-        for index in range(entries)
+        {"path": path, "type": "file", "executable": 0, "size": index, "sha256": _digest(f"entry-{index}"), "origin": "tracked"}
+        for index, path in enumerate(paths)
     ]
     applied_tree_hash = source_helper._tree_hash(
         source_helper.SourceEntry(entry["path"], entry["executable"], entry["size"], entry["sha256"], entry["origin"])
@@ -147,6 +149,31 @@ class ArtifactBundleTests(unittest.TestCase):
                 bundle.finalize()
             self.assertEqual(raised.exception.code, "artifact_incomplete")
             self.assertFalse((root / "artifacts" / "phase-01-runs" / "spark" / "operation-1").exists())
+
+    def test_source_snapshot_paths_match_source_inventory_components(self) -> None:
+        payload = {"snapshot": _snapshot(paths=(".envrc", "nested/.gitignore", "scripts/targetctl/__main__.py"))}
+
+        self.assertEqual(_validate_record_payload("source", payload), payload)
+
+    def test_source_snapshot_paths_reject_unsafe_components(self) -> None:
+        unsafe_paths = (
+            "",
+            "/absolute.py",
+            ".",
+            "..",
+            "nested//file.py",
+            "nested/./file.py",
+            "nested/../file.py",
+            "nested\\file.py",
+            "control\nfile.py",
+            "a" * 129,
+        )
+        for path in unsafe_paths:
+            with self.subTest(path=path):
+                payload = {"snapshot": _snapshot(paths=(path,))}
+                with self.assertRaises(TargetError) as raised:
+                    _validate_record_payload("source", payload)
+                self.assertEqual(raised.exception.code, "artifact_value_invalid")
 
     def test_duplicate_unknown_fields_and_private_fields_fail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

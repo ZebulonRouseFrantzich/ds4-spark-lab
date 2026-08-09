@@ -57,7 +57,7 @@ _COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _TEXT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 _HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_SYSTEM_RE = re.compile(r"[A-Za-z0-9._+@=-]{1,160}\Z")
-_SOURCE_PATH_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._+@%=-]{0,127}/)*[A-Za-z0-9][A-Za-z0-9._+@%=-]{0,127}\Z")
+_SOURCE_COMPONENT_RE = re.compile(r"[A-Za-z0-9._+@%=-]{1,128}\Z")
 _VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
 _SYSTEM_TOOL_PATHS = {
     "nvidia-smi": frozenset(("/usr/bin/nvidia-smi",)),
@@ -99,6 +99,15 @@ def _safe_component(value: Any, *, code: str = "artifact_name_invalid") -> str:
     if not isinstance(value, str) or not _COMPONENT_RE.fullmatch(value):
         raise _fail(code, "artifact name is invalid")
     return value
+
+
+def _valid_source_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        return False
+    return all(
+        component not in {"", ".", ".."} and _SOURCE_COMPONENT_RE.fullmatch(component) is not None
+        for component in value.split("/")
+    )
 
 
 def _safe_text_name(value: Any) -> str:
@@ -363,8 +372,7 @@ def _validate_source_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
         validate_object_keys(entry, allowed=("path", "type", "executable", "size", "sha256", "origin"), required=("path", "type", "executable", "size", "sha256", "origin"))
         path = entry["path"]
         if (
-            not isinstance(path, str)
-            or not _SOURCE_PATH_RE.fullmatch(path)
+            not _valid_source_path(path)
             or path <= previous_path
             or entry["type"] != "file"
             or entry["executable"] not in (0, 1)

@@ -247,6 +247,122 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
             stack.enter_context(patch("scripts.targetctl.source._load_capabilities", return_value={"work_token": "1" * 64, "run_token": "2" * 64}))
             return run_bundle(root, fixture.config.name)
 
+    def test_sync_snapshot_round_trips_dot_and_underscore_tracked_paths_to_doctor(self) -> None:
+        from scripts.targetctl.artifacts import _SOURCE_EXCLUSIONS
+        from scripts.targetctl.common import canonical_json_bytes
+        from scripts.targetctl.source import SourceEntry, SourceSnapshot, SyncResult
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            entries = tuple(
+                SourceEntry(path, 0, 1, "f" * 64, "tracked")
+                for path in (
+                    ".envrc",
+                    ".gitignore",
+                    "_tooling/config.py",
+                    "nested/.gitignore",
+                    "scripts/targetctl/__main__.py",
+                )
+            )
+            tree = hashlib.sha256(b"targetctl-entry-hash-v1\0")
+            for entry in entries:
+                for field in (
+                    entry.path.encode("utf-8"),
+                    b"file",
+                    str(entry.executable).encode("ascii"),
+                    str(entry.size).encode("ascii"),
+                    bytes.fromhex(entry.sha256),
+                ):
+                    tree.update(len(field).to_bytes(8, "big"))
+                    tree.update(field)
+            applied = tree.hexdigest()
+            identity = {
+                "schema_version": 1,
+                "exclusion_policy_version": 1,
+                "exclusions": list(_SOURCE_EXCLUSIONS),
+                "repositories": [item.as_dict() for item in fixture.source.repositories],
+                "entries": [item.as_dict() for item in entries],
+                "applied_tree_hash": applied,
+            }
+            snapshot_id = hashlib.sha256(
+                b"targetctl-source-snapshot-v1\0" + canonical_json_bytes(identity)
+            ).hexdigest()
+            source = SourceSnapshot(
+                fixture.source.repositories,
+                entries,
+                False,
+                applied,
+                snapshot_id,
+            )
+            transport = Mock()
+            doctor_call = Mock(return_value=fixture.doctor)
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.dict(
+                        os.environ,
+                        {
+                            "TARGETCTL_MODEL_PATH": "/private/model-canary.gguf",
+                            "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf",
+                        },
+                        clear=False,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "scripts.targetctl.workflow.load_operational_target",
+                        return_value=fixture.config,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "scripts.targetctl.workflow.select_transport",
+                        return_value=transport,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "scripts.targetctl.workflow.sync_source",
+                        return_value=SyncResult(source, True, source.applied_tree_hash),
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        "scripts.targetctl.workflow.build_snapshot",
+                        return_value=source,
+                    )
+                )
+                stack.enter_context(
+                    patch("scripts.targetctl.workflow.doctor", doctor_call)
+                )
+                synced = structured_result(root, "local", "sync")
+                diagnosed = structured_result(root, "local", "doctor")
+
+            self.assertEqual(
+                synced,
+                {
+                    "schema": 1,
+                    "operation": "sync",
+                    "target": "local",
+                    "status": "succeeded",
+                    "snapshot_id": source.snapshot_id,
+                    "applied_tree_hash": source.applied_tree_hash,
+                    "initialized": True,
+                },
+            )
+            self.assertEqual(
+                diagnosed,
+                {
+                    "schema": 1,
+                    "operation": "doctor",
+                    "target": "local",
+                    **fixture.doctor.controller_payload(),
+                },
+            )
+            doctor_call.assert_called_once()
+            self.assertEqual(doctor_call.call_args.kwargs["snapshot"], source)
+
     def test_ssh_bundle_uses_only_report_helpers_and_preserves_artifact_on_cleanup_mismatch(self) -> None:
         from scripts.targetctl.artifacts import validate_bundle_index
 
