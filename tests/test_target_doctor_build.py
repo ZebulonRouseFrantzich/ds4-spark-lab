@@ -49,6 +49,20 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"descendant {pid} survived process-group termination")
     @staticmethod
+    def _nix_probe_version_output(name: str, version: str) -> str:
+        if name == "nvcc":
+            return (
+                "Copyright (c) 2005-2025 NVIDIA Corporation\n"
+                f"Cuda compilation tools, release {version}, V{version}.93\n"
+            )
+        major = version.split(".", 1)[0]
+        return (
+            f"aarch64-linux-gnu-{name}-{major} "
+            f"(Ubuntu {version}-6ubuntu2~24.04.1) {version}\n"
+            "Copyright (C) 2024 Free Software Foundation, Inc.\n"
+        )
+
+    @staticmethod
     def _successful_remote_payload(snapshot: SourceSnapshot) -> dict[str, object]:
         binary_hash = "c" * 64
         version = "1.2.3"
@@ -183,6 +197,16 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         self.assertEqual(payload["nix"], {"status": "absent", "version": None})
         self.assertNotIn(runtime.model_path, repr(payload))
         self.assertNotIn(runtime.drafter_path, repr(payload))
+        invalid_tool = json.loads(json.dumps(payload))
+        invalid_tool["tools"][0]["version"] = "1" * 11
+        with self.assertRaises(TargetError) as oversized_tool:
+            doctor_module._validate_result_payload(invalid_tool)
+        self.assertEqual(oversized_tool.exception.code, "doctor_response_invalid")
+        invalid_nix = json.loads(json.dumps(payload))
+        invalid_nix["nix"] = {"status": "matched", "version": "1" * 11}
+        with self.assertRaises(TargetError) as oversized_nix:
+            doctor_module._validate_result_payload(invalid_nix)
+        self.assertEqual(oversized_nix.exception.code, "doctor_response_invalid")
         with self.assertRaises(AttributeError):
             result.status = "failed"  # type: ignore[misc]
 
@@ -206,8 +230,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 if argv == ("/nix/store/test/bin/nix", "--version"):
                     return CommandResult(0, False, 1, b"nix (Nix) 2.28.5\n", b"")
                 name = argv[-1]
-                detail = f"Copyright 2005-2025\nCuda compilation tools, release {versions[name]}, V{versions[name]}.1" if name == "nvcc" else f"{name} {versions[name]}"
-                return CommandResult(0, False, 1, f"TARGETCTL_PATH={canonical[name]}\n{detail}\n".encode("ascii"), b"")
+                detail = self._nix_probe_version_output(name, versions[name])
+                return CommandResult(0, False, 1, f"TARGETCTL_PATH={canonical[name]}\n{detail}".encode("ascii"), b"")
 
             transport.run.side_effect = run
             with mock.patch.object(doctor_module, "_find_nix", return_value="/nix/store/test/bin/nix"):
@@ -241,8 +265,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                     return CommandResult(0, False, 1, b"nix (Nix) 2.28.5\n", b"")
                 name = argv[-1]
                 location = "/nix/store/compiler/bin/gcc" if name == "gcc" else canonical[name]
-                detail = f"Copyright 2005-2025\nCuda compilation tools, release {versions[name]}, V{versions[name]}.1" if name == "nvcc" else f"{name} {versions[name]}"
-                return CommandResult(0, False, 1, f"TARGETCTL_PATH={location}\n{detail}\n".encode("ascii"), b"")
+                detail = self._nix_probe_version_output(name, versions[name])
+                return CommandResult(0, False, 1, f"TARGETCTL_PATH={location}\n{detail}".encode("ascii"), b"")
 
             transport.run.side_effect = run
             with mock.patch.object(doctor_module, "_find_nix", return_value="/nix/store/test/bin/nix"):
@@ -284,10 +308,126 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             self.assertEqual(doctor_module._nix_identity(transport, Path("/unneeded"), ()), ("absent", None))
         transport.run.assert_not_called()
 
-    def test_cuda_version_ignores_copyright_years(self) -> None:
-        output = b"Copyright (c) 2005-2025 NVIDIA\nCuda compilation tools, release 12.8, V12.8.93\n"
-        self.assertEqual(doctor_module._version("nvcc", output), "12.8")
-        self.assertEqual(doctor_module._version("cuobjdump", output), "12.8")
+    def test_name_specific_version_parsers_ignore_unrelated_numbers_and_match_embedded(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        embedded_version = namespace["_doctor_version"]
+        cases = (
+            (
+                "nvidia-smi",
+                b"NVIDIA-SMI version  : 570.133.20\n"
+                b"NVML version        : 570.133.20\n"
+                b"DRIVER version      : 570.133.20\n"
+                b"CUDA Version        : 12.8\n",
+                "570.133.20",
+            ),
+            (
+                "nvcc",
+                b"nvcc: NVIDIA (R) Cuda compiler driver\n"
+                b"Copyright (c) 2005-2025 NVIDIA Corporation\n"
+                b"Cuda compilation tools, release 12.8, V12.8.93\n",
+                "12.8",
+            ),
+            (
+                "gcc",
+                b"aarch64-linux-gnu-gcc-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\n"
+                b"Copyright (C) 2023 Free Software Foundation, Inc.\n",
+                "13.3.0",
+            ),
+            (
+                "g++",
+                b"aarch64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\n"
+                b"Copyright (C) 2023 Free Software Foundation, Inc.\n",
+                "13.3.0",
+            ),
+            (
+                "make",
+                b"GNU Make 4.3\nBuilt for aarch64-unknown-linux-gnu\n"
+                b"Copyright (C) 1988-2020 Free Software Foundation, Inc.\n",
+                "4.3",
+            ),
+            ("python3", b"Python 3.12.3\n", "3.12.3"),
+            ("git", b"git version 2.43.0\n", "2.43.0"),
+            (
+                "rsync",
+                b"rsync  version 3.2.7  protocol version 31\n"
+                b"Copyright (C) 1996-2022 by Andrew Tridgell and others.\n",
+                "3.2.7",
+            ),
+            (
+                "cuobjdump",
+                b"cuobjdump: NVIDIA (R) fat binary listing tool\n"
+                b"Copyright (c) 2005-2025 NVIDIA Corporation\n"
+                b"Cuda compilation tools, release 12.8, V12.8.93\n",
+                "12.8",
+            ),
+            ("nix", b"nix (Nix) 2.28.5\n", "2.28.5"),
+        )
+        for name, output, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(doctor_module._version(name, output), expected)
+                self.assertEqual(embedded_version(name, output), expected)  # type: ignore[operator]
+                self.assertRegex(expected, r"[0-9]{1,10}(?:\.[0-9]{1,10}){0,3}\Z")
+
+    def test_name_specific_version_parsers_reject_malformed_ambiguous_and_unknown(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        embedded_version = namespace["_doctor_version"]
+        malformed = (
+            ("nvidia-smi", b"NVIDIA-SMI version : 570.133.20\nCUDA Version : 12.8\n"),
+            ("nvcc", b"Copyright 2005-2025\nCuda compilation tools V12.8.93\n"),
+            ("gcc", b"aarch64-linux-gnu-gcc-13 Ubuntu 13.3.0-6 13.3.0\n"),
+            ("g++", b"aarch64-linux-gnu-g++-13 13.3.0\nCopyright 2023\n"),
+            ("make", b"GNU make version 4.3\n"),
+            ("python3", b"CPython version 3.12.3\n"),
+            ("git", b"git release 2.43.0\n"),
+            ("rsync", b"rsync protocol version 31\npackage version 3.2.7\n"),
+            ("cuobjdump", b"cuobjdump release number 12.8\nCopyright 2025\n"),
+            ("nix", b"nix version 2.28.5\n"),
+        )
+        for name, output in malformed:
+            with self.subTest(name=name, kind="malformed"):
+                with self.assertRaises(TargetError) as local:
+                    doctor_module._version(name, output)
+                self.assertEqual(local.exception.code, "doctor_command_failed")
+                self.assertIsNone(embedded_version(name, output))  # type: ignore[operator]
+
+        valid = (
+            ("gcc", b"aarch64-linux-gnu-gcc-13 (Ubuntu 13.3.0-6) 13.3.0\n"),
+            ("rsync", b"rsync  version 3.2.7  protocol version 31\n"),
+            ("nvidia-smi", b"DRIVER version : 570.133.20\n"),
+            ("nix", b"nix (Nix) 2.28.5\n"),
+        )
+        for name, output in valid:
+            with self.subTest(name=name, kind="ambiguous"):
+                with self.assertRaises(TargetError) as local:
+                    doctor_module._version(name, output + output)
+                self.assertEqual(local.exception.code, "doctor_command_failed")
+                self.assertIsNone(embedded_version(name, output + output))  # type: ignore[operator]
+
+        with self.assertRaises(TargetError) as unknown:
+            doctor_module._version("cc", b"cc 1.2.3\n")
+        self.assertEqual(unknown.exception.code, "doctor_command_failed")
+        self.assertIsNone(embedded_version("cc", b"cc 1.2.3\n"))  # type: ignore[operator]
+
+    def test_nix_identity_rejects_malformed_or_ambiguous_nix_version(self) -> None:
+        tools = tuple((name, "1.0", alias) for name, alias in DOCTOR_TOOLS)
+        invalid_outputs = (
+            b"Copyright 2015-2025\nnix version 2.28.5\n",
+            b"nix (Nix) 2.28.5\nnix (Nix) 2.28.5\n",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workdir = Path(temporary)
+            (workdir / "flake.nix").write_text("{}\n", encoding="ascii")
+            with mock.patch.object(doctor_module, "_find_nix", return_value="/nix/store/test/bin/nix"):
+                for output in invalid_outputs:
+                    with self.subTest(output=output):
+                        transport = mock.Mock()
+                        transport.run.return_value = CommandResult(0, False, 1, output, b"")
+                        with self.assertRaises(TargetError) as raised:
+                            doctor_module._nix_identity(transport, workdir, tools)
+                        self.assertEqual(raised.exception.code, "doctor_nix_mismatch")
+                        transport.run.assert_called_once()
 
     def test_time_sync_file_success_skips_timedatectl_local_and_embedded(self) -> None:
         local_capture = mock.Mock()
@@ -578,8 +718,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             if argv == (nix_path, "--version"):
                 return b"nix (Nix) 2.28.5\n"
             name = argv[-1]
-            detail = f"Copyright 2005-2025\nCuda compilation tools, release {versions[name]}, V{versions[name]}.1" if name == "nvcc" else f"{name} {versions[name]}"
-            return f"TARGETCTL_PATH={probe_locations[name]}\n{detail}\n".encode("ascii")
+            detail = self._nix_probe_version_output(name, versions[name])
+            return f"TARGETCTL_PATH={probe_locations[name]}\n{detail}".encode("ascii")
 
         namespace["_doctor_cmd"] = mock.Mock(side_effect=run)
         helper_error = namespace["HelperError"]
@@ -642,7 +782,11 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                     (resolved, second_fd, identity, replaced_chain),
                 ),
             ),
-            mock.patch.object(doctor_module, "_pinned_tool_output", return_value=b"gcc 14.2\n"),
+            mock.patch.object(
+                doctor_module,
+                "_pinned_tool_output",
+                return_value=b"aarch64-linux-gnu-gcc-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\n",
+            ),
             self.assertRaises(TargetError) as raised,
         ):
             doctor_module._tool_version("gcc", "/usr/bin/gcc")
@@ -656,7 +800,9 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             (resolved, embedded_first_fd, embedded_identity, original_chain),
             (resolved, embedded_second_fd, embedded_identity, replaced_chain),
         ))
-        namespace["_doctor_cmd"] = mock.Mock(return_value=b"gcc 14.2\n")
+        namespace["_doctor_cmd"] = mock.Mock(
+            return_value=b"aarch64-linux-gnu-gcc-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\n",
+        )
         with self.assertRaises(namespace["HelperError"]) as embedded_raised:  # type: ignore[arg-type,index]
             namespace["_doctor_tool"]("gcc", "/usr/bin/gcc")  # type: ignore[index,operator]
         self.assertEqual(embedded_raised.exception.code, "doctor_tool_missing")
@@ -1604,7 +1750,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                     return b"nix (Nix) 2.28.5\n"
                 name = argv[-1]
                 path = native_locations[name]
-                detail = f"Cuda compilation tools, release 1.0, V1.0.0\n" if name == "nvcc" else f"{name} 1.0\n"
+                detail = self._nix_probe_version_output(name, "1.0")
                 return f"TARGETCTL_PATH={path}\n{detail}".encode("ascii")
 
             try:

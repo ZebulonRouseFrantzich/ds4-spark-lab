@@ -29,7 +29,59 @@ _HASH_CHUNK_BYTES = 1024 * 1024
 # A 1 TiB GGUF is far beyond current single-node deployment weights while
 # bounding hostile sparse files before any hashing read is attempted.
 MAX_WEIGHT_BYTES = 1 << 40
-_VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])")
+_VERSION_TEXT = r"[0-9]{1,10}(?:\.[0-9]{1,10}){0,3}"
+_VERSION_VALUE = _VERSION_TEXT.encode("ascii")
+_CUDA_VERSION_VALUE = rb"[0-9]{1,10}(?:\.[0-9]{1,10}){1,3}"
+_VERSION_PATTERNS: dict[str, re.Pattern[bytes]] = {
+    "nvidia-smi": re.compile(
+        rb"^DRIVER version[ \t]*:[ \t]*(" + _VERSION_VALUE + rb")[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "nvcc": re.compile(
+        rb"^Cuda compilation tools,[ \t]+release[ \t]+(" + _CUDA_VERSION_VALUE
+        + rb"),[^\r\n]{1,512}\r?$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    "gcc": re.compile(
+        rb"^[A-Za-z0-9_.+@=-]{0,160}gcc(?:-[0-9]{1,10})?[ \t]+"
+        rb"\([^()\r\n]{1,512}\)[ \t]+(" + _VERSION_VALUE + rb")"
+        rb"(?:[ \t]+[^\r\n]{1,512})?[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "g++": re.compile(
+        rb"^[A-Za-z0-9_.+@=-]{0,160}g\+\+(?:-[0-9]{1,10})?[ \t]+"
+        rb"\([^()\r\n]{1,512}\)[ \t]+(" + _VERSION_VALUE + rb")"
+        rb"(?:[ \t]+[^\r\n]{1,512})?[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "make": re.compile(
+        rb"^GNU Make[ \t]+(" + _VERSION_VALUE + rb")[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "python3": re.compile(
+        rb"^Python[ \t]+(" + _VERSION_VALUE + rb")[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "git": re.compile(
+        rb"^git version[ \t]+(" + _VERSION_VALUE
+        + rb")(?:[ \t]+[^\r\n]{1,512})?[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "rsync": re.compile(
+        rb"^rsync[ \t]+version[ \t]+(" + _VERSION_VALUE
+        + rb")[ \t]+protocol version[ \t]+[0-9]{1,10}[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "cuobjdump": re.compile(
+        rb"^Cuda compilation tools,[ \t]+release[ \t]+(" + _CUDA_VERSION_VALUE
+        + rb"),[^\r\n]{1,512}\r?$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    "nix": re.compile(
+        rb"^nix \(Nix\)[ \t]+(" + _VERSION_VALUE + rb")[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+}
 _SAFE_SYSTEM = re.compile(r"[A-Za-z0-9._+@=-]{1,160}\Z")
 _SAFE_TOOL_LOCATION = re.compile(
     r"/(?:usr|nix/store)/(?:[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}/)*"
@@ -42,10 +94,6 @@ _TIMEDATECTL_ARGUMENTS = ("show", "--property=NTPSynchronized", "--value")
 
 
 # Order is artifact order.  These are not searched through PATH and are part of
-_CUDA_VERSION = re.compile(
-    rb"\brelease\s+([0-9]+(?:\.[0-9]+){1,3})(?:,|\s)",
-    re.IGNORECASE,
-)
 # the public evidence contract.
 DOCTOR_TOOLS: tuple[tuple[str, str], ...] = (
     ("nvidia-smi", "/usr/bin/nvidia-smi"),
@@ -172,7 +220,7 @@ def _validate_result_payload(payload: Any) -> DoctorResult:
             or len(location) > 4096
             or not _SAFE_TOOL_LOCATION.fullmatch(location)
             or not isinstance(item["version"], str)
-            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", item["version"])
+            or not re.fullmatch(_VERSION_TEXT, item["version"])
         ):
             raise _error("doctor_response_invalid")
         clean_tools.append((expected[0], item["version"], location))
@@ -191,7 +239,7 @@ def _validate_result_payload(payload: Any) -> DoctorResult:
         if not isinstance(payload[key], str) or not re.fullmatch(r"[0-9a-f]{64}", payload[key]):
             raise _error("doctor_response_invalid")
     nix = payload["nix"]
-    if not isinstance(nix, Mapping) or set(nix) != {"status", "version"} or nix["status"] not in {"absent", "matched"} or (nix["status"] == "absent" and nix["version"] is not None) or (nix["status"] == "matched" and (not isinstance(nix["version"], str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", nix["version"]))):
+    if not isinstance(nix, Mapping) or set(nix) != {"status", "version"} or nix["status"] not in {"absent", "matched"} or (nix["status"] == "absent" and nix["version"] is not None) or (nix["status"] == "matched" and (not isinstance(nix["version"], str) or not re.fullmatch(_VERSION_TEXT, nix["version"]))):
         raise _error("doctor_response_invalid")
     return DoctorResult("succeeded", None, payload["os"], payload["kernel"], payload["arch"], tuple(clean_tools), ("GB10", "sm_121"), values[0], values[1], True, payload["primary_weight_sha256"], payload["draft_weight_sha256"], (nix["status"], nix["version"]))
 
@@ -208,8 +256,12 @@ def _run_checked(transport: _Transport, argv: tuple[str, ...], *, timeout: float
 
 
 def _version(name: str, output: bytes) -> str:
-    match = _CUDA_VERSION.search(output) if name in {"nvcc", "cuobjdump"} else _VERSION.search(output)
-    if match is None:
+    pattern = _VERSION_PATTERNS.get(name)
+    if pattern is None:
+        raise _error("doctor_command_failed")
+    matches = pattern.finditer(output)
+    match = next(matches, None)
+    if match is None or next(matches, None) is not None:
         raise _error("doctor_command_failed")
     return match.group(1).decode("ascii")
 
@@ -471,9 +523,10 @@ def _nix_identity(
     if not stat.S_ISREG(flake.st_mode) or flake.st_uid != os.geteuid():
         raise _error("doctor_nix_mismatch")
     nix_output = _run_checked(transport, (nix, "--version"))
-    nix_match = _VERSION.search(nix_output)
-    if nix_match is None:
-        raise _error("doctor_nix_mismatch")
+    try:
+        nix_version = _version("nix", nix_output)
+    except TargetError:
+        raise _error("doctor_nix_mismatch") from None
     native: dict[str, tuple[str | None, str | None]] = {}
     for expected_name in _NIX_COMPARE_TOOL_NAMES:
         matches = [
@@ -516,7 +569,7 @@ def _nix_identity(
             raise _error("doctor_nix_mismatch") from None
         if resolved_path != expected_path or observed_version != expected_version:
             raise _error("doctor_nix_mismatch")
-    return "matched", nix_match.group(1).decode("ascii")
+    return "matched", nix_version
 
 
 def _weight_hash(path_value: str) -> str:
@@ -803,8 +856,20 @@ def _doctor_tool(name,alias):
 _DOCTOR_TOOLS=(('nvidia-smi','/usr/bin/nvidia-smi'),('nvcc','/usr/local/cuda/bin/nvcc'),('gcc','/usr/bin/gcc'),('g++','/usr/bin/g++'),('make','/usr/bin/make'),('python3','/usr/bin/python3'),('git','/usr/bin/git'),('rsync','/usr/bin/rsync'),('cuobjdump','/usr/local/cuda/bin/cuobjdump'))
 _DOCTOR_NIX_TOOL_NAMES=('nvcc','gcc','g++')
 _DOCTOR_NIX_PROBE='p=$(command -v "$1") || exit 20; printf "TARGETCTL_PATH=%s\\n" "$p"; exec "$p" --version'
-_DOCTOR_VERSION=rb'(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])'
-_DOCTOR_CUDA_VERSION=rb'\brelease\s+([0-9]+(?:\.[0-9]+){1,3})(?:,|\s)'
+_DOCTOR_VERSION_VALUE=rb'[0-9]{1,10}(?:\.[0-9]{1,10}){0,3}'
+_DOCTOR_CUDA_VERSION_VALUE=rb'[0-9]{1,10}(?:\.[0-9]{1,10}){1,3}'
+_DOCTOR_VERSION_PATTERNS={
+    'nvidia-smi':_doctor_re.compile(rb'^DRIVER version[ \t]*:[ \t]*('+_DOCTOR_VERSION_VALUE+rb')[ \t]*\r?$',_doctor_re.MULTILINE),
+    'nvcc':_doctor_re.compile(rb'^Cuda compilation tools,[ \t]+release[ \t]+('+_DOCTOR_CUDA_VERSION_VALUE+rb'),[^\r\n]{1,512}\r?$',_doctor_re.IGNORECASE|_doctor_re.MULTILINE),
+    'gcc':_doctor_re.compile(rb'^[A-Za-z0-9_.+@=-]{0,160}gcc(?:-[0-9]{1,10})?[ \t]+\([^()\r\n]{1,512}\)[ \t]+('+_DOCTOR_VERSION_VALUE+rb')(?:[ \t]+[^\r\n]{1,512})?[ \t]*\r?$',_doctor_re.MULTILINE),
+    'g++':_doctor_re.compile(rb'^[A-Za-z0-9_.+@=-]{0,160}g\+\+(?:-[0-9]{1,10})?[ \t]+\([^()\r\n]{1,512}\)[ \t]+('+_DOCTOR_VERSION_VALUE+rb')(?:[ \t]+[^\r\n]{1,512})?[ \t]*\r?$',_doctor_re.MULTILINE),
+    'make':_doctor_re.compile(rb'^GNU Make[ \t]+('+_DOCTOR_VERSION_VALUE+rb')[ \t]*\r?$',_doctor_re.MULTILINE),
+    'python3':_doctor_re.compile(rb'^Python[ \t]+('+_DOCTOR_VERSION_VALUE+rb')[ \t]*\r?$',_doctor_re.MULTILINE),
+    'git':_doctor_re.compile(rb'^git version[ \t]+('+_DOCTOR_VERSION_VALUE+rb')(?:[ \t]+[^\r\n]{1,512})?[ \t]*\r?$',_doctor_re.MULTILINE),
+    'rsync':_doctor_re.compile(rb'^rsync[ \t]+version[ \t]+('+_DOCTOR_VERSION_VALUE+rb')[ \t]+protocol version[ \t]+[0-9]{1,10}[ \t]*\r?$',_doctor_re.MULTILINE),
+    'cuobjdump':_doctor_re.compile(rb'^Cuda compilation tools,[ \t]+release[ \t]+('+_DOCTOR_CUDA_VERSION_VALUE+rb'),[^\r\n]{1,512}\r?$',_doctor_re.IGNORECASE|_doctor_re.MULTILINE),
+    'nix':_doctor_re.compile(rb'^nix \(Nix\)[ \t]+('+_DOCTOR_VERSION_VALUE+rb')[ \t]*\r?$',_doctor_re.MULTILINE),
+}
 _DOCTOR_MAX_WEIGHT_BYTES=1<<40
 _DOCTOR_MAX_OUTPUT_BYTES=16384
 _DOCTOR_SAFE_SYSTEM=_doctor_re.compile(r'[A-Za-z0-9._+@=-]{1,160}\Z')
@@ -899,9 +964,10 @@ def _doctor_cmd(argv,timeout=5,pass_fds=(),executable=None):
                 except _doctor_subprocess.TimeoutExpired: cleanup_ok=False
             if not cleanup_ok: _fail('doctor_command_failed')
 def _doctor_version(name,output):
-    pattern=_DOCTOR_CUDA_VERSION if name in ('nvcc','cuobjdump') else _DOCTOR_VERSION
-    match=_doctor_re.search(pattern,output,_doctor_re.IGNORECASE if name in ('nvcc','cuobjdump') else 0)
-    return match.group(1).decode('ascii') if match else None
+    pattern=_DOCTOR_VERSION_PATTERNS.get(name)
+    if pattern is None: return None
+    matches=pattern.finditer(output); match=next(matches,None)
+    return match.group(1).decode('ascii') if match is not None and next(matches,None) is None else None
 def _doctor_nix(tools,work_fd):
     candidates=['/nix/var/nix/profiles/default/bin/nix','/run/current-system/sw/bin/nix','/nix/profile/bin/nix','/usr/bin/nix']
     home_candidate=_doctor_os.path.expanduser('~/.nix-profile/bin/nix')
@@ -919,8 +985,8 @@ def _doctor_nix(tools,work_fd):
     try: flake=_doctor_os.stat('flake.nix',dir_fd=work_fd,follow_symlinks=False)
     except OSError: _fail('doctor_nix_mismatch')
     if not _doctor_stat.S_ISREG(flake.st_mode) or flake.st_uid!=_doctor_os.geteuid(): _fail('doctor_nix_mismatch')
-    match=_doctor_re.search(_DOCTOR_VERSION,_doctor_cmd((nix,'--version')))
-    if not match: _fail('doctor_nix_mismatch')
+    nix_version=_doctor_version('nix',_doctor_cmd((nix,'--version')))
+    if nix_version is None: _fail('doctor_nix_mismatch')
     descriptor='/proc/self/fd/%d'%work_fd
     native={}
     for expected_name in _DOCTOR_NIX_TOOL_NAMES:
@@ -937,7 +1003,7 @@ def _doctor_nix(tools,work_fd):
         except UnicodeDecodeError: _fail('doctor_nix_mismatch')
         version=_doctor_version(name,b'\n'.join(lines[position+1:]))
         if resolved!=expected_location or version!=expected_version: _fail('doctor_nix_mismatch')
-    return {'status':'matched','version':match.group(1).decode('ascii')}
+    return {'status':'matched','version':nix_version}
 def _doctor_live_lock(run_fd,run_identity,run_token,token):
     if not isinstance(token,str) or len(token)!=64 or any(c not in '0123456789abcdef' for c in token): _fail('doctor_source_mismatch')
     _assert_pinned_root(run_fd,run_identity); _read_marker(run_fd,'run',run_token)
