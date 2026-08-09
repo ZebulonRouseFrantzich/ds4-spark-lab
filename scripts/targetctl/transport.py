@@ -16,6 +16,7 @@ from pathlib import Path
 import selectors
 import signal
 import shlex
+import socket
 import stat
 import subprocess
 import sys
@@ -397,6 +398,112 @@ class LocalTransport(_HelperTransport):
         return self._execute((sys.executable, "-I", "-S", "-"), program, timeout=timeout, cwd="/", env=_validate_env(helper_digest=digest, deferred=True))
 
 
+
+
+class SSHForward:
+    """One operation-owned, loopback-only SSH local forward.
+
+    It deliberately does not reuse :class:`SSHTransport`'s runner: forwarding is
+    a live process, so tests and callers can reliably observe and tear it down.
+    """
+
+    def __init__(self, transport: "SSHTransport", *, target_port: int, timeout: float = 30.0) -> None:
+        if not isinstance(transport, SSHTransport) or not isinstance(target_port, int) or isinstance(target_port, bool) or not 1 <= target_port <= 65535 or not isinstance(timeout, (int, float)) or not 0 < timeout <= 600:
+            raise _error("invalid_forward_request", "SSH forward request is invalid")
+        self._transport = transport
+        self._target_port = target_port
+        self._timeout = float(timeout)
+        self._process: subprocess.Popen[bytes] | None = None
+        self.local_port = 0
+
+    def _reserve_port(self) -> int:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+        finally:
+            probe.close()
+
+    def _argv(self) -> tuple[str, ...]:
+        options = tuple(option for option in SSH_OPTIONS if option != "ClearAllForwardings=yes")
+        return (
+            self._transport._ssh_binary,
+            "-F",
+            "/dev/null",
+            *(part for option in (*options, "ClearAllForwardings=no", "ExitOnForwardFailure=yes") for part in ("-o", option)),
+            "-L",
+            f"127.0.0.1:{self.local_port}:127.0.0.1:{self._target_port}",
+            "-N",
+            "--",
+            self._transport.ssh_host,
+        )
+
+    @property
+    def argv(self) -> tuple[str, ...]:
+        """The exact non-secret argv, primarily for deterministic tests."""
+        return self._argv()
+
+    def __enter__(self) -> "SSHForward":
+        self.local_port = self._reserve_port()
+        try:
+            self._process = subprocess.Popen(
+                self._argv(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd="/",
+                env=_validate_env(),
+                shell=False,
+                start_new_session=True,
+            )
+        except OSError:
+            raise _error("forward_start_failed", "SSH forward could not start") from None
+        deadline = time.monotonic() + self._timeout
+        try:
+            while time.monotonic() < deadline:
+                if self._process.poll() is not None:
+                    raise _error("forward_failed", "SSH forward could not become ready")
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    probe.settimeout(min(0.1, max(0.01, deadline - time.monotonic())))
+                    if probe.connect_ex(("127.0.0.1", self.local_port)) == 0:
+                        return self
+                finally:
+                    probe.close()
+                time.sleep(0.02)
+            raise _error("forward_timeout", "SSH forward could not become ready")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+                process.wait(timeout=min(5.0, self._timeout))
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
 class SSHTransport(_HelperTransport):
     """SSH transport with forwarding, agent, X11, tty, and control sharing disabled."""
     def __init__(self, ssh_host: str, *, runner: Runner | None = None, ssh_binary: str = "ssh", max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES) -> None:

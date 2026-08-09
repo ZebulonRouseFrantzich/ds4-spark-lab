@@ -14,7 +14,7 @@ from unittest import mock
 
 from scripts.targetctl import remote
 from scripts.targetctl.common import PROTOCOL_VERSION, TargetError
-from scripts.targetctl.transport import CommandResult, LocalTransport, SSHTransport
+from scripts.targetctl.transport import CommandResult, LocalTransport, SSHForward, SSHTransport
 
 
 def roots(tmp_path: Path) -> dict[str, str]:
@@ -380,6 +380,20 @@ class TransportTests(unittest.TestCase):
         self.assertIsNotNone(processes[0].poll())
         self.assertTrue(all(stream is None or stream.closed for stream in (processes[0].stdin, processes[0].stdout, processes[0].stderr)))
         self.assertFalse(any(issubclass(warning.category, ResourceWarning) for warning in caught))
+
+
+class SSHForwardTests(unittest.TestCase):
+    def test_forward_has_one_loopback_mapping_and_disables_all_other_channels(self) -> None:
+        transport = SSHTransport("spark_1.example", ssh_binary="/usr/bin/ssh")
+        forward = SSHForward(transport, target_port=43123)
+        forward.local_port = 32123
+        argv = forward.argv
+        self.assertEqual(argv[0], "/usr/bin/ssh")
+        self.assertEqual(argv[-2:], ("--", "spark_1.example"))
+        self.assertEqual(argv[argv.index("-L") + 1], "127.0.0.1:32123:127.0.0.1:43123")
+        self.assertEqual(argv.count("-L"), 1)
+        options = {argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-o"}
+        self.assertTrue({"ForwardAgent=no", "ForwardX11=no", "RequestTTY=no", "ControlMaster=no", "ClearAllForwardings=no", "ExitOnForwardFailure=yes"}.issubset(options))
 
 
 if __name__ == "__main__":

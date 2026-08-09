@@ -59,13 +59,15 @@ _SAFE_SYSTEM_RE = re.compile(r"[A-Za-z0-9._+@=-]{1,160}\Z")
 _SOURCE_PATH_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._+@%=-]{0,127}/)*[A-Za-z0-9][A-Za-z0-9._+@%=-]{0,127}\Z")
 _VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
 _SYSTEM_TOOL_PATHS = {
-    "nvidia-smi": frozenset(("/usr/bin/nvidia-smi", "/bin/nvidia-smi")),
-    "nvcc": frozenset(("/usr/bin/nvcc", "/bin/nvcc", "/usr/local/cuda/bin/nvcc")),
-    "gcc": frozenset(("/usr/bin/gcc", "/bin/gcc")),
-    "g++": frozenset(("/usr/bin/g++", "/bin/g++")),
-    "cmake": frozenset(("/usr/bin/cmake", "/bin/cmake")),
-    "make": frozenset(("/usr/bin/make", "/bin/make")),
-    "python3": frozenset(("/usr/bin/python3", "/bin/python3")),
+    "nvidia-smi": frozenset(("/usr/bin/nvidia-smi",)),
+    "nvcc": frozenset(("/usr/local/cuda/bin/nvcc",)),
+    "gcc": frozenset(("/usr/bin/gcc",)),
+    "g++": frozenset(("/usr/bin/g++",)),
+    "make": frozenset(("/usr/bin/make",)),
+    "python3": frozenset(("/usr/bin/python3",)),
+    "git": frozenset(("/usr/bin/git",)),
+    "rsync": frozenset(("/usr/bin/rsync",)),
+    "cuobjdump": frozenset(("/usr/local/cuda/bin/cuobjdump",)),
 }
 _DOCTOR_TOOLS = tuple(_SYSTEM_TOOL_PATHS)
 _FAILURE_CLASSES = frozenset(
@@ -409,7 +411,11 @@ def _validate_source_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_doctor(payload: Mapping[str, Any]) -> dict[str, Any]:
-    fields = ("status", "failure_class", "os", "kernel", "arch", "tools", "gpu", "primary_weight_sha256", "draft_weight_sha256")
+    fields = (
+        "status", "failure_class", "os", "kernel", "arch", "tools", "gpu",
+        "memory_bytes", "disk_bytes", "time_sync", "primary_weight_sha256",
+        "draft_weight_sha256",
+    )
     validate_object_keys(payload, allowed=fields, required=fields)
     status, failure_class = _status_fields(payload)
     succeeded = status == "succeeded"
@@ -456,8 +462,20 @@ def _validate_doctor(payload: Mapping[str, Any]) -> dict[str, Any]:
         clean_gpu = {"platform": "GB10", "compute_capability": "sm_121"}
     else:
         raise _fail("artifact_value_invalid", "artifact value is invalid")
+    memory_bytes = _known_or_none(payload["memory_bytes"], _nullable_positive, required=succeeded)
+    disk_bytes = _known_or_none(payload["disk_bytes"], _nullable_positive, required=succeeded)
+    time_sync = payload["time_sync"]
+    if time_sync is None:
+        if succeeded:
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+    elif not not_run and isinstance(time_sync, bool):
+        if succeeded and not time_sync:
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+    else:
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
     return {
         "status": status, "failure_class": failure_class, **system, "tools": clean_tools, "gpu": clean_gpu,
+        "memory_bytes": memory_bytes, "disk_bytes": disk_bytes, "time_sync": time_sync,
         "primary_weight_sha256": _known_or_none(payload["primary_weight_sha256"], _hex_digest, required=succeeded),
         "draft_weight_sha256": _known_or_none(payload["draft_weight_sha256"], _hex_digest, required=succeeded),
     }

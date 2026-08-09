@@ -74,11 +74,14 @@ def _payload(name: str, *, build_log_sha256: str | None = None, server_log_sha25
                 {"name": "nvcc", "version": "12.8", "location": "/usr/local/cuda/bin/nvcc"},
                 {"name": "gcc", "version": "14.2", "location": "/usr/bin/gcc"},
                 {"name": "g++", "version": "14.2", "location": "/usr/bin/g++"},
-                {"name": "cmake", "version": "3.31", "location": "/usr/bin/cmake"},
                 {"name": "make", "version": "4.4", "location": "/usr/bin/make"},
                 {"name": "python3", "version": "3.13", "location": "/usr/bin/python3"},
+                {"name": "git", "version": "2.47", "location": "/usr/bin/git"},
+                {"name": "rsync", "version": "3.4", "location": "/usr/bin/rsync"},
+                {"name": "cuobjdump", "version": "12.8", "location": "/usr/local/cuda/bin/cuobjdump"},
             ],
             "gpu": {"platform": "GB10", "compute_capability": "sm_121"},
+            "memory_bytes": 1024, "disk_bytes": 1024, "time_sync": True,
             "primary_weight_sha256": primary_hash, "draft_weight_sha256": draft_hash,
         }
     if name == "build":
@@ -252,6 +255,19 @@ class ArtifactBundleTests(unittest.TestCase):
             with self.assertRaises(TargetError):
                 bundle.write_record("cleanup", bad_cleanup, created_at=STAMP)
 
+    def test_doctor_facts_require_the_exact_finite_tools_and_healthy_values(self) -> None:
+        payload = _payload("target-doctor")
+        self.assertEqual(
+            [item["name"] for item in payload["tools"]],
+            ["nvidia-smi", "nvcc", "gcc", "g++", "make", "python3", "git", "rsync", "cuobjdump"],
+        )
+        for field, value in (("memory_bytes", 0), ("disk_bytes", 0), ("time_sync", False)):
+            with self.subTest(field=field):
+                malformed = _payload("target-doctor")
+                malformed[field] = value
+                with self.assertRaises(TargetError):
+                    _validate_record_payload("target-doctor", malformed)
+
     def test_advertised_log_mismatch_or_missing_fails_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -273,7 +289,8 @@ class ArtifactBundleTests(unittest.TestCase):
             "target-doctor": {
                 "status": "not_run", "failure_class": None, "os": None, "kernel": None, "arch": None,
                 "tools": [{"name": tool["name"], "version": None, "location": None} for tool in _payload("target-doctor")["tools"]],
-                "gpu": None, "primary_weight_sha256": None, "draft_weight_sha256": None,
+                "gpu": None, "memory_bytes": None, "disk_bytes": None, "time_sync": None,
+                "primary_weight_sha256": None, "draft_weight_sha256": None,
             },
             "build": {
                 "status": "not_run", "failure_class": None, "source_snapshot_id": None, "source_applied_tree_hash": None,
@@ -352,6 +369,9 @@ class ArtifactBundleTests(unittest.TestCase):
                 for tool in _payload("target-doctor")["tools"]
             ],
             "gpu": None,
+            "memory_bytes": None,
+            "disk_bytes": None,
+            "time_sync": None,
             "primary_weight_sha256": None,
             "draft_weight_sha256": None,
         }
