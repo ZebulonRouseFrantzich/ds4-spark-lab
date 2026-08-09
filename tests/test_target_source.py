@@ -258,10 +258,11 @@ class FakeSSHRsyncTests(_FakeSSHRsyncBase):
         workdir = Path(config.workdir)
         run_dir = Path(config.run_dir)
 
-        # Call 1: initialize
+        # Call 1: initialize and transfer.
         result = sync_source(config, transport)
         self.assertTrue(result.initialized)
-        self.assertIsNone(result.applied_tree_hash)
+        self.assertEqual(result.applied_tree_hash, result.snapshot.applied_tree_hash)
+        self.assertEqual((workdir / "hello.txt").read_bytes(), b"hello world\n")
 
         # Seed stale file and outside canary before transfer
         (workdir / "stale.txt").write_bytes(b"stale")
@@ -300,11 +301,8 @@ class FakeSSHRsyncTests(_FakeSSHRsyncBase):
         for child in run_dir.iterdir():
             self.assertNotIn(".targetctl-source-receiver-", child.name)
 
-        # Lock directory cleaned/released
-        lock_dir = run_dir / ".targetctl-operation-lock-v1"
-        if lock_dir.exists():
-            # Lock may still exist as a directory; verify token file is gone
-            self.assertFalse((lock_dir / "token").exists())
+        # Regular lock record cleaned/released.
+        self.assertFalse((run_dir / ".targetctl-operation-lock-v1").exists())
 
 
 

@@ -20,6 +20,9 @@ from .transport import CommandResult, LocalTransport, SSHTransport
 MAX_COMMAND_OUTPUT_BYTES = 16 * 1024
 COMMAND_TIMEOUT_SECONDS = 5.0
 _HASH_CHUNK_BYTES = 1024 * 1024
+# A 1 TiB GGUF is far beyond current single-node deployment weights while
+# bounding hostile sparse files before any hashing read is attempted.
+MAX_WEIGHT_BYTES = 1 << 40
 _VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])")
 _SAFE_SYSTEM = re.compile(r"[A-Za-z0-9._+@=-]{1,160}\Z")
 
@@ -169,7 +172,7 @@ def _tool_version(transport: _Transport, name: str, path: str) -> str:
 def _weight_hash(path_value: str) -> str:
     try:
         item = os.stat(path_value, follow_symlinks=False)
-        if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or item.st_size < 1:
+        if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or not 1 <= item.st_size <= MAX_WEIGHT_BYTES:
             raise OSError
         fd = os.open(path_value, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
@@ -268,9 +271,10 @@ collect_doctor = doctor
 REMOTE_DOCTOR_EXTENSION = r'''
 import hashlib as _doctor_hashlib, os as _doctor_os, re as _doctor_re, stat as _doctor_stat, subprocess as _doctor_subprocess
 _DOCTOR_TOOLS=(('nvidia-smi','/usr/bin/nvidia-smi'),('nvcc','/usr/local/cuda/bin/nvcc'),('gcc','/usr/bin/gcc'),('g++','/usr/bin/g++'),('make','/usr/bin/make'),('python3','/usr/bin/python3'),('git','/usr/bin/git'),('rsync','/usr/bin/rsync'),('cuobjdump','/usr/local/cuda/bin/cuobjdump'))
+_DOCTOR_MAX_WEIGHT_BYTES=1<<40
 def _doctor_hash(path):
     st=_doctor_os.stat(path,follow_symlinks=False)
-    if not _doctor_stat.S_ISREG(st.st_mode) or st.st_uid!=_doctor_os.geteuid() or st.st_size<1: _fail('doctor_weight_invalid')
+    if not _doctor_stat.S_ISREG(st.st_mode) or st.st_uid!=_doctor_os.geteuid() or not 1<=st.st_size<=_DOCTOR_MAX_WEIGHT_BYTES: _fail('doctor_weight_invalid')
     fd=_doctor_os.open(path,_doctor_os.O_RDONLY|_doctor_os.O_CLOEXEC|getattr(_doctor_os,'O_NOFOLLOW',0))
     try:
         before=_doctor_os.fstat(fd); h=_doctor_hashlib.sha256()

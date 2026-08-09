@@ -6,7 +6,6 @@ module.  Private source roots, target roots, and command output remain local.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -15,6 +14,7 @@ import stat
 import tempfile
 from typing import Any, Mapping
 from .common import TargetError, record_id_for, write_json_atomic
+from .lifecycle import local_operation_lock
 from .source import (
     SourceSnapshot,
     _SOURCE_EXTENSION,
@@ -29,6 +29,7 @@ MAKE = "/usr/bin/make"
 CUOBJDUMP = "/usr/local/cuda/bin/cuobjdump"
 MAX_BUILD_OUTPUT_BYTES = 1_048_576
 BUILD_TIMEOUT_SECONDS = 3_600.0
+BUILD_LOCK_LEASE_SECONDS = 3_720
 _VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])")
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -120,22 +121,6 @@ def _safe_run_dir(path: Path) -> None:
         raise _error("build_run_dir_invalid")
 
 
-def _acquire_lock(run_dir: Path) -> int:
-    try:
-        fd = os.open(run_dir / ".targetctl-operation-lock-v1", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        item = os.fstat(fd)
-        if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600:
-            raise OSError
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            raise _error("build_lock_busy") from None
-        return fd
-    except TargetError:
-        raise
-    except OSError:
-        raise _error("build_lock_failed") from None
 
 
 def _read_lifecycle(run_dir: Path) -> None:
@@ -252,9 +237,7 @@ def _build_id(snapshot: SourceSnapshot, binary_hash: str, version: str, size: in
 def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapshot, *, jobs: int | None) -> BuildResult:
     root = Path(config.source_root)
     run_dir = Path(config.local_run_dir)
-    _safe_run_dir(run_dir)
-    lock = _acquire_lock(run_dir)
-    try:
+    with local_operation_lock(str(run_dir)):
         _read_lifecycle(run_dir)
         # Recheck while serialized; source may have changed after the caller's
         # initial snapshot/dirty decision.
@@ -279,11 +262,6 @@ def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapsho
         state = {"schema_version": 1, "record_type": "build", "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "build_id": build_id, "binary_sha256": binary_hash, "binary_size": size, "version": version, "sass": "verified", "build_log_sha256": log_hash}
         write_json_atomic(run_dir / "build.json", state, mode=0o600)
         return BuildResult("succeeded", None, snapshot.snapshot_id, snapshot.applied_tree_hash, build_id, binary_hash, "make-cuda-spark", version, size, "verified", log_hash)
-    finally:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        finally:
-            os.close(lock)
 
 
 def _remote_result(result: Mapping[str, Any]) -> BuildResult:
@@ -329,7 +307,7 @@ def build(config: Any, transport: LocalTransport | SSHTransport, *, snapshot: So
         _expect_root_identities(verified, state)
         if not isinstance(verified, Mapping) or verified.get("sha256") != checked.applied_tree_hash or verified.get("entry_count") != len(checked.entries):
             raise _error("build_source_mismatch")
-        lock = transport.run_helper("acquire_lock", {"run_dir": config.run_dir, "run_token": state["run_token"]}, allowed_error_codes={"lock_busy", "lock_failed", "unsafe_lock", "marker_mismatch", "unsafe_root"})
+        lock = transport.run_helper("acquire_lock", {"run_dir": config.run_dir, "run_token": state["run_token"], "lease_seconds": BUILD_LOCK_LEASE_SECONDS}, allowed_error_codes={"lock_busy", "lock_failed", "unsafe_lock", "invalid_lease", "marker_mismatch", "unsafe_root"})
         if not isinstance(lock, Mapping) or not isinstance(lock.get("lock_token"), str):
             raise _error("build_lock_failed")
         primary: BaseException | None = None
@@ -361,7 +339,7 @@ build_target = build
 
 
 REMOTE_BUILD_EXTENSION = r'''
-import hashlib as _build_hashlib, json as _build_json, os as _build_os, re as _build_re, stat as _build_stat, subprocess as _build_subprocess, secrets as _build_secrets
+import hashlib as _build_hashlib, json as _build_json, os as _build_os, re as _build_re, signal as _build_signal, stat as _build_stat, subprocess as _build_subprocess, secrets as _build_secrets
 def _build_file_hash(path, executable=False):
     try:
         st=_build_os.stat(path,follow_symlinks=False)
@@ -395,6 +373,34 @@ def _build_record_id(value):
     parts=(b'targetctl.record.v1',raw); h=_build_hashlib.sha256()
     for part in parts: h.update(len(part).to_bytes(8,'big')); h.update(part)
     return h.hexdigest()
+def _build_terminate_process(process):
+    if process is None or process.poll() is not None: return
+    try: _build_os.killpg(process.pid, _build_signal.SIGTERM)
+    except ProcessLookupError: return
+    except OSError: _fail('build_command_failed')
+    try: process.wait(timeout=5)
+    except _build_subprocess.TimeoutExpired:
+        try: _build_os.killpg(process.pid, _build_signal.SIGKILL)
+        except ProcessLookupError: pass
+        except OSError: _fail('build_command_failed')
+        try: process.wait(timeout=5)
+        except _build_subprocess.TimeoutExpired: _fail('build_command_failed')
+def _build_make(cwd, jobs, run_fd):
+    process = None
+    old_handlers = {}
+    def interrupted(signum, frame):
+        _build_terminate_process(process)
+        raise SystemExit(128 + signum)
+    try:
+        process = _build_subprocess.Popen(('/usr/bin/make','-C','engine/ds4','cuda-spark','-j%d'%jobs),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.DEVNULL,stderr=_build_subprocess.DEVNULL,cwd=cwd,env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},start_new_session=True)
+        for signum in (_build_signal.SIGHUP, _build_signal.SIGINT, _build_signal.SIGTERM):
+            old_handlers[signum] = _build_signal.signal(signum, interrupted)
+        try: return process.wait(timeout=3600)
+        except _build_subprocess.TimeoutExpired:
+            _build_terminate_process(process); _build_atomic(run_fd,'build.log',b'[REDACTED]\\n'); _fail('build_timeout')
+    finally:
+        _build_terminate_process(process)
+        for signum, handler in old_handlers.items(): _build_signal.signal(signum, handler)
 @register_action('target_build')
 def target_build(payload):
     keys={'workdir','run_dir','model_path','drafter_path','work_token','run_token','entries','snapshot_id','applied_tree_hash','dirty','allow_dirty','jobs'}
@@ -421,12 +427,10 @@ def target_build(payload):
             finally: _build_os.close(parent)
         if _frame_hash(hashed)!=data['applied_tree_hash']: _fail('entry_changed')
         cwd='/proc/self/fd/%d'%work_fd
-        try: made=_build_subprocess.run(('/usr/bin/make','-C','engine/ds4','cuda-spark','-j%d'%data['jobs']),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd=cwd,env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},timeout=3600,check=False)
-        except _build_subprocess.TimeoutExpired: _build_atomic(run_fd,'build.log',b'[REDACTED]\\n'); _fail('build_timeout')
-        if len(made.stdout)>1048576 or len(made.stderr)>1048576: _build_atomic(run_fd,'build.log',b'[REDACTED_OVERSIZE]\\n'); _fail('build_output_oversize')
+        made=_build_make(cwd,data['jobs'],run_fd)
         # Raw producer output never reaches disk: this fixed log marker is safe and bounded.
-        log=b'[REDACTED]\\n'; _build_atomic(run_fd,'build.log',log)
-        if made.returncode: _fail('build_command_failed')
+        log=b'[REDACTED]\n'; _build_atomic(run_fd,'build.log',log)
+        if made: _fail('build_command_failed')
         binary=cwd+'/engine/ds4/ds4-server'; digest,size=_build_file_hash(binary,True)
         try: version_run=_build_subprocess.run((binary,'--version'),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},timeout=10,check=False)
         except _build_subprocess.TimeoutExpired: _fail('build_binary_invalid')

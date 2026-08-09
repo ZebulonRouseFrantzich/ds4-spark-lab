@@ -13,6 +13,7 @@ import os
 import secrets
 import stat
 import sys
+import time
 from pathlib import PurePosixPath
 from typing import Any, Callable
 
@@ -21,7 +22,7 @@ PROTOCOL_VERSION = 1
 MARKER_PREFIX = ".targetctl-owner-v"
 LOCK_NAME = ".targetctl-operation-lock-v1"
 LOCK_TOKEN_NAME = "token"
-REPORT_NAMES = frozenset({"doctor.json", "build.json", "run.json", "status.json", "server.log"})
+REPORT_NAMES = frozenset({"doctor.json", "source.json", "build.json", "run.json", "status.json", "build.log", "server.log"})
 MAX_REPORT_BYTES = 1024 * 1024
 MAX_ENTRIES = 100_000
 
@@ -238,7 +239,14 @@ def _init_root(root: str, kind: str) -> dict[str, Any]:
         identity = _identity(root_fd)
         _assert_pinned_root(root_fd, identity)
         try:
-            names = os.listdir(root_fd)
+            with os.scandir(os.dup(root_fd)) as entries:
+                names = []
+                for entry in entries:
+                    names.append(entry.name)
+                    if len(names) > 1:
+                        _fail("unmarked_populated_root")
+        except HelperError:
+            raise
         except OSError:
             _fail("unsafe_root")
         marker = _marker_name(kind)
@@ -397,47 +405,247 @@ def inspect_roots(payload: Any) -> dict[str, Any]:
         os.close(work_fd)
 
 
-def _write_lock_token(lock_fd: int, token: str) -> None:
+def _boot_id() -> str:
     try:
-        fd = os.open(LOCK_TOKEN_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=lock_fd)
+        fd = os.open("/proc/sys/kernel/random/boot_id", os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
         try:
-            os.write(fd, token.encode("ascii"))
+            value = os.read(fd, 64)
+            if os.read(fd, 1):
+                _fail("unsafe_lock")
+        finally:
+            os.close(fd)
+    except HelperError:
+        raise
+    except OSError:
+        _fail("unsafe_lock")
+    try:
+        text = value.decode("ascii").strip()
+    except UnicodeDecodeError:
+        _fail("unsafe_lock")
+    if len(text) != 36 or any(character not in "0123456789abcdef-" for character in text):
+        _fail("unsafe_lock")
+    return text
+
+
+def _lease_seconds(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 7200:
+        _fail("invalid_lease")
+    return value
+
+
+def _lock_state(lock_fd: int) -> dict[str, Any]:
+    try:
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        raw = os.read(lock_fd, 1024)
+        if os.read(lock_fd, 1):
+            _fail("unsafe_lock")
+    except OSError:
+        _fail("unsafe_lock")
+    try:
+        state = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _fail("unsafe_lock")
+    if not isinstance(state, dict) or set(state) != {"boot_id", "deadline_monotonic_ns", "token"}:
+        _fail("unsafe_lock")
+    token, boot_id, deadline = state["token"], state["boot_id"], state["deadline_monotonic_ns"]
+    if (not isinstance(token, str) or len(token) != 64 or any(character not in "0123456789abcdef" for character in token) or
+            not isinstance(boot_id, str) or len(boot_id) != 36 or any(character not in "0123456789abcdef-" for character in boot_id) or
+            not isinstance(deadline, int) or isinstance(deadline, bool) or deadline < 1):
+        _fail("unsafe_lock")
+    return state
+
+
+def _install_lock(root_fd: int, state: dict[str, Any]) -> bool:
+    name = ".targetctl-lock-stage-" + secrets.token_hex(16)
+    data = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("ascii")
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=root_fd)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    _fail("unsafe_lock")
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.fsync(lock_fd)
+        try:
+            os.link(name, LOCK_NAME, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        os.unlink(name, dir_fd=root_fd)
+        os.fsync(root_fd)
+        return True
+    except HelperError:
+        raise
+    except OSError:
+        _fail("lock_failed")
+    finally:
+        try:
+            os.unlink(name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _fail("unsafe_lock")
+
+
+def _remove_lock(root_fd: int, lock_fd: int, lock_identity: dict[str, int]) -> None:
+    _assert_named_identity(root_fd, LOCK_NAME, lock_identity, "unsafe_lock")
+    try:
+        os.unlink(LOCK_NAME, dir_fd=root_fd)
+        os.fsync(root_fd)
+    except OSError:
+        _fail("lock_release_failed")
+
+
+def _cleanup_stale_receiver_pairs(root_fd: int) -> int:
+    prefix = ".targetctl-source-receiver-"
+    pairs: dict[str, set[str]] = {}
+    try:
+        with os.scandir(os.dup(root_fd)) as entries:
+            for count, entry in enumerate(entries, start=1):
+                if count > MAX_ENTRIES:
+                    _fail("unsafe_lock")
+                name = entry.name
+                extension = ".py" if name.endswith(".py") else ".json" if name.endswith(".json") else None
+                if extension is None or not name.startswith(prefix):
+                    continue
+                nonce = name[len(prefix):-len(extension)]
+                if len(nonce) != 32 or any(character not in "0123456789abcdef" for character in nonce):
+                    continue
+                pairs.setdefault(nonce, set()).add(extension)
+    except HelperError:
+        raise
     except OSError:
         _fail("unsafe_lock")
+    cleaned = 0
+    for nonce, extensions in pairs.items():
+        if extensions != {".py", ".json"}:
+            continue
+        records: list[tuple[str, dict[str, int], int]] = []
+        try:
+            for extension, mode in ((".py", 0o700), (".json", 0o600)):
+                name = prefix + nonce + extension
+                fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
+                item = os.fstat(fd)
+                if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != mode:
+                    os.close(fd)
+                    _fail("unsafe_lock")
+                records.append((name, _identity(fd), fd))
+            for name, identity, fd in records:
+                _assert_named_identity(root_fd, name, identity, "unsafe_lock")
+                os.unlink(name, dir_fd=root_fd)
+                os.close(fd)
+            os.fsync(root_fd)
+        except HelperError:
+            for _, _, fd in records:
+                try: os.close(fd)
+                except OSError: pass
+            raise
+        except OSError:
+            for _, _, fd in records:
+                try: os.close(fd)
+                except OSError: pass
+            _fail("unsafe_lock")
+        cleaned += 1
+    return cleaned
+
+
+def _cleanup_stale_lock_stages(root_fd: int) -> int:
+    prefix = ".targetctl-lock-stage-"
+    candidates: list[str] = []
+    try:
+        with os.scandir(os.dup(root_fd)) as entries:
+            for count, entry in enumerate(entries, start=1):
+                if count > MAX_ENTRIES:
+                    _fail("unsafe_lock")
+                name = entry.name
+                nonce = name[len(prefix):] if name.startswith(prefix) else ""
+                if len(nonce) == 32 and all(character in "0123456789abcdef" for character in nonce):
+                    candidates.append(name)
+    except OSError:
+        _fail("unsafe_lock")
+    cleaned = 0
+    for name in candidates:
+        try:
+            item = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or item.st_nlink != 1:
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
+            identity = _identity(fd)
+            current = os.fstat(fd)
+            if (current.st_dev, current.st_ino, current.st_nlink) != (item.st_dev, item.st_ino, 1):
+                os.close(fd)
+                continue
+            _assert_named_identity(root_fd, name, identity, "unsafe_lock")
+            os.unlink(name, dir_fd=root_fd)
+            os.close(fd)
+            cleaned += 1
+        except OSError:
+            continue
+    if cleaned:
+        try: os.fsync(root_fd)
+        except OSError: _fail("unsafe_lock")
+    return cleaned
+
+
+def _reclaim_expired_lock(root_fd: int, current_boot_id: str) -> tuple[bool, int]:
+    try:
+        os.stat(LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True, 0
+    except OSError:
+        _fail("unsafe_lock")
+    lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
+    try:
+        lock_identity = _identity(lock_fd)
+        state = _lock_state(lock_fd)
+        _assert_named_identity(root_fd, LOCK_NAME, lock_identity, "unsafe_lock")
+        if state["boot_id"] == current_boot_id and time.monotonic_ns() < state["deadline_monotonic_ns"]:
+            return False, 0
+        _remove_lock(root_fd, lock_fd, lock_identity)
+        return True, _cleanup_stale_receiver_pairs(root_fd)
+    finally:
+        os.close(lock_fd)
 
 
 @register_action("acquire_lock")
 def acquire_lock(payload: Any) -> dict[str, Any]:
-    data = _require_object(payload, {"run_dir", "run_token"})
+    data = _require_object(payload, {"run_dir", "run_token", "lease_seconds"})
+    lease_seconds = _lease_seconds(data["lease_seconds"])
     root_fd = _open_root(_canonical(_validate_absolute_path(data["run_dir"])))
     try:
         identity = _root_identity(root_fd, "run", data["run_token"])
-        try:
-            os.mkdir(LOCK_NAME, 0o700, dir_fd=root_fd)
-            os.fsync(root_fd)
-        except FileExistsError:
+        boot_id = _boot_id()
+        stale_lock_stages_cleaned = _cleanup_stale_lock_stages(root_fd)
+        token = secrets.token_hex(32)
+        state = {"boot_id": boot_id, "deadline_monotonic_ns": time.monotonic_ns() + lease_seconds * 1_000_000_000, "token": token}
+        reclaimed = False
+        stale_receiver_pairs_cleaned = 0
+        for attempt in range(2):
+            if _install_lock(root_fd, state):
+                break
+            available, cleaned = _reclaim_expired_lock(root_fd, boot_id)
+            if not available:
+                _fail("lock_busy")
+            reclaimed = True
+            stale_receiver_pairs_cleaned += cleaned
+        else:
             _fail("lock_busy")
-        except OSError:
-            _fail("lock_failed")
-        lock_fd = _open_directory(root_fd, LOCK_NAME, missing_code="unsafe_lock")
+        lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
         try:
             lock_identity = _identity(lock_fd)
-            if not _is_owned_directory(os.fstat(lock_fd)):
+            installed = _lock_state(lock_fd)
+            if not hmac.compare_digest(installed["token"], token):
                 _fail("unsafe_lock")
-            _write_lock_token(lock_fd, secrets.token_hex(32))
-            token_fd, _ = _open_regular(LOCK_TOKEN_NAME, dir_fd=lock_fd)
-            try:
-                token = os.read(token_fd, 128).decode("ascii")
-            finally:
-                os.close(token_fd)
             _assert_named_identity(root_fd, LOCK_NAME, lock_identity, "unsafe_lock")
             _assert_pinned_root(root_fd, identity)
             _read_marker(root_fd, "run", data["run_token"])
-            return {"lock_token": token}
+            return {"lock_token": token, "reclaimed": reclaimed, "stale_receiver_pairs_cleaned": stale_receiver_pairs_cleaned, "stale_lock_stages_cleaned": stale_lock_stages_cleaned}
         finally:
             os.close(lock_fd)
     finally:
@@ -450,30 +658,14 @@ def release_lock(payload: Any) -> dict[str, Any]:
     root_fd = _open_root(_canonical(_validate_absolute_path(data["run_dir"])))
     try:
         identity = _root_identity(root_fd, "run", data["run_token"])
-        lock_fd = _open_directory(root_fd, LOCK_NAME, missing_code="unsafe_lock")
+        lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
         try:
             lock_identity = _identity(lock_fd)
-            if not _is_owned_directory(os.fstat(lock_fd)):
-                _fail("unsafe_lock")
-            fd, _ = _open_regular(LOCK_TOKEN_NAME, dir_fd=lock_fd)
-            try:
-                token = os.read(fd, 128)
-                if os.read(fd, 1):
-                    _fail("unsafe_lock")
-            finally:
-                os.close(fd)
+            state = _lock_state(lock_fd)
             expected = data["lock_token"]
-            if not isinstance(expected, str) or not hmac.compare_digest(token.decode("ascii", "ignore"), expected):
+            if not isinstance(expected, str) or not hmac.compare_digest(state["token"], expected):
                 _fail("lock_token_mismatch")
-            _assert_named_identity(root_fd, LOCK_NAME, lock_identity, "unsafe_lock")
-            try:
-                os.unlink(LOCK_TOKEN_NAME, dir_fd=lock_fd)
-                os.fsync(lock_fd)
-                _assert_named_identity(root_fd, LOCK_NAME, lock_identity, "unsafe_lock")
-                os.rmdir(LOCK_NAME, dir_fd=root_fd)
-                os.fsync(root_fd)
-            except OSError:
-                _fail("lock_release_failed")
+            _remove_lock(root_fd, lock_fd, lock_identity)
             _assert_pinned_root(root_fd, identity)
             _read_marker(root_fd, "run", data["run_token"])
             return {"released": True}

@@ -65,12 +65,7 @@ class RemoteFdSecurityTests(unittest.TestCase):
             run.symlink_to(replacement, target_is_directory=True)
 
             self.assertEqual(remote._read_marker(root_fd, "run", initialized["run"]["token"])["kind"], "run")
-            os.mkdir(remote.LOCK_NAME, 0o700, dir_fd=root_fd)
-            lock_fd = remote._open_directory(root_fd, remote.LOCK_NAME)
-            try:
-                remote._write_lock_token(lock_fd, "a" * 64)
-            finally:
-                os.close(lock_fd)
+            self.assertTrue(remote._install_lock(root_fd, {"boot_id": remote._boot_id(), "deadline_monotonic_ns": 1, "token": "a" * 64}))
             self._write_at(root_fd, "doctor.json", b"{}")
             report_fd, _ = remote._open_regular("doctor.json", dir_fd=root_fd)
             try:
@@ -89,12 +84,12 @@ class RemoteFdSecurityTests(unittest.TestCase):
                 remote._assert_pinned_root(root_fd, {"device": pinned["device"], "inode": pinned["inode"] + 1})
             self.assertEqual(changed.exception.code, "unsafe_root")
 
-            lock_fd = remote._open_directory(root_fd, remote.LOCK_NAME)
+            lock_fd, _ = remote._open_regular(remote.LOCK_NAME, dir_fd=root_fd)
             try:
-                os.unlink(remote.LOCK_TOKEN_NAME, dir_fd=lock_fd)
+                lock_identity = remote._identity(lock_fd)
+                remote._remove_lock(root_fd, lock_fd, lock_identity)
             finally:
                 os.close(lock_fd)
-            os.rmdir(remote.LOCK_NAME, dir_fd=root_fd)
             os.unlink("doctor.json", dir_fd=root_fd)
             os.unlink("entry.txt", dir_fd=root_fd)
             os.fsync(root_fd)
@@ -105,7 +100,7 @@ class RemoteFdSecurityTests(unittest.TestCase):
         payload = self._payload()
         initialized = remote.initialize_roots(payload)
         token = initialized["run"]["token"]
-        acquired = remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": token})
+        acquired = remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": token, "lease_seconds": 60})
         self.assertEqual(
             remote.release_lock({"run_dir": payload["run_dir"], "run_token": token, "lock_token": acquired["lock_token"]}),
             {"released": True},

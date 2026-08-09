@@ -94,9 +94,9 @@ class RemoteRootTests(unittest.TestCase):
     def test_lock_is_exclusive_and_requires_its_exact_token(self) -> None:
         payload, state = initialized(self.tmp_path)
         run_token = state["run"]["token"]
-        first = remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token})
+        first = remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lease_seconds": 60})
         with self.assertRaises(remote.HelperError) as error:
-            remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token})
+            remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lease_seconds": 60})
         self.assertEqual(error.exception.code, "lock_busy")
         with self.assertRaises(remote.HelperError) as error:
             remote.release_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lock_token": "0" * 64})
@@ -105,7 +105,36 @@ class RemoteRootTests(unittest.TestCase):
             remote.release_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lock_token": first["lock_token"]}),
             {"released": True},
         )
-        self.assertIn("lock_token", remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token}))
+        self.assertIn("lock_token", remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lease_seconds": 60}))
+
+    def test_expired_lock_reclaims_only_owned_receiver_pairs_and_malformed_fails_closed(self) -> None:
+        payload, state = initialized(self.tmp_path)
+        run = Path(payload["run_dir"])
+        run_token = state["run"]["token"]
+        lock = run / remote.LOCK_NAME
+        lock.write_text(json.dumps({"boot_id": remote._boot_id(), "deadline_monotonic_ns": time.monotonic_ns() - 1, "token": "a" * 64}), encoding="ascii")
+        lock.chmod(0o600)
+        nonce = "b" * 32
+        receiver = run / f".targetctl-source-receiver-{nonce}"
+        receiver.with_suffix(".py").write_text("#!/usr/bin/python3\n", encoding="ascii")
+        receiver.with_suffix(".py").chmod(0o700)
+        receiver.with_suffix(".json").write_text("{}", encoding="ascii")
+        receiver.with_suffix(".json").chmod(0o600)
+        canary = run / "canary"
+        canary.write_text("keep", encoding="ascii")
+        canary.chmod(0o600)
+        recovered = remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lease_seconds": 60})
+        self.assertTrue(recovered["reclaimed"])
+        self.assertEqual(recovered["stale_receiver_pairs_cleaned"], 1)
+        self.assertTrue(canary.exists())
+        self.assertFalse(receiver.with_suffix(".py").exists())
+        self.assertFalse(receiver.with_suffix(".json").exists())
+        remote.release_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lock_token": recovered["lock_token"]})
+        lock.write_text("not-json", encoding="ascii")
+        lock.chmod(0o600)
+        with self.assertRaises(remote.HelperError) as error:
+            remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lease_seconds": 60})
+        self.assertEqual(error.exception.code, "unsafe_lock")
 
     def test_overlap_and_weak_or_symlink_reports_fail_closed(self) -> None:
         payload = roots(self.tmp_path)

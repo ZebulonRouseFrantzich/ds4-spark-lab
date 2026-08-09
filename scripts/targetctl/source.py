@@ -26,6 +26,7 @@ EXCLUSION_POLICY_VERSION = 1
 STATE_SCHEMA_VERSION = 1
 MAX_ENTRIES = 100_000
 MAX_FILE_BYTES = 1024 * 1024 * 1024 * 16
+SOURCE_LOCK_LEASE_SECONDS = 3_600
 _COMPONENT = re.compile(r"^[A-Za-z0-9._+@%=-]+$", re.ASCII)
 _HEX = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _MARKER = ".targetctl-owner-v1-work.json"
@@ -843,9 +844,80 @@ def _source_safe_tree(root_fd):
             _fail("unsafe_entry")
     _source_no_nested_mounts(root_fd)
     visit(root_fd)
+def _source_fd_path(fd):
+    try:
+        value = os.readlink("/proc/self/fd/%d" % fd)
+    except OSError:
+        _fail("unsafe_runtime_path")
+    if not value.startswith("/") or value.endswith(" (deleted)"):
+        _fail("unsafe_runtime_path")
+    return _canonical(value)
+
+
+def _source_open_runtime_file(path):
+    parts = path.split("/")[1:]
+    try:
+        parent_fd = os.open("/", _DIRECTORY_FLAGS)
+        for part in parts[:-1]:
+            next_fd = _open_directory(parent_fd, part)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd, item = _open_entry_regular(parts[-1], dir_fd=parent_fd)
+        return parent_fd, fd, item
+    except HelperError:
+        try: os.close(parent_fd)
+        except (OSError, UnboundLocalError): pass
+        raise
+    except OSError:
+        try: os.close(parent_fd)
+        except (OSError, UnboundLocalError): pass
+        _fail("unsafe_runtime_path")
+
+
+def _source_reject_tree_identity(root_fd, identity):
+    root = os.fstat(root_fd)
+    count = [0]
+    def visit(fd):
+        try:
+            with os.scandir(os.dup(fd)) as children:
+                for child in children:
+                    count[0] += 1
+                    if count[0] > MAX_ENTRIES: _fail("unsafe_runtime_path")
+                    item = child.stat(follow_symlinks=False)
+                    if (item.st_dev, item.st_ino) == (identity.st_dev, identity.st_ino):
+                        _fail("unsafe_runtime_path")
+                    if not (stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode)) or item.st_dev != root.st_dev:
+                        _fail("unsafe_runtime_path")
+                    if stat.S_ISDIR(item.st_mode):
+                        child_fd = _open_directory(fd, child.name)
+                        try: visit(child_fd)
+                        finally: os.close(child_fd)
+        except HelperError: raise
+        except OSError: _fail("unsafe_runtime_path")
+    visit(root_fd)
+
+
+def _source_validate_runtime_paths(paths, work_fd, run_fd):
+    opened = []
+    try:
+        for key in ("model_path", "drafter_path"):
+            parent_fd, fd, item = _source_open_runtime_file(paths[key])
+            opened.append((parent_fd, fd, item, _source_fd_path(fd)))
+        model, drafter = opened
+        if ((model[2].st_dev, model[2].st_ino) == (drafter[2].st_dev, drafter[2].st_ino)):
+            _fail("unsafe_runtime_path")
+        roots = (_source_fd_path(work_fd), _source_fd_path(run_fd))
+        for _, _, item, resolved in opened:
+            if any(_overlaps(resolved, root) for root in roots):
+                _fail("unsafe_runtime_path")
+            for root_fd in (work_fd, run_fd):
+                _source_reject_tree_identity(root_fd, item)
+    finally:
+        for parent_fd, fd, _, _ in opened:
+            os.close(fd); os.close(parent_fd)
 def _source_receiver_program(run_dir, auth_name):
     return """#!/usr/bin/python3
-import hashlib, hmac, json, os, stat, sys
+import hashlib, hmac, json, os, stat, sys, time
 RUN = %r
 AUTH = %r
 MARKER = ".targetctl-owner-v1-work.json"
@@ -912,17 +984,27 @@ run_fd = dopen(RUN)
 try:
     raw = contents(run_fd, AUTH)
     auth = json.loads(raw.decode("ascii"))
-    if not isinstance(auth, dict) or set(auth) != {"workdir","work_token","run_token","work_identity","run_identity","lock_token"}: fail()
+    if not isinstance(auth, dict) or set(auth) != {"workdir","work_token","run_token","work_identity","run_identity","lock_token","lock_boot_id","lock_deadline_monotonic_ns"}: fail()
     run_info = os.fstat(run_fd)
     if (not stat.S_ISDIR(run_info.st_mode) or run_info.st_uid != os.geteuid() or stat.S_IMODE(run_info.st_mode) != 0o700 or
         (run_info.st_dev, run_info.st_ino) != (auth["run_identity"]["device"], auth["run_identity"]["inode"])): fail()
     marker = json.loads(contents(run_fd, ".targetctl-owner-v1-run.json", 4096).decode("ascii"))
     if not isinstance(marker, dict) or marker.get("kind") != "run" or marker.get("version") != 1 or not hmac.compare_digest(marker.get("token", ""), auth["run_token"]): fail()
-    lock_fd = os.open(LOCK, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=run_fd)
+    lock_fd = os.open(LOCK, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=run_fd)
     try:
         lock_info = os.fstat(lock_fd)
-        if not stat.S_ISDIR(lock_info.st_mode) or lock_info.st_uid != os.geteuid() or stat.S_IMODE(lock_info.st_mode) != 0o700: fail()
-        if not hmac.compare_digest(contents(lock_fd, "token", 128).decode("ascii"), auth["lock_token"]): fail()
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.geteuid() or stat.S_IMODE(lock_info.st_mode) != 0o600: fail()
+        try:
+            raw_lock = os.read(lock_fd, 1025)
+            if len(raw_lock) > 1024: fail()
+            lock = json.loads(raw_lock.decode("ascii"))
+            boot = open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii").read(64).strip()
+        except Exception: fail()
+        if (not isinstance(lock, dict) or set(lock) != {"boot_id","deadline_monotonic_ns","token"} or
+            not isinstance(lock.get("deadline_monotonic_ns"), int) or isinstance(lock.get("deadline_monotonic_ns"), bool) or
+            not isinstance(lock.get("boot_id"), str) or not hmac.compare_digest(lock.get("token", ""), auth["lock_token"]) or
+            not hmac.compare_digest(lock["boot_id"], auth["lock_boot_id"]) or lock["deadline_monotonic_ns"] != auth["lock_deadline_monotonic_ns"] or
+            not hmac.compare_digest(boot, lock["boot_id"]) or time.monotonic_ns() >= lock["deadline_monotonic_ns"]): fail()
     finally: os.close(lock_fd)
     work_fd = root(auth["workdir"], "work", auth["work_token"], auth["work_identity"])
     try:
@@ -963,25 +1045,27 @@ def source_prepare_receiver(payload):
     work_fd, run_fd, work_identity, run_identity = _source_open(paths)
     try:
         _source_safe_tree(work_fd)
-        lock_fd = _open_directory(run_fd, LOCK_NAME, missing_code="unsafe_lock")
+        lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=run_fd)
         try:
-            if not _is_owned_directory(os.fstat(lock_fd)):
+            lock_state = _lock_state(lock_fd)
+            if (not hmac.compare_digest(lock_state["token"], data["lock_token"]) or
+                    not hmac.compare_digest(lock_state["boot_id"], _boot_id()) or
+                    time.monotonic_ns() >= lock_state["deadline_monotonic_ns"]):
                 _fail("unsafe_lock")
-            token_fd, _ = _open_regular(LOCK_TOKEN_NAME, dir_fd=lock_fd)
-            try:
-                actual_lock = os.read(token_fd, 128).decode("ascii", "strict")
-            except (OSError, UnicodeDecodeError):
-                _fail("unsafe_lock")
-            finally:
-                os.close(token_fd)
-            if not hmac.compare_digest(actual_lock, data["lock_token"]):
+            # Descriptor-validate the private runtime files after each
+            # destructive-tree check, directly before receiver creation.
+            _source_validate_runtime_paths(paths, work_fd, run_fd)
+            lock_state = _lock_state(lock_fd)
+            if (not hmac.compare_digest(lock_state["token"], data["lock_token"]) or
+                    not hmac.compare_digest(lock_state["boot_id"], _boot_id()) or
+                    time.monotonic_ns() >= lock_state["deadline_monotonic_ns"]):
                 _fail("unsafe_lock")
         finally:
             os.close(lock_fd)
         suffix = data["receiver_nonce"]
         auth_name = ".targetctl-source-receiver-" + suffix + ".json"
         receiver_name = ".targetctl-source-receiver-" + suffix + ".py"
-        auth = json.dumps({"workdir": paths["workdir"], "work_token": paths["work_token"], "run_token": paths["run_token"], "work_identity": work_identity, "run_identity": run_identity, "lock_token": data["lock_token"]}, sort_keys=True, separators=(",", ":")).encode("ascii")
+        auth = json.dumps({"workdir": paths["workdir"], "work_token": paths["work_token"], "run_token": paths["run_token"], "work_identity": work_identity, "run_identity": run_identity, "lock_token": data["lock_token"], "lock_boot_id": lock_state["boot_id"], "lock_deadline_monotonic_ns": lock_state["deadline_monotonic_ns"]}, sort_keys=True, separators=(",", ":")).encode("ascii")
         created = []
         try:
             for name, content, mode in ((auth_name, auth, 0o600), (receiver_name, _source_receiver_program(paths["run_dir"], auth_name).encode("ascii"), 0o700)):
@@ -1043,6 +1127,7 @@ def source_preflight(payload):
         _assert_pinned_root(work_fd, work_identity)
         _assert_pinned_root(run_fd, run_identity)
         _source_safe_tree(work_fd)
+        _source_validate_runtime_paths(paths, work_fd, run_fd)
         _read_marker(work_fd, "work", paths["work_token"])
         _read_marker(run_fd, "run", paths["run_token"])
         return {"work": work_identity, "run": run_identity}
@@ -1116,7 +1201,7 @@ def source_write_state(payload):
         os.close(run_fd)
 '''
 
-_EXTENSION_ERRORS = frozenset({"source_lifecycle", "unexpected_entry", "unsafe_mount"})
+_EXTENSION_ERRORS = frozenset({"source_lifecycle", "unexpected_entry", "unsafe_mount", "unsafe_runtime_path"})
 
 
 def _remote_payload(config: Any, state: Mapping[str, Any], entries: Sequence[SourceEntry]) -> dict[str, Any]:
@@ -1151,18 +1236,22 @@ def sync_source(config: Any, transport: LocalTransport | SSHTransport, *, snapsh
     if getattr(config, "mode", None) != "ssh" or not isinstance(transport, SSHTransport):
         raise _error("transport_invalid", "source synchronization transport is invalid")
     state = _load_capabilities(root, config.name)
+    initialized_now = False
     if state is None:
         initialized = transport.run_helper("initialize_roots", {"workdir": config.workdir, "run_dir": config.run_dir, "model_path": config.model_path, "drafter_path": config.drafter_path}, allowed_error_codes={"marker_exists", "unmarked_populated_root", "root_create_failed", "symlink_path", "path_overlap", "unsafe_root"})
         if not isinstance(initialized, Mapping):
             raise _error("initialization_failed", "target roots could not be initialized")
         _store_capabilities(root, config.name, initialized)
-        return SyncResult(source, True, None)
+        state = _load_capabilities(root, config.name)
+        if state is None:
+            raise _error("initialization_failed", "target roots could not be initialized")
+        initialized_now = True
     payload = _remote_payload(config, state, source.entries)
     inspected = transport.run_helper("inspect_roots", {key: payload[key] for key in ("workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token")}, allowed_error_codes={"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"})
     _expect_root_identities(inspected, state)
     preflight = transport.run_helper("source_preflight", payload, extension_source=_SOURCE_EXTENSION, allowed_error_codes=_EXTENSION_ERRORS | {"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"})
     _expect_root_identities(preflight, state)
-    lock = transport.run_helper("acquire_lock", {"run_dir": config.run_dir, "run_token": state["run_token"]}, allowed_error_codes={"lock_busy", "lock_failed", "unsafe_lock", "marker_mismatch", "unsafe_root"})
+    lock = transport.run_helper("acquire_lock", {"run_dir": config.run_dir, "run_token": state["run_token"], "lease_seconds": SOURCE_LOCK_LEASE_SECONDS}, allowed_error_codes={"lock_busy", "lock_failed", "unsafe_lock", "invalid_lease", "marker_mismatch", "unsafe_root"})
     if not isinstance(lock, Mapping) or not isinstance(lock.get("lock_token"), str):
         raise _error("lock_failed", "target synchronization lock could not be acquired")
     primary: BaseException | None = None
@@ -1186,7 +1275,7 @@ def sync_source(config: Any, transport: LocalTransport | SSHTransport, *, snapsh
         transport.run_helper("source_write_state", {"run_dir": config.run_dir, "run_token": state["run_token"], "snapshot_id": source.snapshot_id, "applied_tree_hash": source.applied_tree_hash, "dirty": source.dirty}, extension_source=_SOURCE_EXTENSION, allowed_error_codes={"unsafe_state", "marker_mismatch", "unsafe_root", "missing_path"})
         final_roots = transport.run_helper("inspect_roots", {key: payload[key] for key in ("workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token")}, allowed_error_codes={"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"})
         _expect_root_identities(final_roots, state)
-        return SyncResult(source, False, source.applied_tree_hash)
+        return SyncResult(source, initialized_now, source.applied_tree_hash)
     except BaseException as error:
         primary = error
         raise
