@@ -12,18 +12,54 @@ multi-turn continuations, and mixed latency requirements.
 
 ## Current status
 
-**Planning and documentation.**
+**Phase 00 — Workspace bootstrap: Qualified (2026-08-08).**
 
-The implementation roadmap is defined, but the workspace submodules, Nix/Just
-tooling, target orchestration, benchmark harness, and engine changes have not
-yet landed. Commands described in later phase documents are acceptance targets,
-not claims about the current checkout.
+The qualified implementation is commit
+`69af8ea605972ba79430db3d92dbf1940f824df2` on
+`phase/00_workspace_bootstrap`. It establishes the paired public source
+submodules, pinned Nix userspace, and root Just workflow; it does not implement
+target execution, benchmarks, or engine policy. The anonymous qualification clone
+explicitly selected this unmerged branch rather than observing a default-branch
+clone. See the [Phase 00 qualification record](docs/roadmap/phase-00-qualification.md)
+for the retained evidence.
+
+Later phases remain **Planned**. Their documents describe acceptance targets, not
+claims about this checkout.
 
 Start with:
 
 - [Master project specification](PROJECT.md)
 - [Roadmap and phase status](docs/roadmap/README.md)
 - [Repository instructions for coding agents](AGENTS.md)
+
+## Getting started
+
+Nix must have `nix-command` and `flakes` experimental features enabled. Clone
+the qualified public workspace recursively, explicitly selecting the qualified
+branch:
+
+```sh
+git clone --branch phase/00_workspace_bootstrap --recurse-submodules https://github.com/ZebulonRouseFrantzich/ds4-spark-lab.git
+cd ds4-spark-lab
+nix develop
+```
+
+Inside the pinned Nix shell, the implemented workspace recipes are:
+
+```sh
+just                 # default recipe: help
+just help
+just status
+just doctor
+just tool-versions
+just submodules
+just remotes-check
+just flake-check
+```
+
+`just submodules` is the explicit, idempotent initializer and required
+additional-remotes setup. `just remotes-check` verifies remote policy and never
+mutates configuration.
 
 ## Project goal
 
@@ -80,9 +116,15 @@ measurement-gated experiments. They are not V1 or V2 promises.
 | [`ZebulonRouseFrantzich/ds4-on-spark`](https://github.com/ZebulonRouseFrantzich/ds4-on-spark) | GB10 integration and release packaging fork |
 | [`ZebulonRouseFrantzich/ds4-spark-lab`](https://github.com/ZebulonRouseFrantzich/ds4-spark-lab) | Workspace, source pairing, tooling, target orchestration, benchmarks, and reports |
 
-The two forks will be public-HTTPS Git submodules in this repository.
-Anonymous recursive clone and hosted CI must not require GitHub SSH
-credentials.
+The two forks are committed public-HTTPS Git submodules. Their gitlinks pin the
+published `spark` lineage:
+
+```text
+engine/ds4              df641a7c4358dd6ca3b5acb46cf884a7d42066ed
+spark/ds4-on-spark      60c00afe24dc361c19e53037b599d98d27f32d7b
+```
+
+Anonymous recursive clone and hosted CI do not require GitHub SSH credentials.
 
 Inside each fork, Git remotes follow the standard writable-fork/upstream model:
 
@@ -102,19 +144,20 @@ as needed but incorporated only at deliberate milestone boundaries.
 
 ## Baseline warning
 
-The current engine fork's `main` is **not** the V1 baseline.
+The engine gitlink is **not** the fork's `main`; it tracks the published
+`spark` branch at the exact `v0.5.6`-peeled commit:
 
 ```text
-Entrpi/ds4 v0.5.6 resolved commit:
+Entrpi/ds4 v0.5.6 and engine/ds4 spark:
   df641a7c4358dd6ca3b5acb46cf884a7d42066ed
 
-current engine fork main:
-  b0309611041655f4e45671cfd9c9886aff161406
+spark/ds4-on-spark spark:
+  60c00afe24dc361c19e53037b599d98d27f32d7b
 ```
 
-The `v0.5.6` commit is on Entrpi's `batched-serving` lineage. Phase 00 will seed
-the fork's `spark` branch from the exact resolved commit before adding the
-engine submodule. Scheduler work must not start from the fork's current `main`.
+The engine commit is on Entrpi's `batched-serving` lineage. Phase 00 seeded and
+published the fork's `spark` branch from that exact commit before recording the
+engine gitlink. Planned scheduler work must not start from the fork's `main`.
 
 ## Roadmap
 
@@ -159,17 +202,18 @@ This is a one-target abstraction, not a deployment or cluster framework.
 
 ## Reproducibility boundary
 
-Nix will pin userspace development tools through `flake.lock`. Just will define
-the normal project workflow. During V1, the execution target retains ownership
-of:
+Phase 00 pins userspace development tools through `flake.lock` and defines the
+normal workspace workflow in Just. It deliberately adds no Nix compiler, CUDA
+toolkit, or NVCC: during V1, the execution target retains ownership of:
 
 - NVIDIA driver and runtime;
 - CUDA toolkit and NVCC;
 - host C/C++ compiler accepted by NVCC;
 - target firmware and system configuration.
 
-Qualified results record exact lab/engine/integration commits, dirty state,
-source-content identity, Nix lock, target toolchain, model/drafter hashes,
+The qualification record retains the exact lab, engine, and integration commits,
+their dirty state, and Nix lock identity. Later execution and benchmark
+qualification must additionally record target toolchain, model/drafter hashes,
 scenario/prompt hashes, and measurement vantage point.
 
 ## Privacy and portability
@@ -184,10 +228,11 @@ Committed project files never contain:
 - contributor home-directory paths;
 - secrets in benchmark logs or reports.
 
-The canonical logical target is `spark`; same-machine mode is `local`. Real
-target configuration is gitignored and based on a committed placeholder-only
-schema. Generated benchmark provenance may record physical hardware
-vendor/model, but never access details.
+The ignore policy is deliberately narrow: local configuration and assets,
+regenerable outputs, development caches, local environment overrides, and
+editor temporary state. Trackable project artifacts remain visible. Later
+benchmark provenance may record physical hardware vendor/model, but never
+access details.
 
 ## Benchmark philosophy
 

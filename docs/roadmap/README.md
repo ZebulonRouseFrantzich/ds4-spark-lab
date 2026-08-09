@@ -12,13 +12,13 @@ required.
 
 ## Current status
 
-The repository is in the documentation and planning stage. No workspace
-submodules, remote-target automation, benchmark harness, or engine behavior
-changes are implied by these documents.
+Phase 00 workspace bootstrap is **Qualified** as of 2026-08-08; retained
+evidence is in its [qualification record](phase-00-qualification.md). Phase 01
+and all later numbered phases remain **Planned**; the research backlog remains **Gated**.
 
 | ID | Phase | Status | Primary repositories | Depends on |
 |---|---|---|---|---|
-| 00 | [Workspace bootstrap](phase-00-workspace-bootstrap.md) | Planned | lab, both forks | approved roadmap |
+| 00 | [Workspace bootstrap](phase-00-workspace-bootstrap.md) | Qualified — 2026-08-08 ([evidence](phase-00-qualification.md)) | lab, both forks | approved roadmap |
 | 01 | [Execution target](phase-01-execution-target.md) | Planned | lab | Phase 00 |
 | 02 | [Benchmark and baseline](phase-02-benchmark-baseline.md) | Planned | lab, pinned forks | Phase 01 |
 | 03 | [Observability audit](phase-03-observability-audit.md) | Planned | engine, lab | Phase 02 |

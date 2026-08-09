@@ -2,7 +2,15 @@
 
 ## Status
 
-**Planned**
+**Qualified — 2026-08-08.** Retained evidence: [Phase 00 qualification record](phase-00-qualification.md).
+
+## Qualification result
+
+Phase 00 qualified on 2026-08-08 at implementation commit
+`69af8ea605972ba79430db3d92dbf1940f824df2`. The retained
+[qualification record](phase-00-qualification.md) contains the observed result
+and evidence, including the anonymous clone that explicitly selected the
+unmerged implementation branch.
 
 ## Depends on
 
