@@ -613,6 +613,119 @@ def _reclaim_expired_lock(root_fd: int, current_boot_id: str) -> tuple[bool, int
         os.close(lock_fd)
 
 
+def _acquire_lock_at_root(root_fd: int, identity: dict[str, int], run_token: Any, lease_seconds: int) -> str:
+    boot_id = _boot_id()
+    _cleanup_stale_lock_stages(root_fd)
+    token = secrets.token_hex(32)
+    state = {"boot_id": boot_id, "deadline_monotonic_ns": time.monotonic_ns() + lease_seconds * 1_000_000_000, "token": token}
+    for attempt in range(2):
+        if _install_lock(root_fd, state):
+            break
+        available, _ = _reclaim_expired_lock(root_fd, boot_id)
+        if not available:
+            _fail("lock_busy")
+    else:
+        _fail("lock_busy")
+    lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
+    try:
+        lock_identity = _identity(lock_fd)
+        installed = _lock_state(lock_fd)
+        if not hmac.compare_digest(installed["token"], token):
+            _fail("unsafe_lock")
+        _assert_named_identity(root_fd, LOCK_NAME, lock_identity, "unsafe_lock")
+        _assert_pinned_root(root_fd, identity)
+        _read_marker(root_fd, "run", run_token)
+        return token
+    finally:
+        os.close(lock_fd)
+
+
+def _release_lock_at_root(root_fd: int, identity: dict[str, int], run_token: Any, lock_token: Any) -> None:
+    lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
+    try:
+        lock_identity = _identity(lock_fd)
+        state = _lock_state(lock_fd)
+        if not isinstance(lock_token, str) or not hmac.compare_digest(state["token"], lock_token):
+            _fail("lock_token_mismatch")
+        _remove_lock(root_fd, lock_fd, lock_identity)
+        _assert_pinned_root(root_fd, identity)
+        _read_marker(root_fd, "run", run_token)
+    finally:
+        os.close(lock_fd)
+
+
+def _cleanup_reports(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 2:
+        _fail("invalid_payload")
+    reports: list[dict[str, str]] = []
+    names: set[str] = set()
+    for report in value:
+        if not isinstance(report, dict) or set(report) != {"name", "sha256"}:
+            _fail("invalid_payload")
+        name, digest = report["name"], report["sha256"]
+        if name not in {"build.log", "server.log"}:
+            _fail("invalid_report")
+        if name in names or not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            _fail("invalid_payload")
+        names.add(name)
+        reports.append({"name": name, "sha256": digest})
+    return reports
+
+
+def _report_signature(item: os.stat_result) -> tuple[int, int, int, int, int, int, int, int]:
+    return (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+
+
+def _assert_cleanup_report(root_fd: int, name: str, expected: tuple[int, int, int, int, int, int, int, int]) -> None:
+    try:
+        item = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError:
+        _fail("unsafe_state")
+    if (not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or
+            item.st_nlink != 1 or _report_signature(item) != expected):
+        _fail("unsafe_state")
+
+
+def _remove_report(root_fd: int, identity: dict[str, int], run_token: Any, name: str, expected_digest: str) -> str:
+    try:
+        os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "not_found"
+    except OSError:
+        _fail("unsafe_state")
+    fd, before = _open_regular(name, dir_fd=root_fd)
+    try:
+        expected = _report_signature(before)
+        if before.st_nlink != 1:
+            _fail("unsafe_state")
+        digest = hashlib.sha256()
+        size = 0
+        while size <= MAX_REPORT_BYTES:
+            block = os.read(fd, min(65536, MAX_REPORT_BYTES + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            digest.update(block)
+        after = os.fstat(fd)
+        if size > MAX_REPORT_BYTES or size != before.st_size:
+            _fail("report_too_large")
+        if _report_signature(after) != expected:
+            _fail("unsafe_state")
+        if not hmac.compare_digest(digest.hexdigest(), expected_digest):
+            _fail("unsafe_state")
+        _assert_pinned_root(root_fd, identity)
+        _read_marker(root_fd, "run", run_token)
+        _assert_cleanup_report(root_fd, name, expected)
+        try:
+            os.unlink(name, dir_fd=root_fd)
+            os.fsync(root_fd)
+        except OSError:
+            _fail("unsafe_state")
+        return "cleared"
+    finally:
+        os.close(fd)
+
+
 @register_action("acquire_lock")
 def acquire_lock(payload: Any) -> dict[str, Any]:
     data = _require_object(payload, {"run_dir", "run_token", "lease_seconds"})
@@ -671,6 +784,25 @@ def release_lock(payload: Any) -> dict[str, Any]:
             return {"released": True}
         finally:
             os.close(lock_fd)
+    finally:
+        os.close(root_fd)
+
+
+@register_action("remove_reports")
+def remove_reports(payload: Any) -> dict[str, Any]:
+    data = _require_object(payload, {"run_dir", "run_token", "reports"})
+    reports = _cleanup_reports(data["reports"])
+    root_fd = _open_root(_canonical(_validate_absolute_path(data["run_dir"])))
+    try:
+        identity = _root_identity(root_fd, "run", data["run_token"])
+        lock_token = _acquire_lock_at_root(root_fd, identity, data["run_token"], 60)
+        try:
+            results = [{"name": report["name"], "result": _remove_report(root_fd, identity, data["run_token"], report["name"], report["sha256"])} for report in reports]
+            _assert_pinned_root(root_fd, identity)
+            _read_marker(root_fd, "run", data["run_token"])
+            return {"reports": results}
+        finally:
+            _release_lock_at_root(root_fd, identity, data["run_token"], lock_token)
     finally:
         os.close(root_fd)
 

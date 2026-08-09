@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.targetctl import remote
 
@@ -106,6 +108,126 @@ class RemoteFdSecurityTests(unittest.TestCase):
             {"released": True},
         )
         self.assertFalse((Path(payload["run_dir"]) / remote.LOCK_NAME).exists())
+
+    def _initialized_run(self) -> tuple[dict[str, str], str, Path]:
+        payload = self._payload()
+        state = remote.initialize_roots(payload)
+        return payload, state["run"]["token"], Path(payload["run_dir"])
+
+    @staticmethod
+    def _write_report(path: Path, content: bytes) -> str:
+        path.write_bytes(content)
+        path.chmod(0o600)
+        return hashlib.sha256(content).hexdigest()
+
+    def test_remove_reports_removes_only_exact_digest_bound_reports_and_marks_missing(self) -> None:
+        payload, token, run = self._initialized_run()
+        build_digest = self._write_report(run / "build.log", b"build output")
+        server_digest = self._write_report(run / "server.log", b"server output")
+        canary = run / "canary"
+        self._write_report(canary, b"retain")
+
+        self.assertEqual(
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [
+                {"name": "server.log", "sha256": server_digest},
+                {"name": "build.log", "sha256": build_digest},
+            ]}),
+            {"reports": [{"name": "server.log", "result": "cleared"}, {"name": "build.log", "result": "cleared"}]},
+        )
+        self.assertFalse((run / "build.log").exists())
+        self.assertFalse((run / "server.log").exists())
+        self.assertTrue(canary.exists())
+        self.assertFalse((run / remote.LOCK_NAME).exists())
+        self.assertEqual(
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [
+                {"name": "build.log", "sha256": build_digest},
+            ]}),
+            {"reports": [{"name": "build.log", "result": "not_found"}]},
+        )
+        self.assertFalse((run / remote.LOCK_NAME).exists())
+
+    def test_remove_reports_rejects_changed_and_unsafe_reports_without_deletion(self) -> None:
+        payload, token, run = self._initialized_run()
+        report = run / "build.log"
+        digest = self._write_report(report, b"original")
+
+        with self.assertRaises(remote.HelperError) as changed:
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [{"name": "build.log", "sha256": hashlib.sha256(b"changed").hexdigest()}]})
+        self.assertEqual(changed.exception.code, "unsafe_state")
+        self.assertEqual(report.read_bytes(), b"original")
+        self.assertFalse((run / remote.LOCK_NAME).exists())
+
+        report.unlink()
+        report.symlink_to(run / remote._marker_name("run"))
+        with self.assertRaises(remote.HelperError) as symlink:
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [{"name": "build.log", "sha256": digest}]})
+        self.assertEqual(symlink.exception.code, "unsafe_state")
+        self.assertTrue(report.is_symlink())
+        self.assertFalse((run / remote.LOCK_NAME).exists())
+
+        report.unlink()
+        hardlink_source = run / "canary"
+        self._write_report(hardlink_source, b"original")
+        os.link(hardlink_source, report)
+        with self.assertRaises(remote.HelperError) as hardlink:
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [{"name": "build.log", "sha256": digest}]})
+        self.assertEqual(hardlink.exception.code, "unsafe_state")
+        self.assertTrue(report.exists())
+        self.assertTrue(hardlink_source.exists())
+        self.assertFalse((run / remote.LOCK_NAME).exists())
+
+        report.unlink()
+        self._write_report(report, b"original")
+        report.chmod(0o644)
+        with self.assertRaises(remote.HelperError) as permissive:
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [{"name": "build.log", "sha256": digest}]})
+        self.assertEqual(permissive.exception.code, "unsafe_state")
+        self.assertTrue(report.exists())
+        self.assertFalse((run / remote.LOCK_NAME).exists())
+
+        report.chmod(0o600)
+        root_fd = remote._open_root(payload["run_dir"])
+        try:
+            identity = remote._root_identity(root_fd, "run", token)
+            with mock.patch.object(remote.os, "geteuid", return_value=os.geteuid() + 1):
+                with self.assertRaises(remote.HelperError) as wrong_owner:
+                    remote._remove_report(root_fd, identity, token, "build.log", digest)
+            self.assertEqual(wrong_owner.exception.code, "unsafe_state")
+        finally:
+            os.close(root_fd)
+        self.assertTrue(report.exists())
+
+    def test_remove_reports_respects_locks_and_uses_its_pinned_root(self) -> None:
+        payload, token, run = self._initialized_run()
+        digest = self._write_report(run / "build.log", b"original")
+        held = remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": token, "lease_seconds": 60})
+        with self.assertRaises(remote.HelperError) as busy:
+            remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [{"name": "build.log", "sha256": digest}]})
+        self.assertEqual(busy.exception.code, "lock_busy")
+        self.assertTrue((run / "build.log").exists())
+        remote.release_lock({"run_dir": payload["run_dir"], "run_token": token, "lock_token": held["lock_token"]})
+
+        replacement = self.tmp_path / "replacement"
+        remote._init_root(str(replacement), "run")
+        replacement_digest = self._write_report(replacement / "build.log", b"replacement")
+        original = self.tmp_path / "original-run"
+        acquire = remote._acquire_lock_at_root
+
+        def acquire_then_swap(root_fd: int, identity: dict[str, int], run_token: str, lease_seconds: int) -> str:
+            lock_token = acquire(root_fd, identity, run_token, lease_seconds)
+            os.rename(run, original)
+            os.rename(replacement, run)
+            return lock_token
+
+        with mock.patch.object(remote, "_acquire_lock_at_root", side_effect=acquire_then_swap):
+            self.assertEqual(
+                remote.remove_reports({"run_dir": payload["run_dir"], "run_token": token, "reports": [{"name": "build.log", "sha256": digest}]}),
+                {"reports": [{"name": "build.log", "result": "cleared"}]},
+            )
+        self.assertFalse((original / "build.log").exists())
+        self.assertEqual((run / "build.log").read_bytes(), b"replacement")
+        self.assertEqual(hashlib.sha256((run / "build.log").read_bytes()).hexdigest(), replacement_digest)
+        self.assertFalse((original / remote.LOCK_NAME).exists())
 
 
 if __name__ == "__main__":
