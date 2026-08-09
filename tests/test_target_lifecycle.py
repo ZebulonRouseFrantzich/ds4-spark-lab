@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -270,7 +272,7 @@ class LifecycleTests(unittest.TestCase):
             set(payload),
             {"run_id", "state", "port", "source_snapshot_id", "build_id",
              "binary_sha256", "supervisor_pid", "supervisor_start_ticks",
-             "child_pid", "child_start_ticks"},
+             "child_pid", "child_start_ticks", "launch_profile"},
         )
 
     # ---- Full serve → status → logs → stop lifecycle ----------------------
@@ -317,15 +319,84 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(cl.temp, ("cleared", "not_found"))
         self.assertIsNotNone(cl.server_log_sha256)
 
-    # ---- Cleanup idempotency (double stop returns not_run) ----------------
+    # ---- Cleanup idempotency retains target-side evidence ------------------
 
-    def test_double_stop_returns_not_run_second_time(self) -> None:
-        port = self._setup_work()
+    def test_double_stop_returns_original_evidence(self) -> None:
+        self._setup_work()
         result = serve(self.config, self.transport, self.runtime)
         first = stop(self.config, self.transport, self.runtime, run_id=result.run_id)
         self.assertEqual(first.status, "succeeded")
         second = stop(self.config, self.transport, self.runtime, run_id=result.run_id)
-        self.assertEqual(second.status, "not_run")
+        self.assertEqual(second.status, "succeeded")
+        self.assertEqual(second.controller_payload(), first.controller_payload())
+
+    def test_local_cleanup_retry_returns_original_evidence(self) -> None:
+        self._setup_work()
+        config = SimpleNamespace(
+            mode="local", source_root=self.work, local_run_dir=self.run,
+            validate_for=lambda operation: None,
+        )
+        result = serve(config, self.transport, self.runtime)
+        first = cleanup(config, self.transport, self.runtime, run_id=result.run_id)
+        second = cleanup(config, self.transport, self.runtime, run_id=result.run_id)
+        self.assertEqual(first.status, "succeeded")
+        self.assertEqual(second.controller_payload(), first.controller_payload())
+
+    def test_cleanup_retry_after_response_loss_returns_persisted_evidence(self) -> None:
+        self._setup_work()
+        result = serve(self.config, self.transport, self.runtime)
+
+        class DropFirstStopResponse:
+            def __init__(self, transport: LocalTransport) -> None:
+                self.transport = transport
+                self.dropped = False
+
+            def run_helper(self, action, payload, **kwargs):
+                response = self.transport.run_helper(action, payload, **kwargs)
+                if action == "lifecycle_stop" and not self.dropped:
+                    self.dropped = True
+                    raise TargetError("helper_timeout", "response was lost")
+                return response
+
+        dropped = DropFirstStopResponse(self.transport)
+        with self.assertRaisesRegex(TargetError, "response was lost"):
+            stop(self.config, dropped, self.runtime, run_id=result.run_id)
+        retry = stop(self.config, self.transport, self.runtime, run_id=result.run_id)
+        self.assertEqual(retry.status, "succeeded")
+        state = json.loads((self.run / "run.json").read_text(encoding="ascii"))
+        self.assertTrue(state["cleanup_complete"])
+        self.assertEqual(
+            retry.controller_payload(),
+            {
+                "run_id": result.run_id, "status": "succeeded", "failure_class": None,
+                **state["cleanup"],
+            },
+        )
+
+    def test_concurrent_cleanup_calls_return_one_persisted_evidence(self) -> None:
+        self._setup_work()
+        result = serve(self.config, self.transport, self.runtime)
+        gate = threading.Barrier(3)
+        outcomes: list[CleanupResult] = []
+        errors: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                gate.wait()
+                outcomes.append(cleanup(self.config, self.transport, self.runtime, run_id=result.run_id))
+            except BaseException as error:
+                errors.append(error)
+
+        workers = [threading.Thread(target=invoke) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        gate.wait()
+        for worker in workers:
+            worker.join(30)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(outcomes[0].controller_payload(), outcomes[1].controller_payload())
 
     # ---- Port conflict prevents serve -------------------------------------
 
@@ -350,12 +421,52 @@ class LifecycleTests(unittest.TestCase):
 
     # ---- Startup failure (bad binary path) --------------------------------
 
-    def test_bad_binary_path_fails_startup(self) -> None:
+    def test_bad_binary_path_is_not_dispatched(self) -> None:
         self._setup_work()
         self.config.workdir = "/nonexistent"
         with self.assertRaises(TargetError) as ctx:
             serve(self.config, self.transport, self.runtime)
-        self.assertIn(ctx.exception.code, ("startup_failed", "unsafe_root"))
+        self.assertEqual(ctx.exception.code, "serve_not_dispatched")
+        self.assertFalse((self.run / "run.json").exists())
+
+    def test_build_binary_mismatch_is_not_dispatched_and_releases_lease(self) -> None:
+        self._setup_work()
+        build_path = self.run / "build.json"
+        build = json.loads(build_path.read_text(encoding="ascii"))
+        build["binary_sha256"] = "0" * 64
+        build_path.write_text(json.dumps(build), encoding="ascii")
+        build_path.chmod(0o600)
+
+        with self.assertRaises(TargetError) as ctx:
+            serve(self.config, self.transport, self.runtime, run_id="run-refused-build-0001")
+        self.assertEqual(ctx.exception.code, "serve_not_dispatched")
+        self.assertFalse((self.run / "run.json").exists())
+        self.assertFalse((self.run / ".targetctl-operation-lock-v1").exists())
+
+    def test_local_lock_contention_is_classified_before_helper_dispatch(self) -> None:
+        self._setup_work()
+        config = SimpleNamespace(
+            mode="local", source_root=self.work, local_run_dir=self.run,
+            validate_for=lambda operation: None,
+        )
+        calls: list[str] = []
+
+        class RecordingTransport:
+            def run_helper(self, action, payload, **kwargs):
+                calls.append(action)
+                raise AssertionError("helper must not be dispatched while the local lock is busy")
+
+        lock_fd = os.open(
+            self.run / ".targetctl-operation-lock-v1",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+            0o600,
+        )
+        self.addCleanup(os.close, lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with self.assertRaises(TargetError) as ctx:
+            serve(config, RecordingTransport(), self.runtime, run_id="run-local-busy-0001")
+        self.assertEqual(ctx.exception.code, "serve_not_dispatched")
+        self.assertEqual(calls, [])
 
     # ---- Server log hash matches actual content ---------------------------
 
@@ -391,19 +502,95 @@ class LifecycleTests(unittest.TestCase):
 
     def test_stale_identity_on_status_after_kill(self) -> None:
         self._setup_work()
+        server_path = self.work / "server.py"
+        server_path.write_text(
+            server_path.read_text(encoding="utf-8").replace(
+                "import http.server, json, sys, os\n",
+                "import http.server, json, sys, os, signal, time\n"
+                "if os.fork() == 0:\n"
+                "  signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "  while True: time.sleep(1)\n",
+            ),
+            encoding="utf-8",
+        )
+        _write_build_json(self.run, self.work, "server.py")
         result = serve(self.config, self.transport, self.runtime)
-        # Force kill the supervisor process group
-        child_pid = result.child_pid
-        if child_pid and child_pid > 1:
+        # Simulate an external SIGKILL of the supervisor; its independently
+        # sessioned child, orphanable descendant group, and listener must be cleaned.
+        supervisor_pid = result.supervisor_pid
+        if supervisor_pid and supervisor_pid > 1:
             try:
-                os.killpg(child_pid, signal.SIGKILL)
+                os.killpg(supervisor_pid, signal.SIGKILL)
             except OSError:
                 pass
         time.sleep(0.5)
         st = status(self.config, self.transport, self.runtime, run_id=result.run_id)
         self.assertEqual(st.state, "stale_identity")
         self.assertFalse(st.active)
+        prior_log = (self.run / "server.log").read_bytes()
+        with self.assertRaises(TargetError) as refused:
+            serve(self.config, self.transport, self.runtime, run_id="run-replacement-0002")
+        self.assertEqual(refused.exception.code, "serve_not_dispatched")
+        state = json.loads((self.run / "run.json").read_text(encoding="ascii"))
+        self.assertEqual(state["state"], "stale_identity")
+        self.assertFalse(state["cleanup_complete"])
+        self.assertEqual((self.run / "server.log").read_bytes(), prior_log)
 
+        outcome = cleanup(self.config, self.transport, self.runtime, run_id=result.run_id)
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertNotIn("unknown", (outcome.process, outcome.socket, outcome.lock, outcome.temp))
+        settled = json.loads((self.run / "run.json").read_text(encoding="ascii"))
+        self.assertTrue(settled["cleanup_complete"])
+        self.assertEqual(
+            settled["cleanup"],
+            {
+                "process": outcome.process,
+                "socket": outcome.socket,
+                "lock": outcome.lock,
+                "temp": outcome.temp,
+                "server_log_sha256": outcome.server_log_sha256,
+            },
+        )
+        self.assertEqual(
+            cleanup(self.config, self.transport, self.runtime, run_id=result.run_id).controller_payload(),
+            outcome.controller_payload(),
+        )
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", self.runtime.port))
+
+
+    def test_status_and_refused_serve_preserve_pre_spawn_starting_state(self) -> None:
+        self._setup_work()
+        binary_hash = hashlib.sha256((self.work / "server.py").read_bytes()).hexdigest()
+        state = {
+            "schema_version": 1, "run_id": "run-starting-0001", "state": "starting",
+            "source_snapshot_id": "1" * 64, "applied_tree_hash": "2" * 64,
+            "build_id": "3" * 64, "binary_sha256": binary_hash,
+            "port": self.runtime.port, "launch_profile": dict(remote.LAUNCH_PROFILE),
+            "supervisor_pid": None, "supervisor_start_ticks": None,
+            "supervisor_cmdline_sha256": None, "child_pid": None,
+            "child_start_ticks": None, "child_pgid": None,
+            "child_cmdline_sha256": None, "listener_inode": None,
+            "cleanup_complete": False, "cleanup": None,
+        }
+        state_path = self.run / "run.json"
+        state_path.write_text(json.dumps(state), encoding="ascii")
+        state_path.chmod(0o600)
+        prior_state = state_path.read_bytes()
+        prior_log = b"prior-server-log-must-survive"
+        (self.run / "server.log").write_bytes(prior_log)
+        (self.run / "server.log").chmod(0o600)
+
+        observed = status(self.config, self.transport, self.runtime, run_id=state["run_id"])
+        self.assertEqual(observed.state, "starting")
+        self.assertFalse(observed.active)
+        self.assertEqual(state_path.read_bytes(), prior_state)
+        with self.assertRaises(TargetError) as refused:
+            serve(self.config, self.transport, self.runtime, run_id="run-replacement-0001")
+        self.assertEqual(refused.exception.code, "serve_not_dispatched")
+        self.assertEqual(state_path.read_bytes(), prior_state)
+        self.assertEqual((self.run / "server.log").read_bytes(), prior_log)
     # ---- Cross-chunk secret redaction in log ------------------------------
 
     def test_cross_chunk_secret_redaction(self) -> None:
@@ -484,9 +671,55 @@ class LifecycleTests(unittest.TestCase):
     # ---- Smoke run_id is preallocated and deterministic --------------------
 
     def test_smoke_preallocates_run_id(self) -> None:
-        port = self._setup_work()
+        self._setup_work()
         result = smoke(self.config, self.transport, self.runtime, run_id="my-run-001")
         self.assertEqual(result.run_id, "my-run-001")
+
+    def test_smoke_propagates_pre_dispatch_refusal_without_reconciliation(self) -> None:
+        self._setup_work()
+        active = serve(self.config, self.transport, self.runtime, run_id="run-active-smoke-0001")
+        lease_path = self.run / ".targetctl-operation-lock-v1"
+        lease_before = lease_path.read_bytes()
+
+        with self.assertRaises(TargetError) as refused:
+            smoke(self.config, self.transport, self.runtime, run_id="run-replacement-smoke-0001")
+        self.assertEqual(refused.exception.code, "serve_not_dispatched")
+        self.assertEqual(lease_path.read_bytes(), lease_before)
+        current = status(self.config, self.transport, self.runtime, run_id=active.run_id)
+        self.assertTrue(current.active)
+        self.assertEqual(cleanup(self.config, self.transport, self.runtime, run_id=active.run_id).status, "succeeded")
+
+    def test_cleanup_wrong_run_id_is_absent_without_mutating_current_run(self) -> None:
+        self._setup_work()
+        result = serve(self.config, self.transport, self.runtime)
+        lease_path = self.run / ".targetctl-operation-lock-v1"
+        lease_before = lease_path.read_bytes()
+        absent = cleanup(self.config, self.transport, self.runtime, run_id="run-absent-0001")
+        self.assertEqual(absent.status, "not_run")
+        self.assertIsNone(absent.run_id)
+        self.assertEqual(lease_path.read_bytes(), lease_before)
+        current = json.loads((self.run / "run.json").read_text(encoding="ascii"))
+        self.assertEqual(current["run_id"], result.run_id)
+        self.assertFalse(current["cleanup_complete"])
+        self.assertEqual(cleanup(self.config, self.transport, self.runtime, run_id=result.run_id).status, "succeeded")
+
+    def test_cleanup_refuses_operation_lease_owned_by_another_run(self) -> None:
+        self._setup_work()
+        result = serve(self.config, self.transport, self.runtime)
+        lease_path = self.run / ".targetctl-operation-lock-v1"
+        lease = json.loads(lease_path.read_text(encoding="ascii"))
+        lease["lifecycle_run_id"] = "run-different-0001"
+        lease_path.write_text(
+            json.dumps(lease, sort_keys=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+
+        refused = cleanup(self.config, self.transport, self.runtime, run_id=result.run_id)
+        self.assertEqual(refused.status, "failed")
+        self.assertEqual(refused.lock, "unknown")
+        self.assertTrue(lease_path.exists())
+        state = json.loads((self.run / "run.json").read_text(encoding="ascii"))
+        self.assertFalse(state["cleanup_complete"])
 
     # ---- Status with wrong run_id returns stopped -------------------------
 
@@ -518,7 +751,7 @@ class LifecycleTests(unittest.TestCase):
             serve(self.config, self.transport, self.runtime)
         # Cleanup should succeed even after failed serve
         cl = stop(self.config, self.transport, self.runtime)
-        self.assertEqual(cl.status, "not_run")
+        self.assertEqual(cl.status, "succeeded")
 
 
     def test_child_popen_failure_releases_lock_and_private_files(self) -> None:
@@ -530,7 +763,7 @@ class LifecycleTests(unittest.TestCase):
 
         with self.assertRaises(TargetError) as ctx:
             serve(self.config, self.transport, self.runtime)
-        self.assertEqual(ctx.exception.code, "startup_timeout")
+        self.assertEqual(ctx.exception.code, "startup_failed")
         time.sleep(0.1)
 
         self.assertFalse((self.run / ".targetctl-operation-lock-v1").exists())
@@ -538,7 +771,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse((self.run / name).exists())
         self.assertLessEqual((self.run / "server.log").stat().st_size, 1_048_576)
         outcome = stop(self.config, self.transport, self.runtime)
-        self.assertEqual(outcome.status, "not_run")
+        self.assertEqual(outcome.status, "succeeded")
         self.assertIn(outcome.temp, ("cleared", "not_found"))
         self.assertIn(outcome.lock, ("cleared", "not_found"))
         self.assertIsNotNone(outcome.server_log_sha256)
@@ -586,9 +819,9 @@ class LifecycleTests(unittest.TestCase):
 
         with self.assertRaises(TargetError) as ctx:
             serve(self.config, self.transport, self.runtime)
-        self.assertIn(ctx.exception.code, ("startup_failed", "startup_timeout"))
+        self.assertEqual(ctx.exception.code, "startup_failed")
         outcome = cleanup(self.config, self.transport, self.runtime)
-        self.assertEqual(outcome.status, "not_run")
+        self.assertEqual(outcome.status, "succeeded")
         self.assertEqual(outcome.process, "not_found")
         self.assertEqual(outcome.socket, "not_found")
         self.assertIn(outcome.temp, ("cleared", "not_found"))
@@ -599,30 +832,43 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse((self.run / name).exists())
 
     def test_ambiguous_remote_serve_keeps_target_cleanup_lease(self) -> None:
+        self._setup_work()
         calls: list[str] = []
+        payloads: list[dict[str, object]] = []
+        lease_path = self.run / ".targetctl-operation-lock-v1"
 
-        class AmbiguousTransport:
+        class DropServeResponse:
+            def __init__(self, transport: LocalTransport) -> None:
+                self.transport = transport
+                self.lease_token: str | None = None
+
             def run_helper(self, action, payload, **kwargs):
                 calls.append(action)
-                if action == "acquire_lock":
-                    return {"lock_token": "6" * 64}
+                payloads.append(dict(payload))
+                response = self.transport.run_helper(action, payload, **kwargs)
                 if action == "lifecycle_serve":
+                    self.lease_token = json.loads(lease_path.read_text(encoding="ascii"))["token"]
                     raise TargetError("helper_timeout", "target helper timed out")
-                raise AssertionError(f"unexpected action: {action}")
+                return response
 
-        config = SimpleNamespace(
-            mode="ssh",
-            workdir="/srv/targetctl/work",
-            run_dir="/srv/targetctl/run",
-            validate_for=lambda operation: None,
-        )
-        runtime = RuntimeInputs(
-            str(self.model), str(self.drafter), "1" * 64, "2" * 64, "3" * 64,
-            "4" * 64, "5" * 64, self._port(),
-        )
+        dropped = DropServeResponse(self.transport)
+        identifier = "run-ambiguous-0001"
         with self.assertRaisesRegex(TargetError, "helper_timeout"):
-            serve(config, AmbiguousTransport(), runtime)
-        self.assertEqual(calls, ["acquire_lock", "lifecycle_serve"])
+            serve(self.config, dropped, self.runtime, run_id=identifier)
+        self.assertEqual(calls, ["lifecycle_serve"])
+        self.assertNotIn("lock_token", payloads[0])
+        lease = json.loads(lease_path.read_text(encoding="ascii"))
+        self.assertEqual(lease["lifecycle_run_id"], identifier)
+        self.assertIsNotNone(dropped.lease_token)
+        token = dropped.lease_token.encode("ascii")
+        self.assertNotIn(token, (self.run / "run.json").read_bytes())
+        self.assertNotIn(token, (self.run / "launch.json").read_bytes())
+
+        first = cleanup(self.config, self.transport, self.runtime, run_id=identifier)
+        self.assertEqual(first.status, "succeeded")
+        self.assertFalse(lease_path.exists())
+        retry = cleanup(self.config, self.transport, self.runtime, run_id=identifier)
+        self.assertEqual(retry.controller_payload(), first.controller_payload())
 
     def test_silent_server_lease_expiry_converges(self) -> None:
         port = self._setup_work()

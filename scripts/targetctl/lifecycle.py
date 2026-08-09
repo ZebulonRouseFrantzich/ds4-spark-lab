@@ -17,6 +17,9 @@ from typing import Any, Iterator, Mapping
 
 from .common import TargetError
 from .redaction import REMOTE_REDACTION_EXTENSION
+# These names are also present when the embedded extension executes in the
+# standalone remote-helper namespace; importing them documents that contract.
+from .remote import LAUNCH_PROFILE, RUN_STATE_SCHEMA_VERSION, _is_hex_digest, _valid_run_state
 from .transport import LocalTransport, SSHForward, SSHTransport
 
 RUN_SCHEMA_VERSION = 1
@@ -27,20 +30,17 @@ DEFAULT_LEASE_SECONDS = 120
 _HEX = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{7,63}\Z", re.ASCII)
 _STATES = frozenset(("starting", "running", "stopped", "stale_identity", "failed_startup"))
-# Codes that the lifecycle extension or its remote.py helpers may _fail() with.
-# Only codes NOT already in transport._BASE_HELPER_ERROR_CODES need listing here.
-# Base already includes: lock_busy, lock_failed, lock_release_failed, lock_token_mismatch,
-# invalid_path, invalid_payload, internal_error, invalid_request, ...
-# Codes that the lifecycle extension or its remote.py helpers may _fail() with.
-# Only codes NOT already in transport._BASE_HELPER_ERROR_CODES need listing here.
-# Base already includes: lock_busy, lock_failed, lock_release_failed, lock_token_mismatch,
-# invalid_path, invalid_payload, internal_error, invalid_request, marker_mismatch, ...
+# Lifecycle-specific codes emitted by _LIFECYCLE_EXTENSION.  transport adds its
+# base helper codes separately, so controller-only failures and base codes do
+# not belong in this bounded extension allowlist.
 _ERRORS = frozenset((
-    "invalid_runtime_inputs", "invalid_run_id", "run_active",
-    "startup_failed", "startup_timeout", "unsafe_state",
-    "unsafe_listener", "stop_failed", "cleanup_failed", "log_unavailable",
-    "smoke_failed", "smoke_timeout", "http_contract_failed",
-    "unsafe_lock", "unsafe_root", "invalid_lease",
+    "invalid_runtime_inputs",
+    "run_active",
+    "run_cleanup_required",
+    "startup_failed",
+    "startup_timeout",
+    "log_unavailable",
+    "serve_not_dispatched",
 ))
 
 
@@ -98,6 +98,31 @@ class RuntimeInputs:
 
 
 @dataclass(frozen=True, slots=True)
+class LaunchProfile:
+    """Bounded non-private evidence for the one supported Phase 01 launch."""
+
+    schema_version: int = 1
+    accelerator: str = "cuda"
+    context_tokens: int = 32768
+    bind: str = "loopback"
+    continuation_mtp_mode: int = 2
+    dspark_enabled: bool = True
+    drafter_enabled: bool = True
+
+    def controller_payload(self) -> dict[str, Any]:
+        return {
+            key: getattr(self, key)
+            for key in (
+                "schema_version", "accelerator", "context_tokens", "bind",
+                "continuation_mtp_mode", "dspark_enabled", "drafter_enabled",
+            )
+        }
+
+
+FIXED_LAUNCH_PROFILE = LaunchProfile(**LAUNCH_PROFILE)
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult:
     run_id: str
     state: str
@@ -109,9 +134,19 @@ class RunResult:
     supervisor_start_ticks: int | None = None
     child_pid: int | None = None
     child_start_ticks: int | None = None
+    launch_profile: LaunchProfile = FIXED_LAUNCH_PROFILE
 
     def controller_payload(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in ("run_id", "state", "source_snapshot_id", "build_id", "binary_sha256", "supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks", "port")}
+        payload = {
+            key: getattr(self, key)
+            for key in (
+                "run_id", "state", "source_snapshot_id", "build_id",
+                "binary_sha256", "supervisor_pid", "supervisor_start_ticks",
+                "child_pid", "child_start_ticks", "port",
+            )
+        }
+        payload["launch_profile"] = self.launch_profile.controller_payload()
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +154,7 @@ class StatusResult:
     run_id: str | None
     state: str
     active: bool
+    run: RunResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,7 +257,7 @@ def _call(transport: LocalTransport | SSHTransport, action: str, payload: Mappin
 # ---------------------------------------------------------------------------
 # Helper extension - runs inside the remote.py module namespace.
 # ---------------------------------------------------------------------------
-_LIFECYCLE_EXTENSION = r'''_LC_SUPERVISOR_SOURCE = """import hmac
+_LIFECYCLE_EXTENSION = r'''_LC_SUPERVISOR_SOURCE = """import hashlib
 import json
 import os
 import select
@@ -271,6 +307,27 @@ def _ticks(pid):
   except (OSError, ValueError, IndexError):
     return None
 
+def _cmdline_hash(pid):
+  try:
+    with open('/proc/%d/cmdline' % pid, 'rb') as handle:
+      raw = handle.read(4096).rstrip(b'\0')
+    if not raw:
+      return None
+    return hashlib.sha256(b' '.join(raw.split(b'\0'))).hexdigest()
+  except OSError:
+    return None
+
+def _group_present(pgid):
+  if not isinstance(pgid, int) or pgid <= 1:
+    return None
+  try:
+    os.killpg(pgid, 0)
+    return True
+  except ProcessLookupError:
+    return False
+  except OSError:
+    return None
+
 def _unlink_owned(name):
   try:
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), dir_fd=RUN_FD)
@@ -287,6 +344,49 @@ def _unlink_owned(name):
   except OSError:
     pass
 
+def _release_lifecycle_lease(run_id):
+  if not isinstance(run_id, str):
+    return
+  lock_fd = None
+  try:
+    lock_fd = os.open('.targetctl-operation-lock-v1', os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), dir_fd=RUN_FD)
+    item = os.fstat(lock_fd)
+    raw = os.read(lock_fd, 1025)
+    lock = json.loads(raw.decode('ascii'))
+    named = os.stat('.targetctl-operation-lock-v1', dir_fd=RUN_FD, follow_symlinks=False)
+    if (
+      len(raw) > 1024
+      or not stat.S_ISREG(item.st_mode)
+      or item.st_uid != os.geteuid()
+      or stat.S_IMODE(item.st_mode) != 0o600
+      or item.st_nlink != 1
+      or (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_nlink) !=
+         (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_nlink)
+      or not isinstance(lock, dict)
+      or set(lock) != {'boot_id', 'deadline_monotonic_ns', 'token', 'lifecycle_run_id'}
+      or lock.get('lifecycle_run_id') != run_id
+      or not isinstance(lock.get('token'), str)
+      or len(lock['token']) != 64
+      or any(character not in '0123456789abcdef' for character in lock['token'])
+      or not isinstance(lock.get('boot_id'), str)
+      or len(lock['boot_id']) != 36
+      or any(character not in '0123456789abcdef-' for character in lock['boot_id'])
+      or not isinstance(lock.get('deadline_monotonic_ns'), int)
+      or isinstance(lock['deadline_monotonic_ns'], bool)
+      or lock['deadline_monotonic_ns'] < 1
+    ):
+      return
+    os.unlink('.targetctl-operation-lock-v1', dir_fd=RUN_FD)
+    os.fsync(RUN_FD)
+  except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    pass
+  finally:
+    if lock_fd is not None:
+      try:
+        os.close(lock_fd)
+      except OSError:
+        pass
+
 spec = {}
 
 child = None
@@ -296,6 +396,7 @@ redactor = None
 written = 0
 stopping = False
 deadline = None
+failure_stage = 'spec'
 
 def _flush():
   global written
@@ -340,18 +441,74 @@ signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGHUP, _stop)
 try:
   spec = _read_json(sys.argv[1])
-  if not isinstance(spec, dict) or not isinstance(spec.get('argv'), list) or not isinstance(spec.get('lease_seconds'), int) or (spec.get('lock_token') is not None and not isinstance(spec.get('lock_token'), str)):
+  profile = {
+    'schema_version': 1, 'accelerator': 'cuda', 'context_tokens': 32768,
+    'bind': 'loopback', 'continuation_mtp_mode': 2,
+    'dspark_enabled': True, 'drafter_enabled': True,
+  }
+  if (
+    not isinstance(spec, dict)
+    or set(spec) != {'argv', 'drafter', 'secrets', 'lease_seconds', 'run_id', 'launch_profile'}
+    or not isinstance(spec['argv'], list)
+    or not isinstance(spec['lease_seconds'], int)
+    or not isinstance(spec['run_id'], str)
+    or spec['launch_profile'] != profile
+    or spec['lease_seconds'] < 1
+  ):
     raise ValueError('invalid_spec')
-  if spec['lease_seconds'] < 1:
-    raise ValueError('invalid_spec')
+  state = _read_json('run.json')
+  supervisor_ticks = _ticks(os.getpid())
+  supervisor_cmdline_sha256 = _cmdline_hash(os.getpid())
+  if (
+    not isinstance(state, dict)
+    or state.get('run_id') != spec['run_id']
+    or state.get('state') != 'starting'
+    or state.get('supervisor_pid') is not None
+    or state.get('launch_profile') != profile
+    or supervisor_ticks is None
+    or supervisor_cmdline_sha256 is None
+  ):
+    raise ValueError('invalid_state')
+  state['supervisor_pid'] = os.getpid()
+  state['supervisor_start_ticks'] = supervisor_ticks
+  state['supervisor_cmdline_sha256'] = supervisor_cmdline_sha256
+  _atom_json('run.json', state)
+  failure_stage = 'log_open'
   redactor = _targetctl_redactor(spec.get('secrets', ()))
   log_fd = os.open('server.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), 0o600, dir_fd=RUN_FD)
+  failure_stage = 'child_spawn'
   env = {'LANG': 'C', 'LC_ALL': 'C', 'PATH': '/usr/bin:/bin', 'DS4_CONT_MTP_MODE':'2', 'DS4_CONT_DSPARK':'1', 'DS4_DSPARK_MODEL': spec.get('drafter', '')}
   child = subprocess.Popen(spec['argv'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(int(os.environ['TARGETCTL_SV_DIR_FD']),), env=env)
+  failure_stage = 'child_identity'
   child_pgid = child.pid
-  if os.getpgid(child.pid) != child_pgid:
-    raise OSError('unexpected_child_pgid')
-  _atom_json('ack.json', {'child_pid': child.pid, 'child_start_ticks': _ticks(child.pid), 'child_pgid': child_pgid, 'child_cmdline': ' '.join(spec['argv']), 'supervisor_pid': os.getpid(), 'supervisor_start_ticks': _ticks(os.getpid())})
+  child_ticks = None
+  child_cmdline_sha256 = None
+  previous_identity = None
+  identity_deadline = time.monotonic() + 1
+  while time.monotonic() < identity_deadline and child.poll() is None:
+    candidate = (_ticks(child.pid), _cmdline_hash(child.pid), os.getpgid(child.pid))
+    if candidate == previous_identity and candidate[0] is not None and candidate[1] is not None and candidate[2] == child_pgid:
+      child_ticks, child_cmdline_sha256, _ = candidate
+      break
+    previous_identity = candidate
+    time.sleep(.01)
+  if child_ticks is None or child_cmdline_sha256 is None:
+    raise OSError('unexpected_child_identity')
+  state = _read_json('run.json')
+  if state.get('run_id') != spec['run_id'] or state.get('supervisor_pid') != os.getpid():
+    raise ValueError('invalid_state')
+  state['child_pid'] = child.pid
+  state['child_start_ticks'] = child_ticks
+  state['child_pgid'] = child_pgid
+  state['child_cmdline_sha256'] = child_cmdline_sha256
+  _atom_json('run.json', state)
+  _atom_json('ack.json', {
+    'child_pid': child.pid, 'child_start_ticks': child_ticks,
+    'child_pgid': child_pgid, 'child_cmdline_sha256': child_cmdline_sha256,
+    'supervisor_pid': os.getpid(), 'supervisor_start_ticks': supervisor_ticks,
+    'supervisor_cmdline_sha256': supervisor_cmdline_sha256,
+  })
+  failure_stage = 'monitor'
   os.set_blocking(child.stdout.fileno(), False)
   deadline = time.monotonic() + spec['lease_seconds']
   while child.poll() is None and not stopping and time.monotonic() < deadline:
@@ -359,7 +516,12 @@ try:
     if ready:
       _drain()
 except BaseException:
-  pass
+  if log_fd is not None:
+    try:
+      os.write(log_fd, ('[targetctl-supervisor:%s]\n' % failure_stage).encode('ascii'))
+      os.fsync(log_fd)
+    except OSError:
+      pass
 finally:
   if child is not None:
     try:
@@ -389,6 +551,21 @@ finally:
       child.stdout.close()
     except (AttributeError, OSError):
       pass
+  child_group_cleared = child_pgid is None
+  if child_pgid is not None:
+    group_present = _group_present(child_pgid)
+    if group_present:
+      try:
+        os.killpg(child_pgid, signal.SIGKILL)
+      except OSError:
+        pass
+      group_deadline = time.monotonic() + 3
+      while time.monotonic() < group_deadline:
+        group_present = _group_present(child_pgid)
+        if group_present is not True:
+          break
+        time.sleep(.05)
+    child_group_cleared = group_present is False
   if redactor is not None:
     try:
       _targetctl_redact_feed(redactor, b'', final=True)
@@ -402,28 +579,19 @@ finally:
       os.close(log_fd)
     except OSError:
       pass
+  owned_run = False
   try:
     state = _read_json('run.json')
-    if isinstance(state, dict) and state.get('state') in ('starting', 'running') and (stopping or (deadline is not None and time.monotonic() >= deadline)):
-      state['state'] = 'stopped'
-      _atom_json('run.json', state)
+    if isinstance(state, dict) and state.get('run_id') == spec.get('run_id'):
+      owned_run = True
+      if state.get('state') in ('starting', 'running'):
+        intentional = stopping or (deadline is not None and time.monotonic() >= deadline)
+        state['state'] = 'failed_startup' if child is None else ('stopped' if intentional else 'stale_identity')
+        _atom_json('run.json', state)
   except (OSError, ValueError, json.JSONDecodeError):
     pass
-  lock_token = spec.get('lock_token')
-  if isinstance(lock_token, str):
-    try:
-      lock_fd = os.open('.targetctl-operation-lock-v1', os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), dir_fd=RUN_FD)
-      try:
-        lock_stat = os.fstat(lock_fd)
-        raw = os.read(lock_fd, 65537)
-        lock = json.loads(raw.decode('ascii'))
-      finally:
-        os.close(lock_fd)
-      if stat.S_ISREG(lock_stat.st_mode) and lock_stat.st_uid == os.geteuid() and stat.S_IMODE(lock_stat.st_mode) == 0o600 and isinstance(lock, dict) and isinstance(lock.get('token'), str) and hmac.compare_digest(lock['token'], lock_token):
-        os.unlink('.targetctl-operation-lock-v1', dir_fd=RUN_FD)
-        os.fsync(RUN_FD)
-    except (OSError, ValueError, json.JSONDecodeError):
-      pass
+  if owned_run and child_group_cleared:
+    _release_lifecycle_lease(spec.get('run_id'))
   for name in ('launch.json', 'ack.json', 'supervisor.py'):
     _unlink_owned(name)
 """
@@ -454,6 +622,13 @@ def _lc_read(root_fd,name):
   try:data=json.loads(raw.decode('ascii'))
   except(UnicodeDecodeError,json.JSONDecodeError):_fail('unsafe_state')
   return data
+def _lc_read_state(root_fd):
+  state=_lc_read(root_fd,'run.json')
+  if not _valid_run_state(state):_fail('unsafe_state')
+  return state
+def _lc_write_state(root_fd,state):
+  if not _valid_run_state(state):_fail('unsafe_state')
+  _lc_atom(root_fd,'run.json',state)
 def _lc_ticks(pid):
   try:
     with open('/proc/%d/stat'%pid,'r') as f:raw=f.read(4096)
@@ -463,6 +638,11 @@ def _lc_ticks(pid):
 def _lc_pgid(pid):
   try:return os.getpgid(pid)
   except OSError:return None
+def _lc_group_present(pgid):
+  if not isinstance(pgid,int)or pgid<=1:return None
+  try:os.killpg(pgid,0);return True
+  except ProcessLookupError:return False
+  except OSError:return None
 def _lc_pid_identity(state):
   pid=state.get('supervisor_pid');ticks=state.get('supervisor_start_ticks')
   try:
@@ -471,19 +651,19 @@ def _lc_pid_identity(state):
 def _lc_supervisor_identity(state):
   pid=state.get('supervisor_pid')
   if not isinstance(pid,int) or pid<=1:return False
-  st=state.get('supervisor_start_ticks');cl=state.get('supervisor_cmdline')
-  if not isinstance(st,int) or _lc_ticks(pid)!=st:return False
+  ticks=state.get('supervisor_start_ticks');expected=state.get('supervisor_cmdline_sha256')
+  if not isinstance(ticks,int) or _lc_ticks(pid)!=ticks or not _is_hex_digest(expected):return False
   try:
     if os.stat('/proc/%d'%pid).st_uid!=os.geteuid():return False
     cmdline=open('/proc/%d/cmdline'%pid,'rb').read(4096).rstrip(b'\0')
-    expected=state.get('supervisor_cmdline')
-    return isinstance(expected,str) and hmac.compare_digest(b' '.join(cmdline.split(b'\0')),expected.encode('ascii'))
+    return bool(cmdline) and hmac.compare_digest(hashlib.sha256(b' '.join(cmdline.split(b'\0'))).hexdigest(),expected)
   except OSError:return False
 def _lc_child_identity(state):
-  pid=state.get('child_pid');ticks=state.get('child_start_ticks');expected=state.get('child_cmdline')
-  if not isinstance(pid,int) or pid<=1 or not isinstance(ticks,int) or not isinstance(expected,str) or _lc_ticks(pid)!=ticks or _lc_pgid(pid)!=pid:return False
+  pid=state.get('child_pid');ticks=state.get('child_start_ticks');pgid=state.get('child_pgid');expected=state.get('child_cmdline_sha256')
+  if not isinstance(pid,int) or pid<=1 or not isinstance(ticks,int) or pgid!=pid or not _is_hex_digest(expected) or _lc_ticks(pid)!=ticks or _lc_pgid(pid)!=pid:return False
   try:
-    return os.stat('/proc/%d'%pid).st_uid==os.geteuid() and hmac.compare_digest(b' '.join(open('/proc/%d/cmdline'%pid,'rb').read(4096).rstrip(b'\0').split(b'\0')),expected.encode('ascii'))
+    cmdline=open('/proc/%d/cmdline'%pid,'rb').read(4096).rstrip(b'\0')
+    return os.stat('/proc/%d'%pid).st_uid==os.geteuid() and bool(cmdline) and hmac.compare_digest(hashlib.sha256(b' '.join(cmdline.split(b'\0'))).hexdigest(),expected)
   except OSError:return False
 def _lc_live(state):
   return _lc_supervisor_identity(state) and _lc_child_identity(state) and _lc_listener(state.get('port'),state.get('child_pid',0),state.get('listener_inode')) is not None
@@ -545,13 +725,17 @@ def _lc_roots(payload):
   fields={k:payload[k] for k in('workdir','run_dir','model_path','drafter_path','work_token','run_token')}
   return _root_payload(fields,require_tokens=True)
 def _lc_open_dir(paths):
-  if paths.get('local_mode'):
-    run_fd=_open_root(paths['run_dir'],create_leaf=True)
-    sv_fd=_open_root(paths['workdir'],create_leaf=True)
+  run_fd=_open_root(paths['run_dir'],create_leaf=bool(paths.get('local_mode')))
+  sv_fd=None
+  try:
+    if not paths.get('local_mode'):_root_identity(run_fd,'run',paths['run_token'])
+    sv_fd=_open_root(paths['workdir'],create_leaf=bool(paths.get('local_mode')))
+    if not paths.get('local_mode'):_root_identity(sv_fd,'work',paths['work_token'])
     return run_fd,sv_fd
-  run_fd=_open_root(paths['run_dir']);_root_identity(run_fd,'run',paths['run_token'])
-  sv_fd=_open_root(paths['workdir']);_root_identity(sv_fd,'work',paths['work_token'])
-  return run_fd,sv_fd
+  except BaseException:
+    os.close(run_fd)
+    if sv_fd is not None:os.close(sv_fd)
+    raise
 def _lc_secret_values(paths):
   values=(paths['workdir'],paths['run_dir'],paths['model_path'],paths['drafter_path'],os.path.basename(paths['model_path']),os.path.basename(paths['drafter_path']))
   result=[]
@@ -588,6 +772,25 @@ def _lc_temp_outcome(root_fd):
     if outcome=='unknown':return 'unknown'
     seen=seen or outcome=='cleared'
   return 'cleared' if seen else 'not_found'
+def _lc_release_lease(paths,root_fd,run_id):
+  if paths.get('local_mode'):return 'cleared'
+  return _release_lifecycle_lock_at_root(root_fd,_identity(root_fd),paths['run_token'],run_id)
+def _lc_guard(root_fd):
+  fd=None
+  try:
+    fd=os.open('.targetctl-lifecycle-v1.lock',os.O_RDWR|os.O_CREAT|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
+    item=os.fstat(fd)
+    if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.geteuid() or stat.S_IMODE(item.st_mode)!=0o600:raise OSError()
+    fcntl.flock(fd,fcntl.LOCK_EX)
+    return fd
+  except OSError:
+    if fd is not None:
+      try:os.close(fd)
+      except OSError:pass
+    _fail('unsafe_state')
+def _lc_unguard(fd):
+  try:fcntl.flock(fd,fcntl.LOCK_UN)
+  finally:os.close(fd)
 def _lc_digest(root_fd):
   try:
     fd,item=_open_regular('server.log',dir_fd=root_fd)
@@ -597,136 +800,268 @@ def _lc_digest(root_fd):
       return hashlib.sha256(body).hexdigest()
     finally:os.close(fd)
   except (HelperError,OSError):return None
-def _lc_unvalidated_process_outcome(state):
+def _lc_process_present(pid):
+  if not isinstance(pid,int) or pid<=1:return False
+  try:
+    with open('/proc/%d/stat'%pid,encoding='ascii')as f:raw=f.read(4096)
+    fields=raw[raw.rfind(')')+2:].split()
+    return not fields or fields[0]not in('Z','X','x')
+  except OSError:return False
+def _lc_stale_groups(state):
+  groups={}
+  pid=state.get('supervisor_pid')
+  if _lc_supervisor_identity(state)and _lc_pgid(pid)==pid:groups['supervisor_pid']=pid
+  pid=state.get('child_pid')
+  if _lc_child_identity(state):groups['child_pid']=pid
+  return groups
+def _lc_stale_process_outcome(state,groups):
+  present=False
   for name in('supervisor_pid','child_pid'):
     pid=state.get(name)
-    if isinstance(pid,int) and pid>1:
-      try:
-        os.kill(pid,0)
-        return 'unknown'
-      except ProcessLookupError:pass
-      except OSError:return 'unknown'
-  return 'not_found'
+    if not _lc_process_present(pid):continue
+    if groups.get(name)==pid:
+      if name=='supervisor_pid'and _lc_supervisor_identity(state)and _lc_pgid(pid)==pid:present=True;continue
+      if name=='child_pid'and _lc_child_identity(state):present=True;continue
+    return'unknown'
+  owned_pgids=set(groups.values())
+  tracked_pgids={pgid for pgid in(state.get('supervisor_pid'),state.get('child_pgid'))if isinstance(pgid,int)}
+  for pgid in tracked_pgids:
+    group_present=_lc_group_present(pgid)
+    if group_present is None or(group_present and pgid not in owned_pgids):return'unknown'
+    present=present or group_present
+  return'present'if present else'not_found'
+def _lc_stop_stale_owned(state):
+  groups=_lc_stale_groups(state)
+  for pgid in set(groups.values()):
+    try:os.killpg(pgid,signal.SIGTERM)
+    except ProcessLookupError:pass
+    except OSError:return'unknown','unknown'
+  started=time.monotonic();deadline=started+15;kill_after=started+3;killed=False;socket_seen=False
+  while time.monotonic()<deadline:
+    listener=_lc_listener(state['port'],state['child_pid']or 0)
+    socket_seen=socket_seen or listener is not None
+    process=_lc_stale_process_outcome(state,groups)
+    if process=='unknown':return 'unknown','unknown'if listener is not None else'not_found'
+    if process=='not_found'and listener is None:
+      return('cleared'if groups else'not_found'),'cleared'if socket_seen else'not_found'
+    if not killed and time.monotonic()>=kill_after:
+      for pgid in set(groups.values()):
+        group_present=_lc_group_present(pgid)
+        if group_present is None:return'unknown','unknown'if listener is not None else'not_found'
+        if group_present:
+          try:os.killpg(pgid,signal.SIGKILL)
+          except ProcessLookupError:pass
+          except OSError:return'unknown','unknown'if listener is not None else'not_found'
+      killed=True
+    time.sleep(.05)
+  return 'unknown','unknown'if socket_seen else'not_found'
 @register_action('lifecycle_serve')
 def lifecycle_serve(payload):
-  data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id','source_snapshot_id','applied_tree_hash','build_id','binary_path','port','startup_timeout_ms','lease_seconds','lock_token'})
-  if not _lc_id(data['run_id']) or not all(_lc_hex(data[k]) for k in('source_snapshot_id','applied_tree_hash','build_id')) or not isinstance(data['binary_path'],str) or not isinstance(data['port'],int) or not 1<=data['port']<=65535 or not isinstance(data['startup_timeout_ms'],int) or not 1<=data['startup_timeout_ms']<=600000 or not isinstance(data['lease_seconds'],int) or not 1<=data['lease_seconds']<=7200 or (not data['local_mode'] and not isinstance(data['lock_token'],str)):_fail('invalid_runtime_inputs')
-  paths=_lc_roots(data)
-  root_fd,sv_dir_fd=_lc_open_dir(paths)
+  data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id','source_snapshot_id','applied_tree_hash','build_id','binary_path','port','startup_timeout_ms','lease_seconds'})
+  if not _lc_id(data['run_id']) or not all(_lc_hex(data[k]) for k in('source_snapshot_id','applied_tree_hash','build_id')) or not isinstance(data['binary_path'],str) or not isinstance(data['port'],int) or not 1<=data['port']<=65535 or not isinstance(data['startup_timeout_ms'],int) or not 1<=data['startup_timeout_ms']<=600000 or not isinstance(data['lease_seconds'],int) or not 1<=data['lease_seconds']<=7200:_fail('invalid_runtime_inputs')
+  paths=None
+  root_fd=None
+  sv_dir_fd=None
+  guard_fd=None
+  lease_owned=False
+  dispatch_recorded=False
   try:
-    try:state=_lc_read(root_fd,'run.json')
-    except HelperError:state=None
-    if state and state.get('state')in('starting','running'):
-      if _lc_live(state):_fail('run_active')
-      state['state']='stale_identity';_lc_atom(root_fd,'run.json',state)
-    binary_hash=None
-    try:
-      binary_hash=_lc_binary_hash_at(sv_dir_fd,data['binary_path'])
-    except HelperError:
-      _fail('startup_failed')
+    paths=_lc_roots(data)
+    root_fd,sv_dir_fd=_lc_open_dir(paths)
+    guard_fd=_lc_guard(root_fd)
+    present=_lc_file_present(root_fd,'run.json')
+    if present is None:_fail('unsafe_state')
+    state=_lc_read_state(root_fd)if present else None
+    if state:
+      if state['state']=='starting':
+        if _lc_live(state):_fail('run_active')
+      elif state['state']=='running':
+        if _lc_live(state):_fail('run_active')
+        state['state']='stale_identity';_lc_write_state(root_fd,state)
+      if not state['cleanup_complete']:_fail('run_cleanup_required')
+    if not paths.get('local_mode'):
+      lease_owned=True
+      _acquire_lock_at_root(root_fd,_identity(root_fd),paths['run_token'],min(7200,data['lease_seconds']+15),data['run_id'])
+    try:binary_hash=_lc_binary_hash_at(sv_dir_fd,data['binary_path'])
+    except HelperError:_fail('startup_failed')
     try:build=_lc_read(root_fd,'build.json')
     except HelperError:_fail('startup_failed')
     expected_hash=build.get('binary_sha256')if isinstance(build,dict)else None
     if not isinstance(build,dict)or build.get('schema_version')!=1 or build.get('build_id')!=data['build_id']or build.get('source_snapshot_id')!=data['source_snapshot_id']or build.get('source_applied_tree_hash')!=data['applied_tree_hash']or build.get('exit_code')!=0 or not isinstance(build.get('duration_ns'),int) or isinstance(build.get('duration_ns'),bool) or build['duration_ns']<=0 or not _lc_hex(expected_hash)or not hmac.compare_digest(expected_hash,binary_hash):_fail('startup_failed')
     binary_exec='/proc/self/fd/%d/%s'%(sv_dir_fd,data['binary_path'])
-    argv=(['/usr/bin/python3',binary_exec] if data['binary_path'].endswith('.py') else [binary_exec])+['--cuda','-m',paths['model_path'],'-c','32768','--host','127.0.0.1','--port',str(data['port'])]
+    argv=(['/usr/bin/python3',binary_exec]if data['binary_path'].endswith('.py')else[binary_exec])+['--cuda','-m',paths['model_path'],'-c','32768','--host','127.0.0.1','--port',str(data['port'])]
     try:
       log_fd=os.open('server.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
     except FileExistsError:
       log_fd,_=_open_regular('server.log',dir_fd=root_fd,flags=os.O_WRONLY)
     try:os.ftruncate(log_fd,0);os.fsync(log_fd)
     finally:os.close(log_fd)
-    spec={'argv':argv,'drafter':paths['drafter_path'],'secrets':_lc_secret_values(paths),'lease_seconds':data['lease_seconds'],'lock_token':data['lock_token']}
+    profile=dict(LAUNCH_PROFILE)
+    state={
+      'schema_version':RUN_STATE_SCHEMA_VERSION,'run_id':data['run_id'],'state':'starting',
+      'source_snapshot_id':data['source_snapshot_id'],'applied_tree_hash':data['applied_tree_hash'],
+      'build_id':data['build_id'],'binary_sha256':binary_hash,'port':data['port'],
+      'launch_profile':profile,'supervisor_pid':None,'supervisor_start_ticks':None,
+      'supervisor_cmdline_sha256':None,'child_pid':None,'child_start_ticks':None,
+      'child_pgid':None,'child_cmdline_sha256':None,'listener_inode':None,
+      'cleanup_complete':False,
+      'cleanup':None,
+    }
+    _lc_write_state(root_fd,state)
+    dispatch_recorded=True
+    spec={'argv':argv,'drafter':paths['drafter_path'],'secrets':_lc_secret_values(paths),'lease_seconds':data['lease_seconds'],'run_id':data['run_id'],'launch_profile':profile}
     _lc_atom(root_fd,'launch.json',spec)
     sv_script='supervisor.py'
     sv_temp='.'+sv_script+'.'+secrets.token_hex(12)
-    sv_fd=os.open(sv_temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
     try:
-      os.write(sv_fd,_LC_SUPERVISOR_SOURCE.encode('ascii'));os.fsync(sv_fd)
-    finally:os.close(sv_fd)
-    os.replace(sv_temp,sv_script,src_dir_fd=root_fd,dst_dir_fd=root_fd)
+      sv_fd=os.open(sv_temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
+      try:os.write(sv_fd,_LC_SUPERVISOR_SOURCE.encode('ascii'));os.fsync(sv_fd)
+      finally:os.close(sv_fd)
+      os.replace(sv_temp,sv_script,src_dir_fd=root_fd,dst_dir_fd=root_fd)
+      sv_temp=None
+    finally:
+      if sv_temp is not None:_lc_remove_owned(root_fd,sv_temp)
     env=dict(os.environ)
-    env['TARGETCTL_SV_DIR_FD']=str(sv_dir_fd)
-    env['TARGETCTL_SV_RUN_FD']=str(root_fd)
+    env['TARGETCTL_SV_DIR_FD']=str(sv_dir_fd);env['TARGETCTL_SV_RUN_FD']=str(root_fd)
     sv_program='/proc/self/fd/%d/supervisor.py'%root_fd
-    p=subprocess.Popen(['/usr/bin/python3','-I','-S',sv_program,'launch.json'],cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,pass_fds=(sv_dir_fd,root_fd),env=env)
-    state={'schema_version':1,'run_id':data['run_id'],'state':'starting','source_snapshot_id':data['source_snapshot_id'],'applied_tree_hash':data['applied_tree_hash'],'build_id':data['build_id'],'binary_sha256':binary_hash,'port':data['port'],'supervisor_pid':p.pid,'supervisor_start_ticks':_lc_ticks(p.pid),'supervisor_cmdline':' '.join(p.args),'child_pid':0}
-    _lc_atom(root_fd,'run.json',state)
+    try:
+      p=subprocess.Popen(['/usr/bin/python3','-I','-S',sv_program,'launch.json'],cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,pass_fds=(sv_dir_fd,root_fd),env=env)
+    except BaseException:
+      state['state']='failed_startup';_lc_write_state(root_fd,state);_lc_temp_outcome(root_fd)
+      _fail('startup_failed')
+    lease_owned=False
     deadline=time.monotonic()+data['startup_timeout_ms']/1000
+    process_exited=False
     while time.monotonic()<deadline:
-      try:ack=_lc_read(root_fd,'ack.json')
-      except HelperError:ack=None
-      if isinstance(ack,dict)and ack.get('supervisor_pid')==p.pid and ack.get('supervisor_start_ticks')==state['supervisor_start_ticks']and isinstance(ack.get('child_pid'),int)and isinstance(ack.get('child_start_ticks'),int)and ack.get('child_pgid')==ack.get('child_pid')and isinstance(ack.get('child_cmdline'),str):
-        state['child_pid']=ack['child_pid'];state['child_start_ticks']=ack['child_start_ticks'];state['child_pgid']=ack['child_pgid'];state['child_cmdline']=ack['child_cmdline']
-        inode=_lc_listener(data['port'],state['child_pid'])
-        if inode:state['listener_inode']=inode;state['state']='running';_lc_atom(root_fd,'run.json',state);return{'run_id':data['run_id'],'state':'running','port':data['port'],'binary_sha256':binary_hash,'supervisor_pid':state['supervisor_pid'],'supervisor_start_ticks':state['supervisor_start_ticks'],'child_pid':state['child_pid'],'child_start_ticks':state['child_start_ticks']}
-      if p.poll()is not None:break
+      observed=_lc_read_state(root_fd)
+      if observed['run_id']!=data['run_id']:_fail('unsafe_state')
+      if observed['supervisor_pid']is not None and observed['supervisor_pid']!=p.pid:_fail('unsafe_state')
+      if observed['child_pid']is not None:
+        inode=_lc_listener(data['port'],observed['child_pid'])
+        if inode and _lc_supervisor_identity(observed) and _lc_child_identity(observed):
+          observed['listener_inode']=inode;observed['state']='running';_lc_write_state(root_fd,observed)
+          return{'run_id':data['run_id'],'state':'running','port':data['port'],'binary_sha256':binary_hash,'supervisor_pid':observed['supervisor_pid'],'supervisor_start_ticks':observed['supervisor_start_ticks'],'child_pid':observed['child_pid'],'child_start_ticks':observed['child_start_ticks'],'launch_profile':profile}
+      if p.poll()is not None:process_exited=True;break
       time.sleep(.05)
-    state['state']='failed_startup';_lc_atom(root_fd,'run.json',state)
-    if _lc_supervisor_identity(state) and _lc_pgid(state['supervisor_pid'])==state['supervisor_pid']:os.killpg(state['supervisor_pid'],signal.SIGTERM)
-    _fail('startup_timeout')
-  finally:os.close(root_fd);os.close(sv_dir_fd)
+    observed=_lc_read_state(root_fd)
+    observed['state']='failed_startup';_lc_write_state(root_fd,observed)
+    if _lc_supervisor_identity(observed)and _lc_pgid(observed['supervisor_pid'])==observed['supervisor_pid']:
+      try:os.killpg(observed['supervisor_pid'],signal.SIGTERM)
+      except OSError:pass
+    _fail('startup_failed' if process_exited else 'startup_timeout')
+  except HelperError:
+    if not dispatch_recorded:_fail('serve_not_dispatched')
+    raise
+  finally:
+    if lease_owned and paths is not None and root_fd is not None:_lc_release_lease(paths,root_fd,data['run_id'])
+    if guard_fd is not None:_lc_unguard(guard_fd)
+    if root_fd is not None:os.close(root_fd)
+    if sv_dir_fd is not None:os.close(sv_dir_fd)
+def _lc_public_run(state):
+  return{
+    'run_id':state['run_id'],'state':state['state'],
+    'source_snapshot_id':state['source_snapshot_id'],'build_id':state['build_id'],
+    'binary_sha256':state['binary_sha256'],'supervisor_pid':state['supervisor_pid'],
+    'supervisor_start_ticks':state['supervisor_start_ticks'],'child_pid':state['child_pid'],
+    'child_start_ticks':state['child_start_ticks'],'port':state['port'],
+    'launch_profile':state['launch_profile'],
+  }
 @register_action('lifecycle_status')
 def lifecycle_status(payload):
   data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id'})
   paths=_lc_roots(data)
   root_fd,sv_dir_fd=_lc_open_dir(paths)
+  guard_fd=None
   try:
-    try:state=_lc_read(root_fd,'run.json')
-    except HelperError:return{'run_id':None,'state':'stopped','active':False}
-    if data['run_id']is not None and state.get('run_id')!=data['run_id']:return{'run_id':None,'state':'stopped','active':False}
+    guard_fd=_lc_guard(root_fd)
+    present=_lc_file_present(root_fd,'run.json')
+    if present is None:_fail('unsafe_state')
+    if not present:return{'run_id':None,'state':'stopped','active':False,'run':None}
+    state=_lc_read_state(root_fd)
+    if data['run_id']is not None and state['run_id']!=data['run_id']:return{'run_id':None,'state':'stopped','active':False,'run':None}
     active=_lc_live(state)
-    if state.get('state')in('starting','running')and not active:state['state']='stale_identity';_lc_atom(root_fd,'run.json',state)
-    return{'run_id':state.get('run_id'),'state':state.get('state','stale_identity'),'active':active}
-  finally:os.close(root_fd);os.close(sv_dir_fd)
+    if state['state']=='running'and not active:state['state']='stale_identity';_lc_write_state(root_fd,state)
+    return{'run_id':state['run_id'],'state':state['state'],'active':active,'run':_lc_public_run(state)}
+  finally:
+    if guard_fd is not None:_lc_unguard(guard_fd)
+    os.close(root_fd);os.close(sv_dir_fd)
 @register_action('lifecycle_stop')
 def lifecycle_stop(payload):
   data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id'})
   paths=_lc_roots(data)
   root_fd,sv_dir_fd=_lc_open_dir(paths)
+  guard_fd=None
   try:
-    try:state=_lc_read(root_fd,'run.json')
-    except HelperError:return{'run_id':None,'status':'not_run','process':'not_run','socket':'not_run','lock':'not_found','temp':'not_found','server_log_sha256':None,'failure_class':None}
-    if data['run_id']is not None and state.get('run_id')!=data['run_id']:return{'run_id':None,'status':'not_run','process':'not_run','socket':'not_run','lock':'not_found','temp':'not_found','server_log_sha256':None,'failure_class':None}
-    lock_before=_lc_file_present(root_fd,'.targetctl-operation-lock-v1')
-    def outcomes():
-      lock_after=_lc_file_present(root_fd,'.targetctl-operation-lock-v1')
-      lock='unknown' if lock_before is None or lock_after is None or lock_after else ('cleared' if lock_before else 'not_found')
-      return _lc_temp_outcome(root_fd),lock,_lc_digest(root_fd)
+    guard_fd=_lc_guard(root_fd)
+    absent={'run_id':None,'status':'not_run','process':'not_run','socket':'not_run','lock':'not_found','temp':'not_found','server_log_sha256':None,'failure_class':None}
+    present=_lc_file_present(root_fd,'run.json')
+    if present is None:_fail('unsafe_state')
+    if not present:return absent
+    state=_lc_read_state(root_fd)
+    if data['run_id']is not None and state['run_id']!=data['run_id']:return absent
+    if state['cleanup_complete']:
+      settled=state['cleanup']
+      return{'run_id':state['run_id'],'status':'stopped','process':settled['process'],'socket':settled['socket'],'lock':settled['lock'],'temp':settled['temp'],'server_log_sha256':settled['server_log_sha256'],'failure_class':None}
+    def outcomes(stopped):
+      digest=_lc_digest(root_fd)
+      if not stopped:return'unknown','unknown',digest
+      return _lc_temp_outcome(root_fd),_lc_release_lease(paths,root_fd,state['run_id']),digest
     process='not_found';socket='not_found'
-    sv_pid=state.get('supervisor_pid');sv_pgid=_lc_pgid(sv_pid)if isinstance(sv_pid,int)else None
-    is_live=_lc_live(state) and sv_pgid==sv_pid
+    sv_pid=state['supervisor_pid'];sv_pgid=_lc_pgid(sv_pid)if isinstance(sv_pid,int)else None
+    is_live=_lc_live(state)and sv_pgid==sv_pid
     if not is_live:
-      if state.get('state')in('starting','running'):
-        state['state']='stale_identity';_lc_atom(root_fd,'run.json',state)
-      temp,lock,digest=outcomes()
-      process=_lc_unvalidated_process_outcome(state)
-      socket='unknown' if process=='unknown' else 'not_found'
-      return{'run_id':state.get('run_id'),'status':'not_run','process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest,'failure_class':None}
+      if state['state']in('starting','running'):
+        state['state']='stale_identity';_lc_write_state(root_fd,state)
+      process,socket=_lc_stop_stale_owned(state)
+      stopped=process in('cleared','not_found')and socket in('cleared','not_found')
+      temp,lock,digest=outcomes(stopped)
+      clean=stopped and temp in('cleared','not_found')and lock in('cleared','not_found')
+      if clean:
+        state['cleanup_complete']=True;state['cleanup']={'process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest};_lc_write_state(root_fd,state)
+      return{'run_id':state['run_id'],'status':'stopped'if clean else'failed','process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest,'failure_class':None if clean else'stop_failed'}
     try:os.killpg(sv_pgid,signal.SIGTERM);process='cleared'
     except OSError:process='unknown'
-    if _lc_listener(state.get('port'),state.get('child_pid',0)):socket='unknown'
-    deadline=time.monotonic()+15
+    if _lc_listener(state['port'],state['child_pid'],state['listener_inode']):socket='unknown'
+    owned_groups=(sv_pgid,state['child_pgid'])
+    started=time.monotonic();deadline=started+15;kill_after=started+4;killed=False
+    stopped=False
     while time.monotonic()<deadline:
       proc_alive=False
-      if isinstance(sv_pid,int)and sv_pid>1:
-        try:os.kill(sv_pid,0);proc_alive=True
-        except OSError:pass
-      sock_alive=bool(_lc_listener(state.get('port'),state.get('child_pid',0)))
-      if not proc_alive and not sock_alive:
-        socket='cleared'if socket!='not_found'else socket
-        break
+      try:os.kill(sv_pid,0);proc_alive=True
+      except OSError:pass
+      sock_alive=bool(_lc_listener(state['port'],state['child_pid']))
+      group_states=tuple(_lc_group_present(pgid)for pgid in owned_groups)
+      if any(item is None for item in group_states):process='unknown';break
+      if not proc_alive and not sock_alive and not any(group_states):
+        process='cleared';socket='cleared'if socket!='not_found'else socket;stopped=True;break
+      if not killed and time.monotonic()>=kill_after:
+        for pgid,group_present in zip(owned_groups,group_states):
+          if group_present:
+            try:os.killpg(pgid,signal.SIGKILL)
+            except ProcessLookupError:pass
+            except OSError:process='unknown'
+        killed=True
       time.sleep(.05)
-    else:_fail('stop_failed')
-    state['state']='stopped';_lc_atom(root_fd,'run.json',state)
-    temp,lock,digest=outcomes()
-    return{'run_id':state.get('run_id'),'status':'stopped','process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest,'failure_class':None}
-  finally:os.close(root_fd);os.close(sv_dir_fd)
+    if stopped:
+      state['state']='stopped';_lc_write_state(root_fd,state)
+    temp,lock,digest=outcomes(stopped)
+    clean=stopped and process=='cleared'and socket in('cleared','not_found')and temp in('cleared','not_found')and lock in('cleared','not_found')
+    if clean:
+      state['cleanup_complete']=True;state['cleanup']={'process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest};_lc_write_state(root_fd,state)
+    return{'run_id':state['run_id'],'status':'stopped'if clean else'failed','process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest,'failure_class':None if clean else'stop_failed'}
+  finally:
+    if guard_fd is not None:_lc_unguard(guard_fd)
+    os.close(root_fd);os.close(sv_dir_fd)
 @register_action('lifecycle_logs')
 def lifecycle_logs(payload):
-  paths=_lc_roots(_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode'}))
+  data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id'})
+  paths=_lc_roots(data)
   root_fd,sv_dir_fd=_lc_open_dir(paths)
   try:
+    present=_lc_file_present(root_fd,'run.json')
+    if not present:_fail('log_unavailable')
+    state=_lc_read_state(root_fd)
+    if data['run_id']is not None and state['run_id']!=data['run_id']:_fail('log_unavailable')
     fd,item=_open_regular('server.log',dir_fd=root_fd)
     try:
       body=os.read(fd,_LC_MAX_LOG+1)
@@ -743,64 +1078,130 @@ def lifecycle_weights(payload):
 
 # The sanitizer executes both in remote.py's helper namespace and in the
 # isolated supervisor interpreter; its source is deliberately shared.
-_LIFECYCLE_EXTENSION = REMOTE_REDACTION_EXTENSION + "import signal\nimport subprocess\n" + _LIFECYCLE_EXTENSION
-_LIFECYCLE_EXTENSION = _LIFECYCLE_EXTENSION.replace('"""import hmac', 'r"""' + REMOTE_REDACTION_EXTENSION + '\nimport hmac', 1)
+_LIFECYCLE_EXTENSION = REMOTE_REDACTION_EXTENSION + "import fcntl\nimport signal\nimport subprocess\n" + _LIFECYCLE_EXTENSION
+_LIFECYCLE_EXTENSION = _LIFECYCLE_EXTENSION.replace('"""import hashlib', 'r"""' + REMOTE_REDACTION_EXTENSION + '\nimport hashlib', 1)
 
 
-def _remote_lock(transport, roots, lease_seconds):
-    value = transport.run_helper("acquire_lock", {"run_dir": roots["run_dir"], "run_token": roots["run_token"], "lease_seconds": lease_seconds}, allowed_error_codes={"lock_busy", "lock_failed", "unsafe_lock", "unsafe_root", "invalid_lease"})
-    if not isinstance(value, Mapping) or not isinstance(value.get("lock_token"), str):
-        _fail("unsafe_lock", "target lifecycle lock is invalid")
-    return value["lock_token"]
+
+
+def _launch_profile(value: Any) -> LaunchProfile:
+    if not isinstance(value, Mapping) or dict(value) != LAUNCH_PROFILE:
+        _fail("unsafe_state", "target launch profile is invalid")
+    return FIXED_LAUNCH_PROFILE
 
 
 def _serve_result(value, runtime, identifier):
     keys = ("supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks")
-    if not isinstance(value, Mapping) or value.get("run_id") != identifier or value.get("state") != "running" or value.get("port") != runtime.port or not isinstance(value.get("binary_sha256"), str) or _HEX.fullmatch(value["binary_sha256"]) is None or any(not isinstance(value.get(key), int) or value[key] <= 1 for key in keys):
+    if not isinstance(value, Mapping) or set(value) != {"run_id", "state", "port", "binary_sha256", *keys, "launch_profile"} or value.get("run_id") != identifier or value.get("state") != "running" or value.get("port") != runtime.port or not isinstance(value.get("binary_sha256"), str) or _HEX.fullmatch(value["binary_sha256"]) is None or any(not isinstance(value.get(key), int) or isinstance(value[key], bool) or value[key] <= 1 for key in keys):
         _fail("startup_failed", "target server identity is invalid")
-    return RunResult(identifier, "running", runtime.port, runtime.source_snapshot_id, runtime.build_id, value["binary_sha256"], value["supervisor_pid"], value["supervisor_start_ticks"], value["child_pid"], value["child_start_ticks"])
+    return RunResult(identifier, "running", runtime.port, runtime.source_snapshot_id, runtime.build_id, value["binary_sha256"], value["supervisor_pid"], value["supervisor_start_ticks"], value["child_pid"], value["child_start_ticks"], _launch_profile(value["launch_profile"]))
+
+
+def _observed_run(value: Any, runtime: RuntimeInputs, identifier: str) -> RunResult:
+    fields = {
+        "run_id", "state", "source_snapshot_id", "build_id", "binary_sha256",
+        "supervisor_pid", "supervisor_start_ticks", "child_pid",
+        "child_start_ticks", "port", "launch_profile",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields or value.get("run_id") != identifier or value.get("state") not in _STATES or value.get("source_snapshot_id") != runtime.source_snapshot_id or value.get("build_id") != runtime.build_id or value.get("port") != runtime.port or not isinstance(value.get("binary_sha256"), str) or _HEX.fullmatch(value["binary_sha256"]) is None:
+        _fail("unsafe_state", "target run state is invalid")
+    pairs = (
+        (value["supervisor_pid"], value["supervisor_start_ticks"]),
+        (value["child_pid"], value["child_start_ticks"]),
+    )
+    for pid, ticks in pairs:
+        if (pid is None) != (ticks is None) or (pid is not None and (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(ticks, int) or isinstance(ticks, bool) or ticks <= 1)):
+            _fail("unsafe_state", "target run state is invalid")
+    if value["state"] == "running" and any(item is None for pair in pairs for item in pair):
+        _fail("unsafe_state", "target run state is invalid")
+    return RunResult(
+        identifier, value["state"], runtime.port, runtime.source_snapshot_id,
+        runtime.build_id, value["binary_sha256"], value["supervisor_pid"],
+        value["supervisor_start_ticks"], value["child_pid"],
+        value["child_start_ticks"], _launch_profile(value["launch_profile"]),
+    )
+
 
 def _serve_call(transport, payload, runtime):
     try:
         return _call(transport, "lifecycle_serve", payload, timeout=runtime.startup_timeout + 15)
     except TargetError as error:
+        if error.code in {"run_active", "run_cleanup_required", "lock_busy", "lock_failed", "unsafe_lock"}:
+            _fail("serve_not_dispatched", "target server launch was refused")
         if error.code == "missing_path":
-            _fail("startup_failed", "target server executable is unavailable")
+            _fail("serve_not_dispatched", "target server launch was refused")
         raise
 
+
 def serve(config, transport, runtime, *, run_id=None):
-    if hasattr(config, "validate_for"): config.validate_for("serve")
-    identifier = _run_id(run_id); roots = _roots(config, runtime)
-    payload = {**roots, "run_id": identifier, "source_snapshot_id": runtime.source_snapshot_id, "applied_tree_hash": runtime.applied_tree_hash, "build_id": runtime.build_id, "binary_path": runtime.binary_path, "port": runtime.port, "startup_timeout_ms": int(runtime.startup_timeout * 1000), "lease_seconds": runtime.lease_seconds, "lock_token": None}
+    if hasattr(config, "validate_for"):
+        config.validate_for("serve")
+    identifier = _run_id(run_id)
+    roots = _roots(config, runtime)
+    payload = {**roots, "run_id": identifier, "source_snapshot_id": runtime.source_snapshot_id, "applied_tree_hash": runtime.applied_tree_hash, "build_id": runtime.build_id, "binary_path": runtime.binary_path, "port": runtime.port, "startup_timeout_ms": int(runtime.startup_timeout * 1000), "lease_seconds": runtime.lease_seconds}
     if roots["local_mode"]:
-        with local_operation_lock(roots["run_dir"]):
-            return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier)
-    token = _remote_lock(transport, roots, min(7200, runtime.lease_seconds + 15)); payload["lock_token"] = token
+        try:
+            with local_operation_lock(roots["run_dir"]):
+                return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier)
+        except TargetError as error:
+            if error.code == "run_active":
+                _fail("serve_not_dispatched", "target server launch was refused")
+            raise
     return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier)
 
 def status(config, transport, runtime, *, run_id=None):
     if hasattr(config, "validate_for"): config.validate_for("status")
-    value = _call(transport, "lifecycle_status", {**_roots(config, runtime), "run_id": _run_id(run_id) if run_id is not None else None})
-    if not isinstance(value, Mapping) or value.get("state") not in _STATES or not isinstance(value.get("active"), bool): _fail("unsafe_state", "target run state is invalid")
-    identifier = value.get("run_id")
-    if identifier is not None: _run_id(identifier)
-    return StatusResult(identifier, value["state"], value["active"])
+    requested = _run_id(run_id) if run_id is not None else None
+    value = _call(transport, "lifecycle_status", {**_roots(config, runtime), "run_id": requested})
+    if not isinstance(value, Mapping) or set(value) != {"run_id", "state", "active", "run"} or value.get("state") not in _STATES or not isinstance(value.get("active"), bool):
+        _fail("unsafe_state", "target run state is invalid")
+    identifier = value["run_id"]
+    observed = value["run"]
+    if identifier is None:
+        if observed is not None or value["state"] != "stopped" or value["active"]:
+            _fail("unsafe_state", "target run state is invalid")
+        return StatusResult(None, "stopped", False, None)
+    _run_id(identifier)
+    if requested is not None and identifier != requested:
+        _fail("unsafe_state", "target run state is invalid")
+    run = _observed_run(observed, runtime, identifier)
+    if run.state != value["state"]:
+        _fail("unsafe_state", "target run state is invalid")
+    return StatusResult(identifier, value["state"], value["active"], run)
 
-def logs(config, transport, runtime):
+
+def logs(config, transport, runtime, *, run_id=None):
     if hasattr(config, "validate_for"): config.validate_for("logs")
-    value = _call(transport, "lifecycle_logs", _roots(config, runtime))
-    if not isinstance(value, Mapping) or not isinstance(value.get("content_b64"), str): _fail("log_unavailable", "sanitized server log is unavailable")
+    value = _call(transport, "lifecycle_logs", {**_roots(config, runtime), "run_id": _run_id(run_id) if run_id is not None else None})
+    if not isinstance(value, Mapping) or set(value) != {"content_b64"} or not isinstance(value["content_b64"], str): _fail("log_unavailable", "sanitized server log is unavailable")
     try: data = base64.b64decode(value["content_b64"], validate=True)
     except (ValueError, UnicodeEncodeError): _fail("log_unavailable", "sanitized server log is unavailable")
     if len(data) > MAX_LOG_BYTES: _fail("log_unavailable", "sanitized server log is unavailable")
     return data
 
+
 def _cleanup_result(value):
-    if not isinstance(value, Mapping) or value.get("status") not in ("stopped", "not_run"): _fail("stop_failed", "target server could not be stopped")
-    identifier = value.get("run_id")
+    fields = {"run_id", "status", "failure_class", "process", "socket", "lock", "temp", "server_log_sha256"}
+    if not isinstance(value, Mapping) or set(value) != fields or value["status"] not in ("stopped", "not_run", "failed"):
+        _fail("stop_failed", "target server could not be stopped")
+    identifier = value["run_id"]
     if identifier is not None: _run_id(identifier)
-    digest = value.get("server_log_sha256")
-    return CleanupResult(identifier, "succeeded" if value["status"] == "stopped" else "not_run", value.get("process", "unknown"), value.get("socket", "unknown"), value.get("lock", "unknown"), value.get("temp", "unknown"), digest, value.get("failure_class"))
+    outcomes = (value["process"], value["socket"], value["lock"], value["temp"])
+    if any(item not in {"cleared", "not_found", "not_run", "unknown"} for item in outcomes):
+        _fail("stop_failed", "target server cleanup evidence is invalid")
+    digest = value["server_log_sha256"]
+    if digest is not None and (not isinstance(digest, str) or _HEX.fullmatch(digest) is None):
+        _fail("stop_failed", "target server cleanup evidence is invalid")
+    if value["status"] == "not_run":
+        if identifier is not None or outcomes != ("not_run", "not_run", "not_found", "not_found") or digest is not None or value["failure_class"] is not None:
+            _fail("stop_failed", "target server cleanup evidence is invalid")
+    elif value["status"] == "stopped":
+        if identifier is None or any(item not in {"cleared", "not_found"} for item in outcomes) or value["failure_class"] is not None:
+            _fail("stop_failed", "target server cleanup evidence is invalid")
+    elif identifier is None or value["failure_class"] != "stop_failed":
+        _fail("stop_failed", "target server cleanup evidence is invalid")
+    status_value = {"stopped": "succeeded", "not_run": "not_run", "failed": "failed"}[value["status"]]
+    return CleanupResult(identifier, status_value, *outcomes, digest, value["failure_class"])
 
 def stop(config, transport, runtime, *, run_id=None):
     if hasattr(config, "validate_for"): config.validate_for("stop")
@@ -836,14 +1237,87 @@ def _weight_evidence(config, transport, runtime):
     if not isinstance(primary, str) or not isinstance(draft, str) or _HEX.fullmatch(primary) is None or _HEX.fullmatch(draft) is None: return None, None
     return primary, draft
 
+def _failure_code(error: BaseException) -> str:
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted"
+    if isinstance(error, TargetError):
+        return error.code
+    return "internal_error"
+
+
+def _failed_cleanup(identifier: str, error: BaseException) -> CleanupResult:
+    return CleanupResult(
+        identifier, "failed", "unknown", "unknown", "unknown", "unknown",
+        None, _failure_code(error),
+    )
+
+
+def _reconcile_failed_serve(config, transport, runtime, identifier, started, error):
+    observed: RunResult | None = None
+    try:
+        result = status(config, transport, runtime, run_id=identifier)
+        if result.run_id == identifier:
+            observed = result.run
+    except BaseException as status_error:
+        if not isinstance(status_error, (Exception, KeyboardInterrupt)):
+            raise
+    if observed is None:
+        observed = RunResult(
+            identifier, "failed_startup", runtime.port,
+            runtime.source_snapshot_id, runtime.build_id,
+            launch_profile=FIXED_LAUNCH_PROFILE,
+        )
+    try:
+        cleaned = stop(config, transport, runtime, run_id=identifier)
+    except BaseException as cleanup_error:
+        if not isinstance(cleanup_error, (Exception, KeyboardInterrupt)):
+            raise
+        cleaned = _failed_cleanup(identifier, cleanup_error)
+    return SmokeResult(
+        identifier, "failed", _failure_code(error), None, None, "failed",
+        None, None, __import__("time").monotonic_ns() - started,
+        observed, cleaned,
+    )
+
+
 def smoke(config, transport, runtime, *, run_id=None):
-    identifier = _run_id(run_id); started = __import__("time").monotonic_ns(); run = serve(config, transport, runtime, run_id=identifier); readiness = models = contract = False; primary = draft = None; failure = None
+    identifier = _run_id(run_id)
+    started = __import__("time").monotonic_ns()
+    try:
+        run = serve(config, transport, runtime, run_id=identifier)
+    except BaseException as error:
+        if not isinstance(error, (Exception, KeyboardInterrupt)):
+            raise
+        if isinstance(error, TargetError) and error.code == "serve_not_dispatched":
+            raise
+        return _reconcile_failed_serve(config, transport, runtime, identifier, started, error)
+    readiness = models = contract = False
+    primary = draft = None
+    failure = None
     try:
         if isinstance(transport, SSHTransport):
-            with SSHForward(transport, target_port=runtime.port, timeout=runtime.smoke_timeout) as forward: readiness, models, contract = _http_contract(forward.local_port, runtime.smoke_timeout)
-        else: readiness, models, contract = _http_contract(runtime.port, runtime.smoke_timeout)
+            with SSHForward(transport, target_port=runtime.port, timeout=runtime.smoke_timeout) as forward:
+                readiness, models, contract = _http_contract(forward.local_port, runtime.smoke_timeout)
+        else:
+            readiness, models, contract = _http_contract(runtime.port, runtime.smoke_timeout)
         primary, draft = _weight_evidence(config, transport, runtime)
-        if not (readiness and models and contract and primary and draft): failure = "http_contract_failed"
-    except TargetError as error: failure = error.code
-    finally: cleaned = stop(config, transport, runtime, run_id=run.run_id)
-    return SmokeResult(identifier, "succeeded" if failure is None else "failed", failure, 200 if readiness else None, 200 if models else None, "passed" if contract else "failed", primary, draft, __import__("time").monotonic_ns() - started, run, cleaned)
+        if not (readiness and models and contract and primary and draft):
+            failure = "http_contract_failed"
+    except BaseException as error:
+        if not isinstance(error, (Exception, KeyboardInterrupt)):
+            raise
+        failure = _failure_code(error)
+    try:
+        cleaned = stop(config, transport, runtime, run_id=run.run_id)
+    except BaseException as error:
+        if not isinstance(error, (Exception, KeyboardInterrupt)):
+            raise
+        cleaned = _failed_cleanup(identifier, error)
+    if cleaned.status != "succeeded" and failure is None:
+        failure = cleaned.failure_class or "stop_failed"
+    return SmokeResult(
+        identifier, "succeeded" if failure is None else "failed", failure,
+        200 if readiness else None, 200 if models else None,
+        "passed" if contract else "failed", primary, draft,
+        __import__("time").monotonic_ns() - started, run, cleaned,
+    )

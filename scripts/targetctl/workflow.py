@@ -1,8 +1,10 @@
 """Private-safe Phase 01 workflow composition."""
 from __future__ import annotations
+from contextlib import contextmanager
 
 from base64 import b64decode, b64encode
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -102,14 +104,14 @@ def _state_path(root: Path, target: str) -> Path:
     return root / "targets" / ".state" / f"{target}.workflow-v1.json"
 
 
-def _read_state(root: Path, target: str, required: bool) -> dict[str, Any]:
+def _read_state_unlocked(root: Path, target: str, required: bool) -> dict[str, Any]:
     path = _state_path(root, target)
     try:
         info = os.lstat(path)
     except FileNotFoundError:
         if required:
             _fail("workflow_state_missing", "controller state is unavailable")
-        return {"schema": 1, "source": None, "build": None}
+        return {"schema": 1, "source": None, "build": None, "pending": None}
     except OSError:
         _fail("workflow_state_invalid", "controller state is unavailable")
     if (
@@ -137,7 +139,7 @@ def _read_state(root: Path, target: str, required: bool) -> dict[str, Any]:
     return result
 
 
-def _write_state(root: Path, target: str, value: Mapping[str, Any]) -> None:
+def _write_state_unlocked(root: Path, target: str, value: Mapping[str, Any]) -> None:
     if set(value) != {"schema", "source", "build", "pending"} or value.get("schema") != 1:
         _fail("workflow_state_invalid", "controller state is unavailable")
     write_json_atomic(
@@ -146,6 +148,41 @@ def _write_state(root: Path, target: str, value: Mapping[str, Any]) -> None:
         required_keys=("schema", "source", "build", "pending"), mode=0o600,
     )
 
+
+@contextmanager
+def _controller_state_lock(root: Path, target: str):
+    """Serialize controller-side read/modify/write ownership transitions."""
+    lock_path = _state_path(root, target).parent / ".targetctl-controller-lock-v1"
+    fd = -1
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.fchmod(fd, 0o600)
+        item = os.fstat(fd)
+        if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1 or item.st_uid != os.getuid() or stat.S_IMODE(item.st_mode) != 0o600:
+            _fail("workflow_state_invalid", "controller state is unavailable")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    except BlockingIOError:
+        _fail("workflow_busy", "controller operation is already active")
+    except OSError:
+        _fail("workflow_state_invalid", "controller state is unavailable")
+    finally:
+        if fd >= 0:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+
+def _read_state(root: Path, target: str, required: bool) -> dict[str, Any]:
+    with _controller_state_lock(root, target):
+        return _read_state_unlocked(root, target, required)
+
+
+def _write_state(root: Path, target: str, value: Mapping[str, Any]) -> None:
+    with _controller_state_lock(root, target):
+        _write_state_unlocked(root, target, value)
 
 def _snapshot(value: Any) -> SourceSnapshot:
     try:
@@ -213,20 +250,26 @@ def _doctor_runtime(config: TargetConfig) -> DoctorRuntimeInput | None:
 
 
 def _save_source(root: Path, target: str, source: SourceSnapshot) -> None:
-    state = _read_state(root, target, False)
-    state["source"], state["build"], state["pending"] = source.as_dict(), None, None
-    _write_state(root, target, state)
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, False)
+        if state["pending"] is not None:
+            _fail("workflow_run_pending", "target run reconciliation is required")
+        state["source"], state["build"] = source.as_dict(), None
+        _write_state_unlocked(root, target, state)
 
 
 def _save_build(root: Path, target: str, source: SourceSnapshot, result: BuildResult) -> None:
     if result.status != "succeeded":
         return
-    state = _read_state(root, target, True)
-    if state["source"] != source.as_dict():
-        _fail("workflow_state_invalid", "controller state is unavailable")
-    payload = result.controller_payload()
-    state["build"] = {key: payload[key] for key in ("source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "version", "binary_size", "sass", "build_log_sha256")}
-    _write_state(root, target, state)
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, True)
+        if state["pending"] is not None:
+            _fail("workflow_run_pending", "target run reconciliation is required")
+        if state["source"] != source.as_dict():
+            _fail("workflow_state_invalid", "controller state is unavailable")
+        payload = result.controller_payload()
+        state["build"] = {key: payload[key] for key in ("source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "version", "binary_size", "sass", "build_log_sha256")}
+        _write_state_unlocked(root, target, state)
 
 
 def _source_ready(root: Path, target: str) -> SourceSnapshot:
@@ -240,39 +283,82 @@ def _ready(root: Path, target: str) -> tuple[SourceSnapshot, dict[str, Any]]:
 
 
 def _store_pending_run(root: Path, target: str, source: SourceSnapshot, built: Mapping[str, Any], run_id: str) -> None:
-    """Persist only public identity before a launch can become ambiguous."""
-    state = _read_state(root, target, True)
-    state["pending"] = {
-        "schema": 1,
-        "run_id": run_id,
-        "source_snapshot_id": source.snapshot_id,
-        "build_id": built["build_id"],
-        "binary_sha256": built["binary_sha256"],
-    }
-    _write_state(root, target, state)
+    """Persist one public launch identity without replacing unresolved ownership."""
+    if (
+        not isinstance(run_id, str)
+        or not 8 <= len(run_id) <= 64
+        or not run_id.startswith("run-")
+        or not run_id.isascii()
+        or any(not (character.islower() or character.isdigit() or character == "-") for character in run_id)
+    ):
+        _fail("workflow_state_invalid", "controller state is unavailable")
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, True)
+        if state["pending"] is not None:
+            _fail("workflow_run_pending", "target run reconciliation is required")
+        if state["source"] != source.as_dict():
+            _fail("workflow_state_invalid", "controller state is unavailable")
+        current = _build_state(state["build"], source)
+        if current != dict(built):
+            _fail("workflow_state_invalid", "controller state is unavailable")
+        state["pending"] = {
+            "schema": 1,
+            "run_id": run_id,
+            "source_snapshot_id": source.snapshot_id,
+            "build_id": current["build_id"],
+            "binary_sha256": current["binary_sha256"],
+        }
+        _write_state_unlocked(root, target, state)
 
 
 def _pending_run(root: Path, target: str) -> str | None:
-    pending = _read_state(root, target, True)["pending"]
-    if pending is None:
-        return None
-    if (
-        set(pending) != {"schema", "run_id", "source_snapshot_id", "build_id", "binary_sha256"}
-        or pending.get("schema") != 1
-        or not isinstance(pending["run_id"], str)
-        or not pending["run_id"].startswith("run-")
-        or any(not isinstance(pending[key], str) or len(pending[key]) != 64 or any(char not in _HEX for char in pending[key]) for key in ("source_snapshot_id", "build_id", "binary_sha256"))
-    ):
-        _fail("workflow_state_invalid", "controller state is unavailable")
-    return pending["run_id"]
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, True)
+        pending = state["pending"]
+        if pending is None:
+            return None
+        if (
+            set(pending) != {"schema", "run_id", "source_snapshot_id", "build_id", "binary_sha256"}
+            or pending.get("schema") != 1
+            or not isinstance(pending["run_id"], str)
+            or not 8 <= len(pending["run_id"]) <= 64
+            or not pending["run_id"].startswith("run-")
+            or not pending["run_id"].isascii()
+            or any(not (character.islower() or character.isdigit() or character == "-") for character in pending["run_id"])
+            or any(not isinstance(pending[key], str) or len(pending[key]) != 64 or any(char not in _HEX for char in pending[key]) for key in ("source_snapshot_id", "build_id", "binary_sha256"))
+        ):
+            _fail("workflow_state_invalid", "controller state is unavailable")
+        source = _snapshot(state["source"])
+        built = _build_state(state["build"], source)
+        if (
+            pending["source_snapshot_id"] != source.snapshot_id
+            or pending["build_id"] != built["build_id"]
+            or pending["binary_sha256"] != built["binary_sha256"]
+        ):
+            _fail("workflow_state_invalid", "controller state is unavailable")
+        return pending["run_id"]
 
 
 def _clear_pending_run(root: Path, target: str, run_id: str | None) -> None:
-    state = _read_state(root, target, True)
-    pending = state["pending"]
-    if pending is not None and (run_id is None or pending.get("run_id") == run_id):
-        state["pending"] = None
-        _write_state(root, target, state)
+    if run_id is None:
+        return
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, True)
+        pending = state["pending"]
+        if pending is not None and pending.get("run_id") == run_id:
+            state["pending"] = None
+            _write_state_unlocked(root, target, state)
+
+def _clear_new_pending_on_refusal(root: Path, target: str, run_id: str, error: TargetError) -> None:
+    """CAS-clear only the launch identity rejected before target dispatch."""
+    if error.code == "serve_not_dispatched":
+        _clear_pending_run(root, target, run_id)
+
+
+def _assert_no_pending_run(root: Path, target: str) -> None:
+    with _controller_state_lock(root, target):
+        if _read_state_unlocked(root, target, False)["pending"] is not None:
+            _fail("workflow_run_pending", "target run reconciliation is required")
 
 
 
@@ -315,7 +401,7 @@ def _not_run_build() -> dict[str, Any]:
 
 
 def _not_run_run() -> dict[str, Any]:
-    return {"status": "not_run", "failure_class": None, "state": None, "run_id": None, "source_snapshot_id": None, "build_id": None, "binary_sha256": None, "supervisor_pid": None, "supervisor_start_ticks": None, "child_pid": None, "child_start_ticks": None, "port": None}
+    return {"status": "not_run", "failure_class": None, "state": None, "run_id": None, "source_snapshot_id": None, "build_id": None, "binary_sha256": None, "supervisor_pid": None, "supervisor_start_ticks": None, "child_pid": None, "child_start_ticks": None, "port": None, "launch_profile": None}
 
 
 def _not_run_smoke() -> dict[str, Any]:
@@ -344,8 +430,13 @@ def _lifecycle_run_record(run_result: Any) -> dict[str, Any]:
     state = payload.get("state")
     if state in {"running", "stopped"}:
         return {"status": "succeeded", "failure_class": None, **payload}
-    if state in {"failed_startup", "stale_identity"}:
-        return {"status": "failed", "failure_class": "startup_failed" if state == "failed_startup" else "identity_mismatch", **payload}
+    if state in {"starting", "failed_startup", "stale_identity"}:
+        failure = {
+            "starting": "unavailable",
+            "failed_startup": "preflight",
+            "stale_identity": "identity_mismatch",
+        }[state]
+        return {"status": "failed", "failure_class": failure, **payload}
     return _not_run_run()
 
 
@@ -373,7 +464,7 @@ def _status_runtime(root: Path, target: str, config: TargetConfig) -> RuntimeInp
         capability = _load_capabilities(Path(config.source_root), config.name)
         if capability is None:
             _fail("workflow_capability_missing", "source capability state is unavailable")
-        return RuntimeInputs("/dev/null", "/dev/null", source.snapshot_id, source.applied_tree_hash, built["build_id"], capability["work_token"], capability["run_token"], _port(config))
+        return RuntimeInputs(config.model_path, config.drafter_path, source.snapshot_id, source.applied_tree_hash, built["build_id"], capability["work_token"], capability["run_token"], _port(config))
     return RuntimeInputs("/dev/null", "/dev/null", source.snapshot_id, source.applied_tree_hash, built["build_id"], port=_port(config))
 
 
@@ -581,13 +672,14 @@ def run_bundle(repo_root: str | os.PathLike[str], target: str, *, allow_dirty: s
     try:
         bundle.write_record("controller", {"provenance": controller_provenance(root)}, created_at=_time())
         bundle.write_record("source", {"snapshot": source.as_dict()}, created_at=_time())
-        doctor_result = doctor(config, transport, runtime=_doctor_runtime(config))
+        _assert_no_pending_run(root, config.name)
+        synced = sync_source(config, transport, snapshot=source)
+        if synced.applied_tree_hash != source.applied_tree_hash:
+            _fail("source_identity_mismatch", "source synchronization is unavailable")
+        _save_source(root, config.name, source)
+        doctor_result = doctor(config, transport, snapshot=source, allow_dirty=allow_dirty, runtime=_doctor_runtime(config))
         bundle.write_record("target-doctor", doctor_result.controller_payload(), created_at=_time())
         if doctor_result.status == "succeeded":
-            synced = sync_source(config, transport, snapshot=source)
-            if synced.applied_tree_hash != source.applied_tree_hash:
-                _fail("source_identity_mismatch", "source synchronization is unavailable")
-            _save_source(root, config.name, source)
             build_result = build(config, transport, snapshot=source, allow_dirty=allow_dirty, jobs=jobs)
             _save_build(root, config.name, source, build_result)
             build_payload = build_result.controller_payload()
@@ -603,7 +695,11 @@ def run_bundle(repo_root: str | os.PathLike[str], target: str, *, allow_dirty: s
             runtime = _runtime(config, source_snap, built)
             run_id = "run-" + secrets.token_hex(12)
             _store_pending_run(root, config.name, source_snap, built, run_id)
-            smoke_result = smoke(config, transport, runtime, run_id=run_id)
+            try:
+                smoke_result = smoke(config, transport, runtime, run_id=run_id)
+            except TargetError as error:
+                _clear_new_pending_on_refusal(root, config.name, run_id, error)
+                raise
             observed_run = getattr(smoke_result, "run", None)
             observed_cleanup = getattr(smoke_result, "cleanup", None)
             if observed_run is None or observed_cleanup is None:
@@ -613,10 +709,11 @@ def run_bundle(repo_root: str | os.PathLike[str], target: str, *, allow_dirty: s
             cleanup_record = _cleanup_artifact_payload(observed_cleanup)
             if (
                 getattr(observed_cleanup, "run_id", None) == run_id
-                and getattr(observed_cleanup, "status", None) in {"stopped", "succeeded"}
+                and getattr(observed_cleanup, "status", None) in {"succeeded", "not_run"}
+                and getattr(smoke_result, "status", None) == "succeeded"
             ):
                 _clear_pending_run(root, config.name, run_id)
-            if cleanup_record.get("server_log_sha256"):
+            if cleanup_record["status"] == "succeeded" and cleanup_record.get("server_log_sha256"):
                 _promote_server_log(bundle, root, config.name, cleanup_record["server_log_sha256"], config, transport)
                 promoted_reports.append(("server.log", cleanup_record["server_log_sha256"]))
         bundle.write_record("run", run_record, created_at=_time())
@@ -652,14 +749,19 @@ def execute(repo_root: str | os.PathLike[str], target: str, operation: str, *, a
     config = load_operational_target(root, target)
     transport = select_transport(config, repo_root=root)
     if operation == "doctor":
-        return _public_doctor(doctor(config, transport, runtime=_doctor_runtime(config)))
+        source_snap = _source_ready(root, config.name)
+        if build_snapshot(root).as_dict() != source_snap.as_dict():
+            _fail("workflow_source_stale", "source must be synchronized again")
+        return _public_doctor(doctor(config, transport, snapshot=source_snap, allow_dirty=allow_dirty, runtime=_doctor_runtime(config)))
     if operation == "sync":
+        _assert_no_pending_run(root, config.name)
         result = sync_source(config, transport)
         if result.applied_tree_hash != result.snapshot.applied_tree_hash:
             _fail("source_identity_mismatch", "source synchronization is unavailable")
         _save_source(root, config.name, result.snapshot)
         return {"status": "succeeded", "snapshot_id": result.snapshot.snapshot_id, "applied_tree_hash": result.snapshot.applied_tree_hash, "initialized": result.initialized}
     if operation == "build":
+        _assert_no_pending_run(root, config.name)
         source_snap = _source_ready(root, config.name)
         if build_snapshot(root).as_dict() != source_snap.as_dict():
             _fail("workflow_source_stale", "source must be synchronized again")
@@ -668,11 +770,12 @@ def execute(repo_root: str | os.PathLike[str], target: str, operation: str, *, a
         return _public_build(result)
     if operation in {"status", "logs", "stop", "cleanup"}:
         runtime = _status_runtime(root, config.name, config)
+        pending_run_id = _pending_run(root, config.name)
         if operation == "status":
-            result = status(config, transport, runtime)
+            result = status(config, transport, runtime, run_id=pending_run_id)
             return {"status": "succeeded", "run_id": result.run_id, "state": result.state, "active": result.active}
         if operation == "logs":
-            content = logs(config, transport, runtime)
+            content = logs(config, transport, runtime, run_id=pending_run_id)
             if not isinstance(content, bytes) or len(content) > MAX_TEXT_BYTES:
                 _fail("log_unavailable", "sanitized server log is unavailable")
             return {
@@ -681,10 +784,16 @@ def execute(repo_root: str | os.PathLike[str], target: str, operation: str, *, a
                 "log_sha256": hashlib.sha256(content).hexdigest(),
                 "log_bytes": len(content),
             }
-        result = stop(config, transport, runtime) if operation == "stop" else cleanup(config, transport, runtime)
-        if getattr(result, "status", None) in {"stopped", "succeeded"}:
-            _clear_pending_run(root, config.name, getattr(result, "run_id", None))
-        return {"status": "succeeded", **result.controller_payload()}
+        result = stop(config, transport, runtime, run_id=pending_run_id) if operation == "stop" else cleanup(config, transport, runtime, run_id=pending_run_id)
+        if result.run_id == pending_run_id and result.status in {"succeeded", "not_run"}:
+            _clear_pending_run(root, config.name, pending_run_id)
+        payload = result.controller_payload()
+        outcome = payload.pop("status")
+        return {
+            "status": "failed" if outcome == "failed" else "succeeded",
+            "outcome": outcome,
+            **payload,
+        }
     source, built = _ready(root, config.name)
     if build_snapshot(root).as_dict() != source.as_dict():
         _fail("workflow_source_stale", "source must be synchronized again")
@@ -693,16 +802,25 @@ def execute(repo_root: str | os.PathLike[str], target: str, operation: str, *, a
     if operation == "serve":
         run_id = "run-" + secrets.token_hex(12)
         _store_pending_run(root, config.name, source, built, run_id)
-        result = serve(config, transport, runtime, run_id=run_id)
+        try:
+            result = serve(config, transport, runtime, run_id=run_id)
+        except TargetError as error:
+            _clear_new_pending_on_refusal(root, config.name, run_id, error)
+            raise
         return {"status": "succeeded", **result.controller_payload()}
     run_id = "run-" + secrets.token_hex(12)
     _store_pending_run(root, config.name, source, built, run_id)
-    result = smoke(config, transport, runtime, run_id=run_id)
+    try:
+        result = smoke(config, transport, runtime, run_id=run_id)
+    except TargetError as error:
+        _clear_new_pending_on_refusal(root, config.name, run_id, error)
+        raise
     observed_cleanup = getattr(result, "cleanup", None)
     if (
         observed_cleanup is not None
         and getattr(observed_cleanup, "run_id", None) == run_id
-        and getattr(observed_cleanup, "status", None) in {"stopped", "succeeded"}
+        and getattr(observed_cleanup, "status", None) in {"succeeded", "not_run"}
+        and getattr(result, "status", None) == "succeeded"
     ):
         _clear_pending_run(root, config.name, run_id)
     observed_run = getattr(result, "run", None)

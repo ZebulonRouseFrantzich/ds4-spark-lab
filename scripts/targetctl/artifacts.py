@@ -28,6 +28,7 @@ from .common import (
     write_json_atomic,
 )
 from .redaction import StreamingRedactor
+from .remote import LAUNCH_PROFILE
 
 
 ARTIFACT_SCHEMA = 1
@@ -414,7 +415,7 @@ def _validate_doctor(payload: Mapping[str, Any]) -> dict[str, Any]:
     fields = (
         "status", "failure_class", "os", "kernel", "arch", "tools", "gpu",
         "memory_bytes", "disk_bytes", "time_sync", "primary_weight_sha256",
-        "draft_weight_sha256",
+        "draft_weight_sha256", "nix",
     )
     validate_object_keys(payload, allowed=fields, required=fields)
     status, failure_class = _status_fields(payload)
@@ -473,11 +474,27 @@ def _validate_doctor(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise _fail("artifact_value_invalid", "artifact value is invalid")
     else:
         raise _fail("artifact_value_invalid", "artifact value is invalid")
+    nix = payload["nix"]
+    if not isinstance(nix, Mapping):
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
+    validate_object_keys(nix, allowed=("status", "version"), required=("status", "version"))
+    nix_status, nix_version = nix["status"], nix["version"]
+    if nix_status == "absent" and nix_version is None:
+        clean_nix = {"status": "absent", "version": None}
+    elif nix_status == "matched" and isinstance(nix_version, str) and _VERSION_RE.fullmatch(nix_version):
+        clean_nix = {"status": "matched", "version": nix_version}
+    elif not succeeded and nix_status == "unavailable" and nix_version is None:
+        clean_nix = {"status": "unavailable", "version": None}
+    else:
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
+    if not_run and nix_status != "unavailable":
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
     return {
         "status": status, "failure_class": failure_class, **system, "tools": clean_tools, "gpu": clean_gpu,
         "memory_bytes": memory_bytes, "disk_bytes": disk_bytes, "time_sync": time_sync,
         "primary_weight_sha256": _known_or_none(payload["primary_weight_sha256"], _hex_digest, required=succeeded),
         "draft_weight_sha256": _known_or_none(payload["draft_weight_sha256"], _hex_digest, required=succeeded),
+        "nix": clean_nix,
     }
 
 
@@ -543,11 +560,11 @@ def _validate_build(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_run(payload: Mapping[str, Any]) -> dict[str, Any]:
-    fields = ("status", "failure_class", "state", "run_id", "source_snapshot_id", "build_id", "binary_sha256", "supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks", "port")
+    fields = ("status", "failure_class", "state", "run_id", "source_snapshot_id", "build_id", "binary_sha256", "supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks", "port", "launch_profile")
     validate_object_keys(payload, allowed=fields, required=fields)
     status, failure_class = _status_fields(payload)
     state = payload["state"]
-    identity_keys = ("run_id", "source_snapshot_id", "build_id", "binary_sha256", "supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks", "port")
+    identity_keys = ("run_id", "source_snapshot_id", "build_id", "binary_sha256", "supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks", "port", "launch_profile")
     if status == "not_run":
         if state is not None or any(payload[key] is not None for key in identity_keys):
             raise _fail("artifact_value_invalid", "artifact value is invalid")
@@ -556,8 +573,9 @@ def _validate_run(payload: Mapping[str, Any]) -> dict[str, Any]:
             "source_snapshot_id": None, "build_id": None, "binary_sha256": None,
             "supervisor_pid": None, "supervisor_start_ticks": None,
             "child_pid": None, "child_start_ticks": None, "port": None,
+            "launch_profile": None,
         }
-    if state not in _LIFECYCLE_STATES or state == "starting":
+    if state not in _LIFECYCLE_STATES:
         raise _fail("artifact_value_invalid", "artifact value is invalid")
     run_id = payload["run_id"]
     if run_id is not None and (not isinstance(run_id, str) or not _COMPONENT_RE.fullmatch(run_id)):
@@ -570,9 +588,12 @@ def _validate_run(payload: Mapping[str, Any]) -> dict[str, Any]:
     if (supervisor_pid is None) != (supervisor_ticks is None) or (child_pid is None) != (child_ticks is None):
         raise _fail("artifact_value_invalid", "artifact value is invalid")
     succeeded = status == "succeeded"
-    if (succeeded and state not in {"running", "stopped"}) or (status == "failed" and state not in {"failed_startup", "stale_identity"}):
+    if (succeeded and state not in {"running", "stopped"}) or (status == "failed" and state not in {"starting", "failed_startup", "stale_identity"}):
         raise _fail("artifact_value_invalid", "artifact value is invalid")
     if succeeded and (run_id is None or any(value is None for value in (supervisor_pid, supervisor_ticks, child_pid, child_ticks, port))):
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
+    profile = payload["launch_profile"]
+    if not isinstance(profile, Mapping) or dict(profile) != LAUNCH_PROFILE:
         raise _fail("artifact_value_invalid", "artifact value is invalid")
     return {
         "status": status, "failure_class": failure_class, "state": state, "run_id": run_id,
@@ -581,6 +602,7 @@ def _validate_run(payload: Mapping[str, Any]) -> dict[str, Any]:
         "binary_sha256": _known_or_none(payload["binary_sha256"], _hex_digest, required=succeeded),
         "supervisor_pid": supervisor_pid, "supervisor_start_ticks": supervisor_ticks,
         "child_pid": child_pid, "child_start_ticks": child_ticks, "port": port,
+        "launch_profile": dict(LAUNCH_PROFILE),
     }
 
 

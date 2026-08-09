@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -273,6 +274,20 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
             failed_bytes = b"".join(path.read_bytes() for path in (root / failed["artifact"]).rglob("*") if path.is_file())
             self.assertTrue(all(value not in str(failed) and value.encode() not in failed_bytes for value in private))
 
+    def test_ssh_identity_runtime_uses_distinct_validated_target_paths(self) -> None:
+        from scripts.targetctl.workflow import _status_runtime
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root, ssh=True)
+            fixture.install_ready_state(root)
+            capabilities = {"work_token": "1" * 64, "run_token": "2" * 64}
+            with patch("scripts.targetctl.source._load_capabilities", return_value=capabilities):
+                runtime = _status_runtime(root, "spark", fixture.config)
+            self.assertEqual(runtime.model_path, fixture.config.model_path)
+            self.assertEqual(runtime.drafter_path, fixture.config.drafter_path)
+            self.assertNotEqual(runtime.model_path, runtime.drafter_path)
+
     def test_stale_source_and_binary_reject_before_lifecycle(self) -> None:
         from scripts.targetctl.workflow import execute
 
@@ -327,6 +342,120 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
                 execute(root, "local", "cleanup")
             self.assertIsNone(_pending_run(root, "local"))
 
+    def test_pending_run_cas_refuses_duplicate_owner(self) -> None:
+        from scripts.targetctl.workflow import _pending_run, _ready, _store_pending_run
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            source, built = _ready(root, "local")
+            barrier = threading.Barrier(2)
+            errors: list[str] = []
+
+            def store(run_id: str) -> None:
+                barrier.wait()
+                try:
+                    _store_pending_run(root, "local", source, built, run_id)
+                except TargetError as error:
+                    errors.append(error.code)
+
+            run_ids = ("run-aaaaaaaaaaaaaaaaaaaaaaaa", "run-bbbbbbbbbbbbbbbbbbbbbbbb")
+            workers = [threading.Thread(target=store, args=(run_id,)) for run_id in run_ids]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            self.assertEqual(len(errors), 1)
+            self.assertIn(errors[0], {"workflow_run_pending", "workflow_busy"})
+            self.assertIn(_pending_run(root, "local"), run_ids)
+
+    def test_pre_dispatch_refusal_clears_only_new_pending_owner(self) -> None:
+        from scripts.targetctl.workflow import _pending_run, execute
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            fixture.install_binary()
+            observed: list[str] = []
+
+            def refused(*_args, run_id: str, **_kwargs) -> None:
+                observed.append(run_id)
+                self.assertEqual(_pending_run(root, "local"), run_id)
+                raise TargetError("serve_not_dispatched", "target server launch was refused")
+
+            environment = {"TARGETCTL_MODEL_PATH": "/private/model-canary.gguf", "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf"}
+            with patch.dict(os.environ, environment, clear=False), patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source), patch("scripts.targetctl.workflow.serve", side_effect=refused):
+                with self.assertRaisesRegex(TargetError, "serve_not_dispatched"):
+                    execute(root, "local", "serve")
+            self.assertEqual(len(observed), 1)
+            self.assertIsNone(_pending_run(root, "local"))
+
+    def test_smoke_pre_dispatch_refusal_clears_new_pending_owner(self) -> None:
+        from scripts.targetctl.workflow import _pending_run, execute
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            fixture.install_binary()
+            observed: list[str] = []
+
+            def refused(*_args, run_id: str, **_kwargs) -> None:
+                observed.append(run_id)
+                self.assertEqual(_pending_run(root, "local"), run_id)
+                raise TargetError("serve_not_dispatched", "target server launch was refused")
+
+            environment = {"TARGETCTL_MODEL_PATH": "/private/model-canary.gguf", "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf"}
+            with patch.dict(os.environ, environment, clear=False), patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source), patch("scripts.targetctl.workflow.smoke", side_effect=refused):
+                with self.assertRaisesRegex(TargetError, "serve_not_dispatched"):
+                    execute(root, "local", "smoke")
+            self.assertEqual(len(observed), 1)
+            self.assertIsNone(_pending_run(root, "local"))
+
+    def test_refusal_cas_does_not_clear_a_different_pending_owner(self) -> None:
+        from scripts.targetctl.workflow import (
+            _clear_new_pending_on_refusal, _pending_run, _ready,
+            _store_pending_run,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            source, built = _ready(root, "local")
+            replacement = "run-replacement-owner-0001"
+            _store_pending_run(root, "local", source, built, replacement)
+
+            _clear_new_pending_on_refusal(
+                root,
+                "local",
+                "run-refused-owner-0001",
+                TargetError("serve_not_dispatched", "target server launch was refused"),
+            )
+            self.assertEqual(_pending_run(root, "local"), replacement)
+
+    def test_ambiguous_smoke_error_retains_pending_owner(self) -> None:
+        from scripts.targetctl.workflow import _pending_run, execute
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            fixture.install_binary()
+            observed: list[str] = []
+
+            def ambiguous(*_args, run_id: str, **_kwargs) -> None:
+                observed.append(run_id)
+                raise TargetError("helper_timeout", "dispatch outcome is unavailable")
+
+            environment = {"TARGETCTL_MODEL_PATH": "/private/model-canary.gguf", "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf"}
+            with patch.dict(os.environ, environment, clear=False), patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source), patch("scripts.targetctl.workflow.smoke", side_effect=ambiguous):
+                with self.assertRaisesRegex(TargetError, "helper_timeout"):
+                    execute(root, "local", "smoke")
+            self.assertEqual(_pending_run(root, "local"), observed[0])
+
     def test_identity_only_operations_and_cli_evidence_are_private_safe(self) -> None:
         from scripts.targetctl.lifecycle import CleanupResult, StatusResult
         from scripts.targetctl.workflow import execute
@@ -355,7 +484,7 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
                 return fixture.smoke(run_id)
 
             environment = {"TARGETCTL_MODEL_PATH": private, "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf"}
-            with patch.dict(os.environ, environment, clear=False), patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.doctor", return_value=fixture.doctor):
+            with patch.dict(os.environ, environment, clear=False), patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source), patch("scripts.targetctl.workflow.doctor", return_value=fixture.doctor):
                 doctor = structured_result(root, "local", "doctor")
             with patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source), patch("scripts.targetctl.workflow.build", return_value=fixture.build):
                 built = structured_result(root, "local", "build")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import stat
@@ -12,6 +13,7 @@ from unittest import mock
 from scripts.targetctl import source as source_module
 from scripts.targetctl.common import TargetError
 from scripts.targetctl.source import _SOURCE_EXTENSION, _stage_snapshot, build_snapshot, qualified_clean, sync_source, verify_applied_tree
+from scripts.targetctl.remote import LAUNCH_PROFILE
 from scripts.targetctl.transport import CommandResult, LocalTransport, SSHTransport
 
 
@@ -336,8 +338,7 @@ class MountDecodingTests(unittest.TestCase):
 
 
 class LifecycleRefusalTests(unittest.TestCase):
-    """Lifecycle states other than stopped/stale_identity/failed_startup are refused."""
-
+    """Source mutation requires an absent run or completed terminal cleanup."""
     def _setUpHelper(self) -> tuple[LocalTransport, dict, dict]:
         transport = LocalTransport()
         base = Path(tempfile.mkdtemp())
@@ -376,6 +377,60 @@ class LifecycleRefusalTests(unittest.TestCase):
                 transport.run_helper("source_preflight", request, extension_source=_SOURCE_EXTENSION,
                                      allowed_error_codes={"source_lifecycle", "unexpected_entry"})
             self.assertEqual(ctx.exception.code, "source_lifecycle")
+        finally:
+            import shutil
+            shutil.rmtree(str(Path(payload["workdir"]).parent), ignore_errors=True)
+
+    def test_terminal_lifecycle_requires_completed_cleanup(self) -> None:
+        transport, payload, tokens = self._setUpHelper()
+        run = Path(payload["run_dir"])
+        state = {
+            "schema_version": 1,
+            "run_id": "run-aaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "failed_startup",
+            "source_snapshot_id": "1" * 64,
+            "applied_tree_hash": "2" * 64,
+            "build_id": "3" * 64,
+            "binary_sha256": "4" * 64,
+            "port": 8000,
+            "launch_profile": dict(LAUNCH_PROFILE),
+            "supervisor_pid": None,
+            "supervisor_start_ticks": None,
+            "supervisor_cmdline_sha256": None,
+            "child_pid": None,
+            "child_start_ticks": None,
+            "child_pgid": None,
+            "child_cmdline_sha256": None,
+            "listener_inode": None,
+            "cleanup_complete": False,
+            "cleanup": None,
+        }
+        request = {**payload, **tokens, "entries": []}
+        try:
+            (run / "run.json").write_text(json.dumps(state), encoding="ascii")
+            os.chmod(run / "run.json", 0o600)
+            with self.assertRaises(TargetError) as raised:
+                transport.run_helper(
+                    "source_preflight", request,
+                    extension_source=_SOURCE_EXTENSION,
+                    allowed_error_codes={"source_lifecycle", "unexpected_entry"},
+                )
+            self.assertEqual(raised.exception.code, "source_lifecycle")
+            state["cleanup_complete"] = True
+            state["cleanup"] = {
+                "process": "not_found",
+                "socket": "not_found",
+                "lock": "not_found",
+                "temp": "not_found",
+                "server_log_sha256": None,
+            }
+            (run / "run.json").write_text(json.dumps(state), encoding="ascii")
+            result = transport.run_helper(
+                "source_preflight", request,
+                extension_source=_SOURCE_EXTENSION,
+                allowed_error_codes={"source_lifecycle", "unexpected_entry"},
+            )
+            self.assertEqual(set(result), {"work", "run"})
         finally:
             import shutil
             shutil.rmtree(str(Path(payload["workdir"]).parent), ignore_errors=True)

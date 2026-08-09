@@ -19,6 +19,9 @@ import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 from .common import SCHEMA_VERSION, TargetError, canonical_json_bytes
+# The embedded source extension executes after this same validator is defined
+# by the standalone target helper.
+from .remote import _valid_run_state
 from .transport import LocalTransport, MAX_RSYNC_FILTER_BYTES, SSHTransport
 
 SNAPSHOT_SCHEMA_VERSION = 1
@@ -759,8 +762,7 @@ def _source_lifecycle(run_fd):
         state = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         _fail("source_lifecycle")
-    allowed = {"record_type", "schema_version", "state", "run_id", "source_snapshot_id", "applied_tree_hash", "build_id", "binary_sha256", "supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks", "port", "started_at", "stopped_at", "failure_code", "lease_deadline", "acknowledged"}
-    if not isinstance(state, dict) or set(state) - allowed or state.get("schema_version") != 1 or state.get("state") not in {"stopped", "stale_identity", "failed_startup"}:
+    if not _valid_run_state(state, terminal=True) or not state["cleanup_complete"]:
         _fail("source_lifecycle")
 
 def _source_open(paths):

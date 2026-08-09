@@ -21,10 +21,122 @@ SCHEMA_VERSION = 1
 PROTOCOL_VERSION = 1
 MARKER_PREFIX = ".targetctl-owner-v"
 LOCK_NAME = ".targetctl-operation-lock-v1"
-LOCK_TOKEN_NAME = "token"
 REPORT_NAMES = frozenset({"doctor.json", "source.json", "build.json", "run.json", "status.json", "build.log", "server.log"})
 MAX_REPORT_BYTES = 1024 * 1024
 MAX_ENTRIES = 100_000
+RUN_STATE_SCHEMA_VERSION = 1
+RUN_STATE_FIELDS = frozenset({
+    "schema_version", "run_id", "state", "source_snapshot_id",
+    "applied_tree_hash", "build_id", "binary_sha256", "port",
+    "launch_profile", "supervisor_pid", "supervisor_start_ticks",
+    "supervisor_cmdline_sha256", "child_pid", "child_start_ticks",
+    "child_pgid", "child_cmdline_sha256", "listener_inode",
+    "cleanup_complete", "cleanup",
+})
+RUN_STATE_STATES = frozenset({
+    "starting", "running", "stopped", "stale_identity", "failed_startup",
+})
+RUN_STATE_TERMINAL_STATES = frozenset({
+    "stopped", "stale_identity", "failed_startup",
+})
+LAUNCH_PROFILE = {
+    "schema_version": 1,
+    "accelerator": "cuda",
+    "context_tokens": 32768,
+    "bind": "loopback",
+    "continuation_mtp_mode": 2,
+    "dspark_enabled": True,
+    "drafter_enabled": True,
+}
+
+
+def _is_hex_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _valid_run_state(value: Any, *, terminal: bool = False) -> bool:
+    """Validate the one target-side run-state schema shared by all actions."""
+
+    if not isinstance(value, dict) or set(value) != RUN_STATE_FIELDS:
+        return False
+    run_id = value["run_id"]
+    if (
+        value["schema_version"] != RUN_STATE_SCHEMA_VERSION
+        or value["state"] not in RUN_STATE_STATES
+        or (terminal and value["state"] not in RUN_STATE_TERMINAL_STATES)
+        or not isinstance(run_id, str)
+        or not 8 <= len(run_id) <= 64
+        or not run_id[0].isalnum()
+        or not run_id.isascii()
+        or any(not (character.islower() or character.isdigit() or character == "-") for character in run_id)
+        or any(not _is_hex_digest(value[key]) for key in (
+            "source_snapshot_id", "applied_tree_hash", "build_id", "binary_sha256",
+        ))
+        or not isinstance(value["port"], int)
+        or isinstance(value["port"], bool)
+        or not 1 <= value["port"] <= 65535
+        or value["launch_profile"] != LAUNCH_PROFILE
+        or not isinstance(value["cleanup_complete"], bool)
+    ):
+        return False
+    cleanup = value["cleanup"]
+    if value["cleanup_complete"]:
+        if (
+            value["state"] not in RUN_STATE_TERMINAL_STATES
+            or not isinstance(cleanup, dict)
+            or set(cleanup) != {"process", "socket", "lock", "temp", "server_log_sha256"}
+            or any(cleanup[key] not in {"cleared", "not_found"} for key in ("process", "socket", "lock", "temp"))
+            or (cleanup["server_log_sha256"] is not None and not _is_hex_digest(cleanup["server_log_sha256"]))
+        ):
+            return False
+    elif cleanup is not None:
+        return False
+    supervisor = (
+        value["supervisor_pid"],
+        value["supervisor_start_ticks"],
+        value["supervisor_cmdline_sha256"],
+    )
+    child = (
+        value["child_pid"],
+        value["child_start_ticks"],
+        value["child_pgid"],
+        value["child_cmdline_sha256"],
+    )
+    if not (
+        all(item is None for item in supervisor)
+        or (
+            all(isinstance(item, int) and not isinstance(item, bool) and item > 1 for item in supervisor[:2])
+            and _is_hex_digest(supervisor[2])
+        )
+    ):
+        return False
+    if not (
+        all(item is None for item in child)
+        or (
+            all(isinstance(item, int) and not isinstance(item, bool) and item > 1 for item in child[:3])
+            and child[0] == child[2]
+            and _is_hex_digest(child[3])
+        )
+    ):
+        return False
+    listener = value["listener_inode"]
+    if listener is not None and (
+        child[0] is None
+        or not isinstance(listener, str)
+        or not 1 <= len(listener) <= 32
+        or not listener.isascii()
+        or not listener.isdigit()
+    ):
+        return False
+    if value["state"] == "running" and (
+        supervisor[0] is None or child[0] is None or listener is None
+    ):
+        return False
+    return True
 
 
 class HelperError(Exception):
@@ -445,12 +557,17 @@ def _lock_state(lock_fd: int) -> dict[str, Any]:
         state = json.loads(raw.decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         _fail("unsafe_lock")
-    if not isinstance(state, dict) or set(state) != {"boot_id", "deadline_monotonic_ns", "token"}:
+    fields = set(state) if isinstance(state, dict) else set()
+    if fields not in ({"boot_id", "deadline_monotonic_ns", "token"}, {"boot_id", "deadline_monotonic_ns", "token", "lifecycle_run_id"}):
         _fail("unsafe_lock")
     token, boot_id, deadline = state["token"], state["boot_id"], state["deadline_monotonic_ns"]
+    owner = state.get("lifecycle_run_id")
     if (not isinstance(token, str) or len(token) != 64 or any(character not in "0123456789abcdef" for character in token) or
             not isinstance(boot_id, str) or len(boot_id) != 36 or any(character not in "0123456789abcdef-" for character in boot_id) or
-            not isinstance(deadline, int) or isinstance(deadline, bool) or deadline < 1):
+            not isinstance(deadline, int) or isinstance(deadline, bool) or deadline < 1 or
+            ("lifecycle_run_id" in state and
+             (not isinstance(owner, str) or not 8 <= len(owner) <= 64 or not owner[0].isalnum() or not owner.isascii() or
+              any(not (character.islower() or character.isdigit() or character == "-") for character in owner)))):
         _fail("unsafe_lock")
     return state
 
@@ -613,11 +730,19 @@ def _reclaim_expired_lock(root_fd: int, current_boot_id: str) -> tuple[bool, int
         os.close(lock_fd)
 
 
-def _acquire_lock_at_root(root_fd: int, identity: dict[str, int], run_token: Any, lease_seconds: int) -> str:
+def _acquire_lock_at_root(
+    root_fd: int,
+    identity: dict[str, int],
+    run_token: Any,
+    lease_seconds: int,
+    lifecycle_run_id: str | None = None,
+) -> str:
     boot_id = _boot_id()
     _cleanup_stale_lock_stages(root_fd)
     token = secrets.token_hex(32)
     state = {"boot_id": boot_id, "deadline_monotonic_ns": time.monotonic_ns() + lease_seconds * 1_000_000_000, "token": token}
+    if lifecycle_run_id is not None:
+        state["lifecycle_run_id"] = lifecycle_run_id
     for attempt in range(2):
         if _install_lock(root_fd, state):
             break
@@ -650,6 +775,43 @@ def _release_lock_at_root(root_fd: int, identity: dict[str, int], run_token: Any
         _remove_lock(root_fd, lock_fd, lock_identity)
         _assert_pinned_root(root_fd, identity)
         _read_marker(root_fd, "run", run_token)
+    finally:
+        os.close(lock_fd)
+
+
+def _release_lifecycle_lock_at_root(
+    root_fd: int,
+    identity: dict[str, int],
+    run_token: Any,
+    lifecycle_run_id: str,
+) -> str:
+    """Release only the operation lease bound to one persisted lifecycle run."""
+
+    try:
+        os.stat(LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        _assert_pinned_root(root_fd, identity)
+        _read_marker(root_fd, "run", run_token)
+        return "not_found"
+    except OSError:
+        return "unknown"
+    try:
+        lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
+    except HelperError:
+        return "unknown"
+    try:
+        lock_identity = _identity(lock_fd)
+        state = _lock_state(lock_fd)
+        if state.get("lifecycle_run_id") != lifecycle_run_id:
+            return "unknown"
+        _assert_pinned_root(root_fd, identity)
+        _read_marker(root_fd, "run", run_token)
+        _remove_lock(root_fd, lock_fd, lock_identity)
+        _assert_pinned_root(root_fd, identity)
+        _read_marker(root_fd, "run", run_token)
+        return "cleared"
+    except HelperError:
+        return "unknown"
     finally:
         os.close(lock_fd)
 

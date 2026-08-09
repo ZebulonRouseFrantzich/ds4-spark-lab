@@ -12,19 +12,21 @@ multi-turn continuations, and mixed latency requirements.
 
 ## Current status
 
-**Phase 00 — Workspace bootstrap: Qualified (2026-08-08).**
+**Phase 00 — Workspace bootstrap: Qualified (2026-08-08). Phase 01 —
+execution target: Active and not Qualified.**
 
-The qualified implementation is commit
+Phase 00 qualified at commit
 `69af8ea605972ba79430db3d92dbf1940f824df2` on
-`phase/00_workspace_bootstrap`. It establishes the paired public source
-submodules, pinned Nix userspace, and root Just workflow; it does not implement
-target execution, benchmarks, or engine policy. The anonymous qualification clone
-explicitly selected this unmerged branch rather than observing a default-branch
-clone. See the [Phase 00 qualification record](docs/roadmap/phase-00-qualification.md)
-for the retained evidence.
+`phase/00_workspace_bootstrap`. It established the paired public source
+submodules, pinned Nix userspace, and root Just workflow. See the
+[Phase 00 qualification record](docs/roadmap/phase-00-qualification.md) for
+retained evidence.
 
-Later phases remain **Planned**. Their documents describe acceptance targets, not
-claims about this checkout.
+Phase 01 is being implemented on `phase/01_execution_target`. Its controller
+and target workflows require the validation gates in the
+[active phase document](docs/roadmap/phase-01-execution-target.md); the
+destructive DGX Spark qualification has not run for this implementation.
+Phases after Phase 01 remain **Planned**.
 
 Start with:
 
@@ -34,12 +36,12 @@ Start with:
 
 ## Getting started
 
-Nix must have `nix-command` and `flakes` experimental features enabled. Clone
-the qualified public workspace recursively, explicitly selecting the qualified
-branch:
+Nix must have `nix-command` and `flakes` experimental features enabled. To
+inspect the active, not-yet-qualified Phase 01 implementation, clone its branch
+recursively:
 
 ```sh
-git clone --branch phase/00_workspace_bootstrap --recurse-submodules https://github.com/ZebulonRouseFrantzich/ds4-spark-lab.git
+git clone --branch phase/01_execution_target --recurse-submodules https://github.com/ZebulonRouseFrantzich/ds4-spark-lab.git
 cd ds4-spark-lab
 nix develop
 ```
@@ -56,6 +58,34 @@ just submodules
 just remotes-check
 just flake-check
 ```
+
+### Phase 01 target controller
+
+Create the private operational file with `install -d -m 700 targets && install
+-m 600 configs/targets.example.toml targets/targets.toml`, then replace the SSH
+placeholders. The controller accepts only a target name, never private paths:
+
+```sh
+just target-sync local
+just target-build local
+TARGETCTL_MODEL_PATH=/absolute/model TARGETCTL_DRAFTER_PATH=/absolute/drafter just target-smoke local
+just target-sync spark
+just target-doctor spark
+just target-bundle spark
+```
+
+`targetctl` returns structured sanitized JSON. Local model/drafter paths come
+only from those two environment variables; SSH runtime paths remain only in the
+ignored mode-0600 target configuration. Controller state is under
+`targets/.state`, and complete evidence bundles are atomically published under
+`artifacts/phase-01-runs/<target>/`. Neither location may be committed.
+
+`target-bundle` synchronizes the frozen source before doctor so the target's
+optional Nix check evaluates the exact synchronized `flake.lock`. When Nix is
+present, doctor enters that shell and requires `nvcc`, `gcc`, and `g++` to
+resolve to the same target-native paths and versions observed outside it; Nix
+absence is recorded as a supported native-host result. Run `target-sync` first
+when invoking `target-doctor` independently on an SSH target.
 
 `just submodules` is the explicit, idempotent initializer and required
 additional-remotes setup. `just remotes-check` verifies remote policy and never

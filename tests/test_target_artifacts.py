@@ -12,6 +12,7 @@ import unittest
 from scripts.targetctl.artifacts import ArtifactBundle, MAX_SOURCE_FILE_BYTES, _validate_record_payload, controller_provenance, validate_bundle_index
 from scripts.targetctl.common import TargetError, canonical_json_bytes, read_json_file
 from scripts.targetctl import source as source_helper
+from scripts.targetctl.remote import LAUNCH_PROFILE
 from scripts.targetctl.redaction import StreamingRedactor
 
 
@@ -83,6 +84,7 @@ def _payload(name: str, *, build_log_sha256: str | None = None, server_log_sha25
             "gpu": {"platform": "GB10", "compute_capability": "sm_121"},
             "memory_bytes": 1024, "disk_bytes": 1024, "time_sync": True,
             "primary_weight_sha256": primary_hash, "draft_weight_sha256": draft_hash,
+            "nix": {"status": "matched", "version": "2.28.5"},
         }
     if name == "build":
         return {
@@ -95,6 +97,7 @@ def _payload(name: str, *, build_log_sha256: str | None = None, server_log_sha25
             "status": "succeeded", "failure_class": None, "state": "stopped", "run_id": "run-1",
             "source_snapshot_id": snapshot_id, "build_id": build_id, "binary_sha256": binary_hash,
             "supervisor_pid": 100, "supervisor_start_ticks": 200, "child_pid": 101, "child_start_ticks": 201, "port": 8080,
+            "launch_profile": dict(LAUNCH_PROFILE),
         }
     if name == "smoke":
         return {
@@ -315,6 +318,7 @@ class ArtifactBundleTests(unittest.TestCase):
                 "tools": [{"name": tool["name"], "version": None, "location": None} for tool in _payload("target-doctor")["tools"]],
                 "gpu": None, "memory_bytes": None, "disk_bytes": None, "time_sync": None,
                 "primary_weight_sha256": None, "draft_weight_sha256": None,
+                "nix": {"status": "unavailable", "version": None},
             },
             "build": {
                 "status": "not_run", "failure_class": None, "source_snapshot_id": None, "source_applied_tree_hash": None,
@@ -325,6 +329,7 @@ class ArtifactBundleTests(unittest.TestCase):
                 "status": "not_run", "failure_class": None, "state": None, "run_id": None, "source_snapshot_id": None,
                 "build_id": None, "binary_sha256": None, "supervisor_pid": None, "supervisor_start_ticks": None,
                 "child_pid": None, "child_start_ticks": None, "port": None,
+                "launch_profile": None,
             },
             "smoke": {
                 "status": "not_run", "failure_class": None, "readiness_http": None, "models_http": None,
@@ -335,8 +340,10 @@ class ArtifactBundleTests(unittest.TestCase):
                 "lock": "not_run", "temp": None, "server_log_sha256": None,
             },
         }
+        failed_doctor = {**_payload("target-doctor"), "status": "failed", "failure_class": "preflight"}
+        failed_doctor["nix"] = {"status": "unavailable", "version": None}
         failed_payloads = {
-            "target-doctor": {**_payload("target-doctor"), "status": "failed", "failure_class": "preflight"},
+            "target-doctor": failed_doctor,
             "build": {**_payload("build", build_log_sha256="d" * 64), "status": "failed", "failure_class": "command_failed", "build_id": None, "binary_sha256": None, "version": None, "binary_size": None, "sass": None, "exit_code": 2},
             "run": {**_payload("run"), "status": "failed", "failure_class": "command_failed", "state": "failed_startup", "run_id": None, "source_snapshot_id": None, "build_id": None, "binary_sha256": None, "supervisor_pid": None, "supervisor_start_ticks": None, "child_pid": None, "child_start_ticks": None, "port": None},
             "smoke": {**_payload("smoke"), "status": "failed", "failure_class": "contract_failed", "contract": "failed"},
@@ -381,6 +388,7 @@ class ArtifactBundleTests(unittest.TestCase):
             "status": "not_run", "failure_class": None, "state": None, "run_id": None, "source_snapshot_id": None,
             "build_id": None, "binary_sha256": None, "supervisor_pid": None, "supervisor_start_ticks": None,
             "child_pid": None, "child_start_ticks": None, "port": None,
+            "launch_profile": None,
         }
         doctor_not_run = {
             "status": "not_run",
@@ -398,6 +406,7 @@ class ArtifactBundleTests(unittest.TestCase):
             "time_sync": None,
             "primary_weight_sha256": None,
             "draft_weight_sha256": None,
+            "nix": {"status": "unavailable", "version": None},
         }
         smoke_not_run = {
             "status": "not_run",

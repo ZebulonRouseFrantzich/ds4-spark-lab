@@ -2,10 +2,10 @@
 
 ## Status
 
-**Active — 2026-08-08.** Phase 00 is qualified; implementation and target
-qualification are in progress on `phase/01_execution_target`. Core target
-operations (doctor, sync, build, lifecycle, smoke, cleanup, artifact bundle)
-and Phase 01 Just recipes are implemented. 77 tests pass.
+**Active — 2026-08-09.** Phase 01 controller operations and recipes are
+implemented, but Phase 01 is **not Qualified**. The destructive SSH target gate
+has not been executed for this implementation; it remains required before any
+qualification claim.
 
 ## Depends on
 
@@ -135,6 +135,13 @@ supported path.
 
 Doctor output used in reports is sanitized before retention.
 
+The implemented doctor records a bounded `nix` status and version only. A
+present Nix installation evaluates the synchronized workspace flake with
+`--no-write-lock-file`; `nvcc`, `gcc`, and `g++` must resolve to the fixed
+target-native paths and report the same versions observed outside the shell.
+Path or version drift fails doctor. Nix absence is the only supported bypass.
+The aggregate bundle therefore synchronizes source before running doctor.
+
 ### 3. Source snapshot and synchronization
 
 Synchronize the actual controller worktrees, including supported dirty and
@@ -254,21 +261,24 @@ explicit.
 
 ### 8. Root workflow
 
-Add only implemented recipes, expected to include equivalents of:
+The implemented `python3 -m scripts.targetctl` entry point owns every target
+operation. Just recipes delegate to it: `target-doctor`, `target-sync`,
+`target-build`, `target-serve`, `target-status`, `target-logs`, `target-stop`,
+`target-smoke`, `target-cleanup`, and `target-bundle`.
 
-```text
-target-doctor [target]
-target-sync [target]
-target-build [target]
-target-serve [target]
-target-status [target]
-target-logs [target]
-target-stop [target]
-target-smoke [target]
-```
+The only operational configuration path is ignored `targets/targets.toml`; it
+must be a current-user-owned regular mode-0600 file. Local mode keeps its
+minimal schema and receives model/drafter paths only through
+`TARGETCTL_MODEL_PATH` and `TARGETCTL_DRAFTER_PATH`; no CLI option accepts a
+private path. SSH derives its loopback port from `api_base_url`; local uses the
+documented fixed loopback port 8000. State is private under `targets/.state`,
+and a complete atomic bundle is returned under `artifacts/phase-01-runs/`.
 
-Normal users should not need to remember raw SSH, rsync, process, or internal
-script commands.
+The upstream deterministic smoke command retained for target use is
+`make proof-cuda-smoke` in `engine/ds4` (with its required
+`DS4_PROOF_BASE`); integration's serving smoke is
+`spark/ds4-on-spark/scripts/smoke-test.sh --port 8000`. The controller smoke
+also checks loopback `/v1/models` and the canonical Paris completion contract.
 
 ## Explicit non-goals
 
