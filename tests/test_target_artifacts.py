@@ -338,6 +338,49 @@ class ArtifactBundleTests(unittest.TestCase):
                 missing.finalize()
             self.assertEqual(raised.exception.code, "artifact_log_missing")
 
+    def test_failed_cleanup_retains_advertised_server_log_evidence(self) -> None:
+        failed_cleanup = {
+            "status": "failed",
+            "failure_class": "command_failed",
+            "process": "unknown",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            retained = self._bundle(root, "failed-cleanup-retained")
+            self._complete(retained, overrides={"cleanup": failed_cleanup})
+            live_server_log = root / f"{retained.operation_id}-server.log"
+            live_server_log.write_text("live server continued\n", encoding="utf-8")
+            retained_path = root / retained.finalize()
+            retained_index = validate_bundle_index(retained_path)
+            cleanup = read_json_file(retained_path / "cleanup.json")["payload"]
+            server_log = (retained_path / "texts" / "server-log.txt").read_bytes()
+            self.assertEqual(live_server_log.read_text(encoding="utf-8"), "live server continued\n")
+            self.assertEqual(server_log, b"server output\n")
+            self.assertEqual(cleanup["status"], "failed")
+            self.assertEqual(hashlib.sha256(server_log).hexdigest(), cleanup["server_log_sha256"])
+            self.assertTrue(retained_index["complete"])
+
+            missing = self._bundle(root, "failed-cleanup-missing")
+            self._complete(missing, overrides={"cleanup": failed_cleanup})
+            (missing._staging / "texts" / "server-log.txt").unlink()
+            with self.assertRaises(TargetError) as raised:
+                missing.finalize()
+            self.assertEqual(raised.exception.code, "artifact_log_missing")
+
+            mismatch = self._bundle(root, "failed-cleanup-mismatch")
+            self._complete(
+                mismatch,
+                overrides={
+                    "cleanup": {
+                        **failed_cleanup,
+                        "server_log_sha256": "0" * 64,
+                    }
+                },
+            )
+            with self.assertRaises(TargetError) as raised:
+                mismatch.finalize()
+            self.assertEqual(raised.exception.code, "artifact_log_mismatch")
+
     def test_status_and_lifecycle_matrices_reject_contradictory_evidence(self) -> None:
         not_run_payloads = {
             "target-doctor": {
@@ -511,26 +554,58 @@ class ArtifactBundleTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "artifact_source_unsafe")
 
     def test_text_promotion_redacts_split_canaries_and_invalid_bytes(self) -> None:
+        from scripts.targetctl.config import TargetConfig
+        from scripts.targetctl.workflow import _private_canaries
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "raw.log"
-            canary = "secret-canary-123"
-            source.write_bytes(b"before " + canary.encode() + b"\x1b[31m red\x1b[0m\ninvalid:\xff\x00\n")
+            canary = (
+                "/mnt/targetctl-private/models/drafter/"
+                + "/".join(f"segment-{index:02d}-" + ("x" * 96) for index in range(6))
+                + "/draft.gguf"
+            )
+            self.assertGreater(len(canary), 512)
+            config = TargetConfig(
+                "spark", "ssh", ssh_host="target-alias",
+                workdir="/mnt/ds4-data/spark/work",
+                run_dir="/mnt/ds4-data/spark/run",
+                api_base_url="http://127.0.0.1:8080",
+                model_path="/home/private-user/models/releases/model.gguf",
+                drafter_path=canary, source_root=root,
+            )
+            config.validate_for("logs")
+            private = _private_canaries(config)
+            self.assertIn(canary, private)
+            emitted_ancestor = str(Path(canary).parents[2])
+            home_ancestor = "/home/private-user"
+            self.assertIn(emitted_ancestor, private)
+            self.assertIn("/mnt/targetctl-private", private)
+            self.assertIn(home_ancestor, private)
+            source.write_bytes(
+                b"producer-prefix "
+                + home_ancestor.encode()
+                + b" middle "
+                + emitted_ancestor.encode()
+                + b" producer-suffix\x1b[31m red\x1b[0m\ninvalid:\xff\x00\n"
+            )
             bundle = self._bundle(root)
             relative = bundle.promote_text(
                 "server-log",
                 source,
-                StreamingRedactor([canary]),
-                canaries=[canary],
-                chunk_bytes=3,
+                StreamingRedactor(private),
+                canaries=private,
+                chunk_bytes=257,
             )
             self.assertEqual(relative, "artifacts/phase-01-runs/spark/operation-1/texts/server-log.txt")
             staged = bundle._staging / "texts" / "server-log.txt"
             content = staged.read_text(encoding="utf-8")
-            self.assertNotIn(canary, content)
+            for private_value in (home_ancestor, emitted_ancestor, "/mnt/targetctl-private"):
+                self.assertNotIn(private_value, content)
             self.assertNotIn("\x1b", content)
             self.assertNotIn("\x00", content)
-            self.assertIn("[REDACTED]", content)
+            self.assertIn("invalid:\ufffd", content)
+            self.assertIn("producer-prefix [REDACTED] middle [REDACTED] producer-suffix", content)
 
     def test_streaming_redactor_enforces_utf8_byte_limits(self) -> None:
         redactor = StreamingRedactor(max_output=10)

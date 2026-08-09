@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 from contextlib import ExitStack
+from dataclasses import replace
+import json
 import hashlib
 import os
 from pathlib import Path
@@ -11,6 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts.targetctl.common import TargetError
+from scripts.targetctl.redaction import StreamingRedactor, redaction_canaries
 from scripts.targetctl.source import _is_excluded
 from scripts.targetctl.workflow import DEFAULT_LOCAL_PORT, load_operational_target, structured_result
 
@@ -29,7 +32,7 @@ class TargetWorkflowContracts(unittest.TestCase):
             self._config(root)
             self.assertEqual(load_operational_target(root, "local").name, "local")
             self.assertTrue(_is_excluded("targets/targets.toml"))
-            self.assertTrue(_is_excluded("targets/.state/local.workflow-v1.json"))
+            self.assertTrue(_is_excluded("targets/.state/local.workflow-v2.json"))
 
     def test_symlink_and_permissive_config_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -186,7 +189,7 @@ class _WorkflowFixture:
             "tools": {"git": "1.0", "nix": "unavailable", "python": "1.0"},
         }
         if ssh:
-            self.config = TargetConfig("spark", "ssh", ssh_host="private-host", workdir="/lab/targetctl/work", run_dir="/lab/targetctl/run", api_base_url="http://127.0.0.1:8010", model_path="/private/model-canary.gguf", drafter_path="/private/drafter-canary.gguf", source_root=root)
+            self.config = TargetConfig("spark", "ssh", ssh_host="private-host", workdir="/lab/targetctl/work", run_dir="/lab/targetctl/run", api_base_url="http://127.0.0.1:8010", model_path="/home/private-user/models/releases/model-canary.gguf", drafter_path="/mnt/private-store/drafters/releases/drafter-canary.gguf", source_root=root)
         else:
             self.run_dir = root / "runtime"
             self.run_dir.mkdir(mode=0o700)
@@ -200,10 +203,21 @@ class _WorkflowFixture:
         return SmokeResult(run_id, "succeeded", None, 200, 200, "passed", "b" * 64, "c" * 64, 1, run, cleanup)
 
     def install_ready_state(self, root: Path) -> None:
-        from scripts.targetctl.workflow import _save_build, _save_source
+        from scripts.targetctl.workflow import (
+            _build_generation,
+            _save_build,
+            _save_source,
+        )
 
         _save_source(root, self.config.name, self.source)
-        _save_build(root, self.config.name, self.source, self.build)
+        generation = _build_generation(root, self.config.name, self.source)
+        _save_build(
+            root,
+            self.config.name,
+            self.source,
+            self.build,
+            expected_generation=generation,
+        )
 
     def install_binary(self) -> None:
         path = Path(self.config.source_root) / "engine" / "ds4"
@@ -214,19 +228,41 @@ class _WorkflowFixture:
 
 
 class _ReportTransport:
-    def __init__(self, fixture: _WorkflowFixture, *, mismatch: bool = False) -> None:
-        self.fixture, self.mismatch, self.calls = fixture, mismatch, []
+    def __init__(self, fixture: _WorkflowFixture, *, mismatch: bool = False, server_report: str = "valid") -> None:
+        self.fixture, self.mismatch, self.server_report, self.calls = fixture, mismatch, server_report, []
+        self.reports = {"build.log": fixture.build_log, "server.log": fixture.server_log}
+        self.server_reads = 0
+        if server_report == "absent":
+            self.reports.pop("server.log")
+        elif server_report == "mismatch":
+            self.reports["server.log"] = b"[REDACTED] different server log\n"
 
     def run_helper(self, action, payload, **_kwargs):
         self.calls.append((action, payload))
         if action == "read_report":
-            content = {"build.log": self.fixture.build_log, "server.log": self.fixture.server_log}[payload["name"]]
+            name = payload["name"]
+            if name not in self.reports:
+                raise TargetError("artifact_log_unavailable", "sanitized target report is unavailable")
+            if name == "server.log":
+                self.server_reads += 1
+                if self.server_report == "changing" and self.server_reads == 2:
+                    self.reports[name] = b"[REDACTED] changed during promotion\n"
+            content = self.reports[name]
             return {"sha256": hashlib.sha256(content).hexdigest(), "content_b64": base64.b64encode(content).decode("ascii")}
         if action == "remove_reports":
             reports = payload["reports"]
             if self.mismatch:
                 return {"reports": [{"name": "wrong.log", "result": "cleared"} for _ in reports]}
-            return {"reports": [{"name": item["name"], "result": "cleared"} for item in reports]}
+            outcomes = []
+            for item in reports:
+                content = self.reports.get(item["name"])
+                if content is None or hashlib.sha256(content).hexdigest() != item["sha256"]:
+                    result = "not_found"
+                else:
+                    del self.reports[item["name"]]
+                    result = "cleared"
+                outcomes.append({"name": item["name"], "result": result})
+            return {"reports": outcomes}
         raise AssertionError(f"unexpected helper action: {action}")
 
 
@@ -369,18 +405,31 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fixture = _WorkflowFixture(root, ssh=True)
+            private = redaction_canaries(
+                (fixture.config.model_path, fixture.config.drafter_path),
+                additional=(fixture.config.ssh_host, fixture.config.workdir, fixture.config.run_dir),
+            )
+            home_ancestor = "/home/private-user"
+            producer = StreamingRedactor(private)
+            fixture.server_log = (
+                producer.feed(f"server ancestor-only {home_ancestor}\n") + producer.finalize()
+            ).encode("utf-8")
+            fixture.server_digest = hashlib.sha256(fixture.server_log).hexdigest()
             transport = _ReportTransport(fixture)
             with patch("scripts.targetctl.workflow._read_stored_log", side_effect=AssertionError("controller opened a remote path")):
                 result = self._bundle(root, fixture, transport)
             self.assertEqual(result["status"], "succeeded")
-            self.assertEqual([action for action, _ in transport.calls], ["read_report", "read_report", "remove_reports"])
+            self.assertEqual([action for action, _ in transport.calls], ["read_report", "read_report", "read_report", "remove_reports"])
             self.assertEqual(
                 transport.calls[-1][1]["reports"],
                 [{"name": "build.log", "sha256": fixture.build_digest}, {"name": "server.log", "sha256": fixture.server_digest}],
             )
+            self.assertEqual(transport.reports, {})
             self.assertTrue(validate_bundle_index(root / result["artifact"])["complete"])
             artifact_bytes = b"".join(path.read_bytes() for path in (root / result["artifact"]).rglob("*") if path.is_file())
-            private = (fixture.config.ssh_host, fixture.config.workdir, fixture.config.run_dir, fixture.config.model_path, fixture.config.drafter_path)
+            self.assertNotIn(home_ancestor.encode(), fixture.server_log)
+            self.assertIn("/home/private-user", private)
+            self.assertIn("/mnt/private-store", private)
             self.assertTrue(all(value not in str(result) and value.encode() not in artifact_bytes for value in private))
             mismatched = _ReportTransport(fixture, mismatch=True)
             with patch("scripts.targetctl.workflow._read_stored_log", side_effect=AssertionError("controller opened a remote path")):
@@ -389,6 +438,93 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
             self.assertTrue(validate_bundle_index(root / failed["artifact"])["complete"])
             failed_bytes = b"".join(path.read_bytes() for path in (root / failed["artifact"]).rglob("*") if path.is_file())
             self.assertTrue(all(value not in str(failed) and value.encode() not in failed_bytes for value in private))
+
+    def test_failed_cleanup_promotes_digest_matching_server_log_and_rejects_bad_evidence(self) -> None:
+        from scripts.targetctl.artifacts import validate_bundle_index
+
+        def with_failed_cleanup(original_smoke, run_id: str):
+            smoked = original_smoke(run_id)
+            return replace(
+                smoked,
+                cleanup=replace(
+                    smoked.cleanup,
+                    status="failed",
+                    process="unknown",
+                    failure_class="command_failed",
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root, ssh=True)
+            private = redaction_canaries(
+                (fixture.config.model_path, fixture.config.drafter_path),
+                additional=(fixture.config.ssh_host, fixture.config.workdir, fixture.config.run_dir),
+            )
+            non_home_ancestor = "/mnt/private-store"
+            producer = StreamingRedactor(private)
+            fixture.server_log = (
+                producer.feed(f"failed cleanup ancestor-only {non_home_ancestor}\n")
+                + producer.finalize()
+            ).encode("utf-8")
+            fixture.server_digest = hashlib.sha256(fixture.server_log).hexdigest()
+            original_smoke = fixture.smoke
+            fixture.smoke = lambda run_id: with_failed_cleanup(original_smoke, run_id)
+            transport = _ReportTransport(fixture)
+            result = self._bundle(root, fixture, transport)
+            artifact = root / result["artifact"]
+            cleanup_record = json.loads((artifact / "cleanup.json").read_text(encoding="utf-8"))["payload"]
+            server_log = (artifact / "texts" / "server-log.txt").read_bytes()
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["report_cleanup"]["status"], "succeeded")
+            self.assertEqual(
+                transport.calls[-1],
+                (
+                    "remove_reports",
+                    {
+                        "run_dir": fixture.config.run_dir,
+                        "run_token": "2" * 64,
+                        "reports": [{"name": "build.log", "sha256": fixture.build_digest}],
+                    },
+                ),
+            )
+            self.assertNotIn("build.log", transport.reports)
+            self.assertEqual(transport.reports["server.log"], fixture.server_log)
+            self.assertEqual(cleanup_record["status"], "failed")
+            self.assertEqual(cleanup_record["server_log_sha256"], fixture.server_digest)
+            self.assertNotIn(non_home_ancestor.encode(), fixture.server_log)
+            self.assertIn("/home/private-user", private)
+            self.assertIn("/mnt/private-store", private)
+            failed_artifact_bytes = b"".join(
+                path.read_bytes() for path in artifact.rglob("*") if path.is_file()
+            )
+            for raw in private:
+                self.assertNotIn(raw, str(result))
+                self.assertNotIn(raw.encode(), server_log)
+                self.assertNotIn(raw.encode(), failed_artifact_bytes)
+            self.assertEqual(hashlib.sha256(server_log).hexdigest(), fixture.server_digest)
+            self.assertTrue(validate_bundle_index(artifact)["complete"])
+
+        for report, code in (
+            ("absent", "artifact_log_unavailable"),
+            ("mismatch", "artifact_log_mismatch"),
+            ("changing", "artifact_log_mismatch"),
+        ):
+            with self.subTest(report=report), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                fixture = _WorkflowFixture(root, ssh=True)
+                original_smoke = fixture.smoke
+                fixture.smoke = lambda run_id, original_smoke=original_smoke: with_failed_cleanup(original_smoke, run_id)
+                transport = _ReportTransport(fixture, server_report=report)
+                with self.assertRaises(TargetError) as raised:
+                    self._bundle(root, fixture, transport)
+                self.assertEqual(raised.exception.code, code)
+                self.assertFalse(any(action == "remove_reports" for action, _ in transport.calls))
+                self.assertEqual(transport.reports["build.log"], fixture.build_log)
+                if report != "absent":
+                    self.assertIn("server.log", transport.reports)
+                artifact_root = root / "artifacts" / "phase-01-runs" / fixture.config.name
+                self.assertFalse(artifact_root.exists() and any(artifact_root.iterdir()))
 
     def test_ssh_identity_runtime_uses_distinct_validated_target_paths(self) -> None:
         from scripts.targetctl.workflow import _status_runtime
@@ -425,6 +561,271 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
                 with self.assertRaisesRegex(TargetError, "workflow_binary_stale"):
                     execute(root, "local", "serve")
             self.assertFalse(lifecycle.called)
+
+    def test_failed_bundle_keeps_exact_attempt_artifact_but_invalidates_prior_build(self) -> None:
+        from scripts.targetctl.artifacts import validate_bundle_index
+        from scripts.targetctl.build import BuildResult
+        from scripts.targetctl.source import SyncResult
+        from scripts.targetctl.workflow import _read_state, execute, run_bundle
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            fixture.install_binary()
+            (fixture.run_dir / "build.log").write_bytes(fixture.build_log)
+            os.chmod(fixture.run_dir / "build.log", 0o600)
+            failed = BuildResult(
+                "failed", "command_failed",
+                fixture.source.snapshot_id, fixture.source.applied_tree_hash,
+                None, None, "make-cuda-spark", None, None, None,
+                fixture.build_digest, 2, 19,
+            )
+            lifecycle = Mock()
+
+            environment = {
+                "TARGETCTL_MODEL_PATH": "/private/model-canary.gguf",
+                "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf",
+            }
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config),
+                patch("scripts.targetctl.workflow.select_transport", return_value=Mock()),
+                patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source),
+                patch("scripts.targetctl.workflow.controller_provenance", return_value=fixture.provenance),
+                patch("scripts.targetctl.workflow.sync_source", return_value=SyncResult(fixture.source, True, fixture.source.applied_tree_hash)),
+                patch("scripts.targetctl.workflow.doctor", return_value=fixture.doctor),
+                patch("scripts.targetctl.workflow.build", return_value=failed),
+                patch("scripts.targetctl.workflow.serve", lifecycle),
+            ):
+                bundled = run_bundle(root, "local")
+                with self.assertRaisesRegex(TargetError, "workflow_state_invalid"):
+                    execute(root, "local", "serve")
+
+            artifact = root / bundled["artifact"]
+            build_record = json.loads((artifact / "build.json").read_text(encoding="utf-8"))["payload"]
+            self.assertEqual(bundled["status"], "failed")
+            self.assertEqual(build_record, failed.controller_payload())
+            self.assertTrue(validate_bundle_index(artifact)["complete"])
+            self.assertIsNone(_read_state(root, "local", True)["build"])
+            self.assertFalse(lifecycle.called)
+
+    def test_execute_build_cas_rejects_save_after_identical_sync(self) -> None:
+        from scripts.targetctl.source import SyncResult
+        from scripts.targetctl.workflow import _read_state, execute
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            synchronized = SyncResult(
+                fixture.source, True, fixture.source.applied_tree_hash,
+            )
+            build_committed = threading.Event()
+            resume_build = threading.Event()
+            errors: list[BaseException] = []
+
+            def delayed_build(*_args, **_kwargs):
+                build_committed.set()
+                if not resume_build.wait(5):
+                    raise AssertionError("build was not resumed")
+                return fixture.build
+
+            def run_build() -> None:
+                try:
+                    execute(root, "local", "build")
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config),
+                patch("scripts.targetctl.workflow.select_transport"),
+                patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source),
+                patch("scripts.targetctl.workflow.sync_source", return_value=synchronized),
+                patch("scripts.targetctl.workflow.build", side_effect=delayed_build),
+            ):
+                worker = threading.Thread(target=run_build)
+                worker.start()
+                try:
+                    self.assertTrue(build_committed.wait(5))
+                    result = execute(root, "local", "sync")
+                finally:
+                    resume_build.set()
+                    worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result["snapshot_id"], fixture.source.snapshot_id)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TargetError)
+            self.assertEqual(errors[0].code, "workflow_source_stale")
+            state = _read_state(root, "local", True)
+            self.assertEqual(state["source"], fixture.source.as_dict())
+            self.assertIsNone(state["build"])
+            self.assertIsNone(state["pending"])
+
+    def test_bundle_build_cas_rejects_save_after_identical_sync(self) -> None:
+        from scripts.targetctl.source import SyncResult
+        from scripts.targetctl.workflow import _read_state, execute, run_bundle
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            synchronized = SyncResult(
+                fixture.source, True, fixture.source.applied_tree_hash,
+            )
+            build_committed = threading.Event()
+            resume_build = threading.Event()
+            errors: list[BaseException] = []
+
+            def delayed_build(*_args, **_kwargs):
+                build_committed.set()
+                if not resume_build.wait(5):
+                    raise AssertionError("bundle build was not resumed")
+                return fixture.build
+
+            def run() -> None:
+                try:
+                    run_bundle(root, "local")
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "TARGETCTL_MODEL_PATH": "/private/model-canary.gguf",
+                        "TARGETCTL_DRAFTER_PATH": "/private/drafter-canary.gguf",
+                    },
+                    clear=False,
+                ),
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config),
+                patch("scripts.targetctl.workflow.select_transport"),
+                patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source),
+                patch("scripts.targetctl.workflow.controller_provenance", return_value=fixture.provenance),
+                patch("scripts.targetctl.workflow.sync_source", return_value=synchronized),
+                patch("scripts.targetctl.workflow.doctor", return_value=fixture.doctor),
+                patch("scripts.targetctl.workflow.build", side_effect=delayed_build),
+            ):
+                worker = threading.Thread(target=run)
+                worker.start()
+                try:
+                    self.assertTrue(build_committed.wait(5))
+                    execute(root, "local", "sync")
+                finally:
+                    resume_build.set()
+                    worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TargetError)
+            self.assertEqual(errors[0].code, "workflow_source_stale")
+            state = _read_state(root, "local", True)
+            self.assertEqual(state["source"], fixture.source.as_dict())
+            self.assertIsNone(state["build"])
+            self.assertIsNone(state["pending"])
+
+    def test_newer_post_sync_build_survives_delayed_old_save_until_next_sync(self) -> None:
+        from scripts.targetctl.source import SyncResult
+        from scripts.targetctl.workflow import (
+            _build_generation,
+            _read_state,
+            _ready,
+            _save_build,
+            execute,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            old_generation = _build_generation(
+                root, fixture.config.name, fixture.source,
+            )
+            newer = replace(fixture.build, build_id="e" * 64)
+            synchronized = SyncResult(
+                fixture.source, True, fixture.source.applied_tree_hash,
+            )
+
+            with (
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config),
+                patch("scripts.targetctl.workflow.select_transport"),
+                patch("scripts.targetctl.workflow.build_snapshot", return_value=fixture.source),
+                patch("scripts.targetctl.workflow.sync_source", return_value=synchronized),
+                patch("scripts.targetctl.workflow.build", return_value=newer),
+            ):
+                execute(root, "local", "sync")
+                built = execute(root, "local", "build")
+                with self.assertRaisesRegex(TargetError, "workflow_source_stale"):
+                    _save_build(
+                        root,
+                        fixture.config.name,
+                        fixture.source,
+                        fixture.build,
+                        expected_generation=old_generation,
+                    )
+                source, current = _ready(root, "local")
+                self.assertEqual(source, fixture.source)
+                self.assertEqual(current["build_id"], newer.build_id)
+                self.assertEqual(built["build_id"], newer.build_id)
+                execute(root, "local", "sync")
+
+            self.assertIsNone(_read_state(root, "local", True)["build"])
+
+    def test_sync_interruption_releases_controller_lock_without_mutation(self) -> None:
+        from scripts.targetctl.source import SyncResult
+        from scripts.targetctl.workflow import _read_state, execute
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            before = _read_state(root, "local", True)
+            synchronized = SyncResult(
+                fixture.source, True, fixture.source.applied_tree_hash,
+            )
+
+            with (
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config),
+                patch("scripts.targetctl.workflow.select_transport"),
+            ):
+                with patch("scripts.targetctl.workflow.sync_source", side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        execute(root, "local", "sync")
+                self.assertEqual(_read_state(root, "local", True), before)
+                with patch("scripts.targetctl.workflow.sync_source", return_value=synchronized):
+                    result = execute(root, "local", "sync")
+
+            self.assertEqual(result["snapshot_id"], fixture.source.snapshot_id)
+            self.assertIsNone(_read_state(root, "local", True)["build"])
+
+    def test_sync_preflight_failure_preserves_existing_controller_state(self) -> None:
+        from scripts.targetctl.workflow import (
+            _read_state, _ready, _store_pending_run, execute,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _WorkflowFixture(root)
+            fixture.install_ready_state(root)
+            source, built = _ready(root, "local")
+            _store_pending_run(
+                root, "local", source, built,
+                "run-existing-owner-0001",
+            )
+            before = _read_state(root, "local", True)
+            synchronized = Mock()
+
+            with (
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config),
+                patch("scripts.targetctl.workflow.select_transport"),
+                patch("scripts.targetctl.workflow.sync_source", synchronized),
+            ):
+                with self.assertRaisesRegex(TargetError, "workflow_run_pending"):
+                    execute(root, "local", "sync")
+
+            self.assertEqual(_read_state(root, "local", True), before)
+            synchronized.assert_not_called()
 
     def test_pending_run_survives_ambiguous_serve_and_requires_matching_cleanup(self) -> None:
         from scripts.targetctl.lifecycle import CleanupResult
@@ -613,5 +1014,5 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
             self.assertEqual(smoked["smoke"], observed.controller_payload())
             self.assertEqual(smoked["run"], observed.run.controller_payload())
             self.assertEqual(smoked["cleanup"], observed.cleanup.controller_payload())
-            state = (root / "targets" / ".state" / "local.workflow-v1.json").read_text(encoding="utf-8")
+            state = (root / "targets" / ".state" / "local.workflow-v2.json").read_text(encoding="utf-8")
             self.assertTrue(all(value not in str((doctor, built, logs, smoked)) and value not in state for value in (private, "/private/drafter-canary.gguf")))

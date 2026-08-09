@@ -20,13 +20,15 @@ from .common import TargetError, read_json_file, write_json_atomic
 from .config import TargetConfig, load_target
 from .doctor import DoctorResult, RuntimeInput as DoctorRuntimeInput, doctor
 from .lifecycle import RuntimeInputs, cleanup, logs, serve, smoke, status, stop
-from .redaction import StreamingRedactor
-from .source import RepositoryState, SourceEntry, SourceSnapshot, build_snapshot, sync_source
+from .redaction import StreamingRedactor, redaction_canaries
+from .source import RepositoryState, SourceEntry, SourceSnapshot, SyncResult, build_snapshot, sync_source
 from .transport import select_transport
 
 DEFAULT_LOCAL_PORT = 8000
 _CONFIG = Path("targets") / "targets.toml"
 _HEX = frozenset("0123456789abcdef")
+_WORKFLOW_STATE_SCHEMA = 2
+_MAX_WORKFLOW_GENERATION = (1 << 63) - 1
 
 
 def _fail(code: str, message: str = "target workflow is unavailable") -> None:
@@ -101,7 +103,7 @@ def _state_path(root: Path, target: str) -> Path:
             or stat.S_IMODE(info.st_mode) != 0o700
         ):
             _fail("workflow_state_invalid", "controller state is unavailable")
-    return root / "targets" / ".state" / f"{target}.workflow-v1.json"
+    return root / "targets" / ".state" / f"{target}.workflow-v2.json"
 
 
 def _read_state_unlocked(root: Path, target: str, required: bool) -> dict[str, Any]:
@@ -111,7 +113,13 @@ def _read_state_unlocked(root: Path, target: str, required: bool) -> dict[str, A
     except FileNotFoundError:
         if required:
             _fail("workflow_state_missing", "controller state is unavailable")
-        return {"schema": 1, "source": None, "build": None, "pending": None}
+        return {
+            "schema": _WORKFLOW_STATE_SCHEMA,
+            "generation": 0,
+            "source": None,
+            "build": None,
+            "pending": None,
+        }
     except OSError:
         _fail("workflow_state_invalid", "controller state is unavailable")
     if (
@@ -123,14 +131,15 @@ def _read_state_unlocked(root: Path, target: str, required: bool) -> dict[str, A
         _fail("workflow_state_invalid", "controller state is unavailable")
     result = read_json_file(
         path,
-        allowed_keys=("schema", "source", "build", "pending"),
-        required_keys=("schema", "source", "build"),
+        allowed_keys=("schema", "generation", "source", "build", "pending"),
+        required_keys=("schema", "generation", "source", "build", "pending"),
         max_bytes=32 * 1024 * 1024,
     )
-    if set(result) == {"schema", "source", "build"}:
-        result["pending"] = None
     if (
-        result["schema"] != 1
+        result["schema"] != _WORKFLOW_STATE_SCHEMA
+        or not isinstance(result["generation"], int)
+        or isinstance(result["generation"], bool)
+        or not 0 <= result["generation"] <= _MAX_WORKFLOW_GENERATION
         or not isinstance(result["source"], (dict, type(None)))
         or not isinstance(result["build"], (dict, type(None)))
         or not isinstance(result["pending"], (dict, type(None)))
@@ -140,13 +149,41 @@ def _read_state_unlocked(root: Path, target: str, required: bool) -> dict[str, A
 
 
 def _write_state_unlocked(root: Path, target: str, value: Mapping[str, Any]) -> None:
-    if set(value) != {"schema", "source", "build", "pending"} or value.get("schema") != 1:
+    if (
+        set(value) != {"schema", "generation", "source", "build", "pending"}
+        or value.get("schema") != _WORKFLOW_STATE_SCHEMA
+        or not isinstance(value.get("generation"), int)
+        or isinstance(value.get("generation"), bool)
+        or not 0 <= value["generation"] <= _MAX_WORKFLOW_GENERATION
+    ):
         _fail("workflow_state_invalid", "controller state is unavailable")
     write_json_atomic(
         _state_path(root, target), value,
-        allowed_keys=("schema", "source", "build", "pending"),
-        required_keys=("schema", "source", "build", "pending"), mode=0o600,
+        allowed_keys=("schema", "generation", "source", "build", "pending"),
+        required_keys=("schema", "generation", "source", "build", "pending"),
+        mode=0o600,
     )
+
+
+def _advance_generation(state: dict[str, Any]) -> None:
+    generation = state.get("generation")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or not 0 <= generation < _MAX_WORKFLOW_GENERATION
+    ):
+        _fail("workflow_state_invalid", "controller state is unavailable")
+    state["generation"] = generation + 1
+
+
+def _commit_state_unlocked(
+    root: Path,
+    target: str,
+    state: dict[str, Any],
+) -> None:
+    """Commit one state transition and advance its exact CAS revision."""
+    _advance_generation(state)
+    _write_state_unlocked(root, target, state)
 
 
 @contextmanager
@@ -180,9 +217,6 @@ def _read_state(root: Path, target: str, required: bool) -> dict[str, Any]:
         return _read_state_unlocked(root, target, required)
 
 
-def _write_state(root: Path, target: str, value: Mapping[str, Any]) -> None:
-    with _controller_state_lock(root, target):
-        _write_state_unlocked(root, target, value)
 
 def _snapshot(value: Any) -> SourceSnapshot:
     try:
@@ -254,22 +288,119 @@ def _save_source(root: Path, target: str, source: SourceSnapshot) -> None:
         state = _read_state_unlocked(root, target, False)
         if state["pending"] is not None:
             _fail("workflow_run_pending", "target run reconciliation is required")
-        state["source"], state["build"] = source.as_dict(), None
-        _write_state_unlocked(root, target, state)
+        state["source"] = source.as_dict()
+        state["build"] = None
+        state["pending"] = None
+        _commit_state_unlocked(root, target, state)
+
+def _sync_and_save_source(
+    root: Path,
+    target: str,
+    config: TargetConfig,
+    transport: Any,
+    *,
+    snapshot: SourceSnapshot | None = None,
+) -> SyncResult:
+    """Serialize sync with its all-or-nothing controller invalidation."""
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, False)
+        if state["pending"] is not None:
+            _fail("workflow_run_pending", "target run reconciliation is required")
+        result = sync_source(config, transport, snapshot=snapshot)
+        synchronized = snapshot if snapshot is not None else result.snapshot
+        if result.applied_tree_hash != synchronized.applied_tree_hash:
+            _fail("source_identity_mismatch", "source synchronization is unavailable")
+        state["source"] = synchronized.as_dict()
+        state["build"] = None
+        state["pending"] = None
+        _commit_state_unlocked(root, target, state)
+        return result
 
 
-def _save_build(root: Path, target: str, source: SourceSnapshot, result: BuildResult) -> None:
-    if result.status != "succeeded":
-        return
+def _build_generation(
+    root: Path,
+    target: str,
+    source: SourceSnapshot,
+) -> int:
+    """Pin the exact controller revision that a target build may publish into."""
     with _controller_state_lock(root, target):
         state = _read_state_unlocked(root, target, True)
         if state["pending"] is not None:
             _fail("workflow_run_pending", "target run reconciliation is required")
         if state["source"] != source.as_dict():
-            _fail("workflow_state_invalid", "controller state is unavailable")
+            _fail("workflow_source_stale", "source must be synchronized again")
+        return state["generation"]
+
+
+def _save_build(
+    root: Path,
+    target: str,
+    source: SourceSnapshot,
+    result: BuildResult,
+    *,
+    expected_generation: int,
+) -> None:
+    if (
+        not isinstance(expected_generation, int)
+        or isinstance(expected_generation, bool)
+        or not 0 <= expected_generation <= _MAX_WORKFLOW_GENERATION
+    ):
+        _fail("workflow_state_invalid", "controller state is unavailable")
+    if result.status != "succeeded":
+        return
+    with _controller_state_lock(root, target):
+        state = _read_state_unlocked(root, target, True)
+        if (
+            state["generation"] != expected_generation
+            or state["source"] != source.as_dict()
+        ):
+            _fail("workflow_source_stale", "source must be synchronized again")
+        if state["pending"] is not None:
+            _fail("workflow_run_pending", "target run reconciliation is required")
         payload = result.controller_payload()
-        state["build"] = {key: payload[key] for key in ("source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "version", "binary_size", "sass", "build_log_sha256")}
-        _write_state_unlocked(root, target, state)
+        state["build"] = {
+            key: payload[key]
+            for key in (
+                "source_snapshot_id",
+                "source_applied_tree_hash",
+                "build_id",
+                "binary_sha256",
+                "version",
+                "binary_size",
+                "sass",
+                "build_log_sha256",
+            )
+        }
+        _commit_state_unlocked(root, target, state)
+
+
+def _build_and_save(
+    root: Path,
+    target: str,
+    config: TargetConfig,
+    transport: Any,
+    source: SourceSnapshot,
+    *,
+    allow_dirty: str | None,
+    jobs: int | None,
+) -> BuildResult:
+    """Build against one state revision and publish only through its exact CAS."""
+    generation = _build_generation(root, target, source)
+    result = build(
+        config,
+        transport,
+        snapshot=source,
+        allow_dirty=allow_dirty,
+        jobs=jobs,
+    )
+    _save_build(
+        root,
+        target,
+        source,
+        result,
+        expected_generation=generation,
+    )
+    return result
 
 
 def _source_ready(root: Path, target: str) -> SourceSnapshot:
@@ -308,7 +439,7 @@ def _store_pending_run(root: Path, target: str, source: SourceSnapshot, built: M
             "build_id": current["build_id"],
             "binary_sha256": current["binary_sha256"],
         }
-        _write_state_unlocked(root, target, state)
+        _commit_state_unlocked(root, target, state)
 
 
 def _pending_run(root: Path, target: str) -> str | None:
@@ -347,7 +478,7 @@ def _clear_pending_run(root: Path, target: str, run_id: str | None) -> None:
         pending = state["pending"]
         if pending is not None and pending.get("run_id") == run_id:
             state["pending"] = None
-            _write_state_unlocked(root, target, state)
+            _commit_state_unlocked(root, target, state)
 
 def _clear_new_pending_on_refusal(root: Path, target: str, run_id: str, error: TargetError) -> None:
     """CAS-clear only the launch identity rejected before target dispatch."""
@@ -472,12 +603,17 @@ def _time() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _read_stored_log(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> bytes:
-    """Read a stored log through a pinned descriptor without accepting a pathname swap."""
+def _stored_log_identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Return the pathname/file identity that must remain stable during promotion."""
+    return (item.st_mode, item.st_uid, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+
+
+def _read_stored_log_snapshot(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> tuple[bytes, tuple[int, int, int, int, int, int, int]]:
+    """Read a stored log and retain its pinned identity for a later stability check."""
     try:
         before = os.lstat(path)
     except OSError:
-        _fail("artifact_log_unavailable", "sanitized build report is unavailable")
+        _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
     if (
         stat.S_ISLNK(before.st_mode)
         or not stat.S_ISREG(before.st_mode)
@@ -485,16 +621,16 @@ def _read_stored_log(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> bytes:
         or stat.S_IMODE(before.st_mode) != 0o600
         or before.st_size > max_bytes
     ):
-        _fail("artifact_log_unavailable", "sanitized build report is unavailable")
+        _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
-        _fail("artifact_log_unavailable", "sanitized build report is unavailable")
+        _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
     try:
         opened = os.fstat(fd)
-        before_identity = (before.st_mode, before.st_uid, before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-        if (opened.st_mode, opened.st_uid, opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != before_identity:
-            _fail("artifact_log_unavailable", "sanitized build report is unavailable")
+        before_identity = _stored_log_identity(before)
+        if _stored_log_identity(opened) != before_identity:
+            _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
         content = bytearray()
         while True:
             chunk = os.read(fd, 65_536)
@@ -504,24 +640,40 @@ def _read_stored_log(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> bytes:
             if len(content) > max_bytes:
                 _fail("artifact_too_large", "artifact text exceeds its size limit")
         after = os.fstat(fd)
-        if (after.st_mode, after.st_uid, after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != before_identity:
-            _fail("artifact_log_unavailable", "sanitized build report is unavailable")
+        if _stored_log_identity(after) != before_identity:
+            _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
     except OSError:
-        _fail("artifact_log_unavailable", "sanitized build report is unavailable")
+        _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
     finally:
         os.close(fd)
-    return bytes(content)
+    return bytes(content), before_identity
+
+
+def _read_stored_log(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> bytes:
+    """Read a stored log through a pinned descriptor without accepting a pathname swap."""
+    return _read_stored_log_snapshot(path, max_bytes)[0]
+
+
+def _assert_stored_log_unchanged(path: Path, expected: tuple[int, int, int, int, int, int, int]) -> None:
+    """Reject a live report that changed while its controller copy was promoted."""
+    try:
+        current = os.lstat(path)
+    except OSError:
+        _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
+    if _stored_log_identity(current) != expected:
+        _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
 
 def _private_canaries(config: TargetConfig) -> tuple[str, ...]:
     """Return bounded invocation/config values that must never survive promotion."""
     model, drafter = _paths(config)
-    values: tuple[str | None, ...]
     if config.mode == "local":
-        values = (str(config.source_root), str(config.local_run_dir), model, drafter)
+        additional = (str(config.source_root), str(config.local_run_dir))
     else:
-        values = (config.ssh_host, config.workdir, config.run_dir, config.model_path, config.drafter_path, model, drafter)
-    basenames = tuple(Path(value).name for value in (model, drafter) if Path(value).name)
-    return tuple(dict.fromkeys(value for value in (*values, *basenames) if isinstance(value, str) and 4 <= len(value) <= 512))
+        additional = (config.ssh_host, config.workdir, config.run_dir)
+    try:
+        return redaction_canaries((model, drafter), additional=additional)
+    except TargetError:
+        _fail("artifact_canary_invalid", "artifact canary is invalid")
 
 
 def _promote_log_content(bundle: ArtifactBundle, text_name: str, content: bytes, digest: str, config: TargetConfig, spool_dir: Path) -> None:
@@ -581,14 +733,23 @@ def _promote_build_log(bundle: ArtifactBundle, root: Path, target: str, digest: 
 
 
 def _promote_server_log(bundle: ArtifactBundle, root: Path, target: str, digest: str, config: TargetConfig, transport: Any) -> None:
-    """Promote the actual producer-sanitized server log."""
+    """Promote a stable producer-sanitized server log without consuming the live file."""
     if config.mode == "local":
-        content = _read_stored_log(Path(config.local_run_dir) / "server.log")
-        spool_dir = Path(config.local_run_dir)
-    else:
-        content = _remote_report(config, transport, "server.log")
-        spool_dir = _state_path(root, target).parent
-    _promote_log_content(bundle, "server-log", content, digest, config, spool_dir)
+        live_path = Path(config.local_run_dir) / "server.log"
+        content, identity = _read_stored_log_snapshot(live_path)
+        _promote_log_content(bundle, "server-log", content, digest, config, Path(config.local_run_dir))
+        _assert_stored_log_unchanged(live_path, identity)
+        return
+    content = _remote_report(config, transport, "server.log")
+    _promote_log_content(bundle, "server-log", content, digest, config, _state_path(root, target).parent)
+    current = _remote_report(config, transport, "server.log")
+    if hashlib.sha256(current).hexdigest() != digest:
+        _fail("artifact_log_mismatch", "advertised artifact log changed during promotion")
+
+
+def _cleanup_allows_server_log_removal(cleanup_record: Mapping[str, Any]) -> bool:
+    """Return whether cleanup proved that no process can still write the server log."""
+    return all(cleanup_record.get(field) in {"cleared", "not_found"} for field in ("process", "socket"))
 
 def _cleanup_promoted_reports(config: TargetConfig, transport: Any, reports: tuple[tuple[str, str], ...]) -> dict[str, Any]:
     """Remove only digest-matching reports after their artifact copy is finalized."""
@@ -672,16 +833,21 @@ def run_bundle(repo_root: str | os.PathLike[str], target: str, *, allow_dirty: s
     try:
         bundle.write_record("controller", {"provenance": controller_provenance(root)}, created_at=_time())
         bundle.write_record("source", {"snapshot": source.as_dict()}, created_at=_time())
-        _assert_no_pending_run(root, config.name)
-        synced = sync_source(config, transport, snapshot=source)
-        if synced.applied_tree_hash != source.applied_tree_hash:
-            _fail("source_identity_mismatch", "source synchronization is unavailable")
-        _save_source(root, config.name, source)
+        _sync_and_save_source(
+            root, config.name, config, transport, snapshot=source,
+        )
         doctor_result = doctor(config, transport, snapshot=source, allow_dirty=allow_dirty, runtime=_doctor_runtime(config))
         bundle.write_record("target-doctor", doctor_result.controller_payload(), created_at=_time())
         if doctor_result.status == "succeeded":
-            build_result = build(config, transport, snapshot=source, allow_dirty=allow_dirty, jobs=jobs)
-            _save_build(root, config.name, source, build_result)
+            build_result = _build_and_save(
+                root,
+                config.name,
+                config,
+                transport,
+                source,
+                allow_dirty=allow_dirty,
+                jobs=jobs,
+            )
             build_payload = build_result.controller_payload()
         else:
             build_payload = _not_run_build()
@@ -713,9 +879,10 @@ def run_bundle(repo_root: str | os.PathLike[str], target: str, *, allow_dirty: s
                 and getattr(smoke_result, "status", None) == "succeeded"
             ):
                 _clear_pending_run(root, config.name, run_id)
-            if cleanup_record["status"] == "succeeded" and cleanup_record.get("server_log_sha256"):
+            if cleanup_record.get("server_log_sha256"):
                 _promote_server_log(bundle, root, config.name, cleanup_record["server_log_sha256"], config, transport)
-                promoted_reports.append(("server.log", cleanup_record["server_log_sha256"]))
+                if _cleanup_allows_server_log_removal(cleanup_record):
+                    promoted_reports.append(("server.log", cleanup_record["server_log_sha256"]))
         bundle.write_record("run", run_record, created_at=_time())
         bundle.write_record("smoke", smoke_record, created_at=_time())
         bundle.write_record("cleanup", cleanup_record, created_at=_time())
@@ -754,19 +921,22 @@ def execute(repo_root: str | os.PathLike[str], target: str, operation: str, *, a
             _fail("workflow_source_stale", "source must be synchronized again")
         return _public_doctor(doctor(config, transport, snapshot=source_snap, allow_dirty=allow_dirty, runtime=_doctor_runtime(config)))
     if operation == "sync":
-        _assert_no_pending_run(root, config.name)
-        result = sync_source(config, transport)
-        if result.applied_tree_hash != result.snapshot.applied_tree_hash:
-            _fail("source_identity_mismatch", "source synchronization is unavailable")
-        _save_source(root, config.name, result.snapshot)
+        result = _sync_and_save_source(root, config.name, config, transport)
         return {"status": "succeeded", "snapshot_id": result.snapshot.snapshot_id, "applied_tree_hash": result.snapshot.applied_tree_hash, "initialized": result.initialized}
     if operation == "build":
         _assert_no_pending_run(root, config.name)
         source_snap = _source_ready(root, config.name)
         if build_snapshot(root).as_dict() != source_snap.as_dict():
             _fail("workflow_source_stale", "source must be synchronized again")
-        result = build(config, transport, snapshot=source_snap, allow_dirty=allow_dirty, jobs=jobs)
-        _save_build(root, config.name, source_snap, result)
+        result = _build_and_save(
+            root,
+            config.name,
+            config,
+            transport,
+            source_snap,
+            allow_dirty=allow_dirty,
+            jobs=jobs,
+        )
         return _public_build(result)
     if operation in {"status", "logs", "stop", "cleanup"}:
         runtime = _status_runtime(root, config.name, config)

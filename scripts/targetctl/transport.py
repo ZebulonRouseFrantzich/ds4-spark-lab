@@ -20,6 +20,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Collection, Mapping, Sequence
 
@@ -435,94 +436,82 @@ def _validated_ssh_config(value: str | Path) -> Path:
 
 
 class SSHForward:
-    """One operation-owned, loopback-only SSH local forward.
+    """Operation-owned loopback bridge backed by one ``ssh -W`` per client.
 
-    It deliberately does not reuse :class:`SSHTransport`'s runner: forwarding is
-    a live process, so tests and callers can reliably observe and tear it down.
+    OpenSSH's configured forward directives stay disabled by
+    ``ClearAllForwardings=yes``.  The controller listener is a normal loopback
+    socket and each accepted connection is carried over SSH's fixed stdio
+    forwarding mode, so private configuration can still provide host routing
+    and identity without activating any configured listener.
     """
 
+    _BACKLOG = 8
+    _MAX_WORKERS = 8
+    _BUFFER_BYTES = 64 * 1024
+    _POLL_SECONDS = 0.1
+
     def __init__(self, transport: "SSHTransport", *, target_port: int, timeout: float = 30.0) -> None:
-        if not isinstance(transport, SSHTransport) or not isinstance(target_port, int) or isinstance(target_port, bool) or not 1 <= target_port <= 65535 or not isinstance(timeout, (int, float)) or not 0 < timeout <= 600:
+        if (
+            not isinstance(transport, SSHTransport)
+            or not isinstance(target_port, int)
+            or isinstance(target_port, bool)
+            or not 1 <= target_port <= 65535
+            or not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not 0 < timeout <= 600
+        ):
             raise _error("invalid_forward_request", "SSH forward request is invalid")
         self._transport = transport
         self._target_port = target_port
         self._timeout = float(timeout)
-        self._process: subprocess.Popen[bytes] | None = None
+        self._listener: socket.socket | None = None
+        self._accept_thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._workers: set[threading.Thread] = set()
+        self._processes: set[subprocess.Popen[bytes]] = set()
+        self._clients: set[socket.socket] = set()
         self.local_port = 0
 
-    def _reserve_port(self) -> int:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-            probe.bind(("127.0.0.1", 0))
-            return int(probe.getsockname()[1])
-        finally:
-            probe.close()
-
     def _argv(self) -> tuple[str, ...]:
-        options = tuple(option for option in SSH_OPTIONS if option != "ClearAllForwardings=yes")
         config_args = () if self._transport._ssh_config is None else ("-F", os.fspath(self._transport._ssh_config))
+        connect_timeout = max(1, int(self._timeout))
         return (
             self._transport._ssh_binary,
             *config_args,
-            *(part for option in (*options, "ClearAllForwardings=no", "ExitOnForwardFailure=yes") for part in ("-o", option)),
-            "-L",
-            f"127.0.0.1:{self.local_port}:127.0.0.1:{self._target_port}",
-            "-N",
+            *(part for option in (*SSH_OPTIONS, f"ConnectTimeout={connect_timeout}", "ConnectionAttempts=1") for part in ("-o", option)),
+            "-W",
+            f"127.0.0.1:{self._target_port}",
             "--",
             self._transport.ssh_host,
         )
 
     @property
     def argv(self) -> tuple[str, ...]:
-        """The exact non-secret argv, primarily for deterministic tests."""
+        """The fixed forwarding-free SSH argv, primarily for deterministic tests."""
         return self._argv()
 
-    def __enter__(self) -> "SSHForward":
-        self.local_port = self._reserve_port()
+    @staticmethod
+    def _selector_events(selector: selectors.BaseSelector, fileobj: Any, events: int, data: str) -> None:
         try:
-            self._process = subprocess.Popen(
-                self._argv(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd="/",
-                env=_validate_env(),
-                shell=False,
-                start_new_session=True,
-            )
-        except OSError:
-            raise _error("forward_start_failed", "SSH forward could not start") from None
-        deadline = time.monotonic() + self._timeout
-        try:
-            while time.monotonic() < deadline:
-                if self._process.poll() is not None:
-                    raise _error("forward_failed", "SSH forward could not become ready")
-                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                try:
-                    probe.settimeout(min(0.1, max(0.01, deadline - time.monotonic())))
-                    if probe.connect_ex(("127.0.0.1", self.local_port)) == 0:
-                        return self
-                finally:
-                    probe.close()
-                time.sleep(0.02)
-            raise _error("forward_timeout", "SSH forward could not become ready")
-        except BaseException:
-            self.close()
-            raise
+            selector.get_key(fileobj)
+        except KeyError:
+            if events:
+                selector.register(fileobj, events, data)
+        else:
+            if events:
+                selector.modify(fileobj, events, data)
+            else:
+                selector.unregister(fileobj)
 
-    def close(self) -> None:
-        process = self._process
-        self._process = None
-        if process is None:
-            return
+    def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
         if process.poll() is None:
             try:
                 if os.name == "posix":
                     os.killpg(process.pid, signal.SIGTERM)
                 else:
                     process.terminate()
-                process.wait(timeout=min(5.0, self._timeout))
+                process.wait(timeout=min(2.0, self._timeout))
             except (OSError, subprocess.TimeoutExpired):
                 try:
                     if os.name == "posix":
@@ -531,10 +520,255 @@ class SSHForward:
                         process.kill()
                 except OSError:
                     pass
+        try:
+            process.wait(timeout=min(2.0, self._timeout))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
                 try:
-                    process.wait(timeout=5.0)
-                except (OSError, subprocess.TimeoutExpired):
+                    stream.close()
+                except OSError:
                     pass
+
+    def _pump(self, client: socket.socket, process: subprocess.Popen[bytes]) -> None:
+        if process.stdin is None or process.stdout is None:
+            return
+        selector = selectors.DefaultSelector()
+        to_ssh = bytearray()
+        to_client = bytearray()
+        client_readable = True
+        ssh_readable = True
+        stdin_open = True
+        deadline = time.monotonic() + self._timeout
+        client.setblocking(False)
+        os.set_blocking(process.stdin.fileno(), False)
+        os.set_blocking(process.stdout.fileno(), False)
+        try:
+            while not self._stop.is_set():
+                if not client_readable and not to_ssh and stdin_open:
+                    self._selector_events(selector, process.stdin, 0, "ssh-write")
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                    stdin_open = False
+                if not ssh_readable and not to_client:
+                    try:
+                        client.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                if not client_readable and not to_ssh and not ssh_readable and not to_client:
+                    break
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                client_events = 0
+                if client_readable and len(to_ssh) < self._BUFFER_BYTES:
+                    client_events |= selectors.EVENT_READ
+                if to_client:
+                    client_events |= selectors.EVENT_WRITE
+                self._selector_events(selector, client, client_events, "client")
+                self._selector_events(
+                    selector,
+                    process.stdout,
+                    selectors.EVENT_READ if ssh_readable and len(to_client) < self._BUFFER_BYTES else 0,
+                    "ssh-read",
+                )
+                if stdin_open:
+                    self._selector_events(
+                        selector,
+                        process.stdin,
+                        selectors.EVENT_WRITE if to_ssh else 0,
+                        "ssh-write",
+                    )
+                try:
+                    events = selector.select(min(self._POLL_SECONDS, deadline - now))
+                except OSError:
+                    break
+                for key, mask in events:
+                    if key.data == "client":
+                        if mask & selectors.EVENT_READ:
+                            try:
+                                chunk = client.recv(min(16384, self._BUFFER_BYTES - len(to_ssh)))
+                            except BlockingIOError:
+                                chunk = None
+                            except OSError:
+                                chunk = b""
+                            if chunk:
+                                to_ssh.extend(chunk)
+                                deadline = time.monotonic() + self._timeout
+                            elif chunk == b"":
+                                client_readable = False
+                        if mask & selectors.EVENT_WRITE and to_client:
+                            try:
+                                sent = client.send(to_client)
+                            except BlockingIOError:
+                                sent = 0
+                            except OSError:
+                                return
+                            if sent:
+                                del to_client[:sent]
+                                deadline = time.monotonic() + self._timeout
+                    elif key.data == "ssh-read":
+                        try:
+                            chunk = os.read(process.stdout.fileno(), min(16384, self._BUFFER_BYTES - len(to_client)))
+                        except BlockingIOError:
+                            chunk = None
+                        except OSError:
+                            chunk = b""
+                        if chunk:
+                            to_client.extend(chunk)
+                            deadline = time.monotonic() + self._timeout
+                        elif chunk == b"":
+                            ssh_readable = False
+                    elif key.data == "ssh-write" and to_ssh:
+                        try:
+                            sent = os.write(process.stdin.fileno(), to_ssh)
+                        except BlockingIOError:
+                            sent = 0
+                        except (BrokenPipeError, OSError):
+                            sent = 0
+                            to_ssh.clear()
+                            self._selector_events(selector, process.stdin, 0, "ssh-write")
+                            try:
+                                process.stdin.close()
+                            except OSError:
+                                pass
+                            stdin_open = False
+                        if sent:
+                            del to_ssh[:sent]
+                            deadline = time.monotonic() + self._timeout
+        finally:
+            selector.close()
+
+    def _bridge_connection(self, client: socket.socket) -> None:
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            if self._stop.is_set():
+                return
+            try:
+                process = subprocess.Popen(
+                    self._argv(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    cwd="/",
+                    env=_validate_env(),
+                    shell=False,
+                    start_new_session=True,
+                    bufsize=0,
+                )
+            except OSError:
+                return
+            with self._lock:
+                self._processes.add(process)
+            if self._stop.is_set():
+                return
+            try:
+                self._pump(client, process)
+            except (OSError, ValueError):
+                pass
+        finally:
+            if process is not None:
+                self._stop_process(process)
+            try:
+                client.close()
+            except OSError:
+                pass
+            current = threading.current_thread()
+            with self._lock:
+                self._clients.discard(client)
+                if process is not None:
+                    self._processes.discard(process)
+                self._workers.discard(current)
+
+    def _accept_connections(self) -> None:
+        while not self._stop.is_set():
+            listener = self._listener
+            if listener is None:
+                return
+            try:
+                client, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            client.settimeout(self._timeout)
+            with self._lock:
+                if self._stop.is_set() or len(self._workers) >= self._MAX_WORKERS:
+                    client.close()
+                    continue
+                worker = threading.Thread(target=self._bridge_connection, args=(client,), name="targetctl-ssh-bridge", daemon=True)
+                self._clients.add(client)
+                self._workers.add(worker)
+            try:
+                worker.start()
+            except RuntimeError:
+                with self._lock:
+                    self._clients.discard(client)
+                    self._workers.discard(worker)
+                client.close()
+
+    def __enter__(self) -> "SSHForward":
+        if self._listener is not None:
+            raise _error("forward_start_failed", "SSH forward could not start")
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(self._BACKLOG)
+            listener.settimeout(self._POLL_SECONDS)
+            self.local_port = int(listener.getsockname()[1])
+            self._listener = listener
+            self._stop.clear()
+            thread = threading.Thread(target=self._accept_connections, name="targetctl-ssh-accept", daemon=True)
+            self._accept_thread = thread
+            thread.start()
+            return self
+        except BaseException:
+            try:
+                listener.close()
+            except OSError:
+                pass
+            self._listener = None
+            self.local_port = 0
+            raise
+
+    def close(self) -> None:
+        self._stop.set()
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        with self._lock:
+            clients = tuple(self._clients)
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
+        accept_thread = self._accept_thread
+        self._accept_thread = None
+        if accept_thread is not None and accept_thread is not threading.current_thread():
+            accept_thread.join(timeout=2.0)
+        with self._lock:
+            workers = tuple(self._workers)
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=min(5.0, self._timeout))
+        with self._lock:
+            remaining = tuple(self._processes)
+        for process in remaining:
+            self._stop_process(process)
+        self.local_port = 0
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()

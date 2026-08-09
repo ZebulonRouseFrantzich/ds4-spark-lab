@@ -15,7 +15,13 @@ from scripts.targetctl.common import (
     write_json_atomic,
 )
 from scripts.targetctl.config import load_target
-from scripts.targetctl.redaction import StreamingRedactor, redact_text
+from scripts.targetctl.redaction import (
+    MAX_REDACTION_SECRET_AGGREGATE_BYTES,
+    MAX_REDACTION_SECRETS,
+    StreamingRedactor,
+    redact_text,
+    redaction_canaries,
+)
 
 
 class TargetConfigTests(unittest.TestCase):
@@ -467,6 +473,112 @@ class RedactionTests(unittest.TestCase):
         self.assertLessEqual(len(output), max_output)
         self.assertNotIn("private-secret", output)
         self.assertNotIn("x" * 32, output)
+
+    def test_path_canaries_include_every_nontrivial_ancestor_deterministically(self) -> None:
+        home = "/home/alice/models/releases/model.gguf"
+        non_home = "/srv/private/weights/releases/draft.gguf"
+        expected = {
+            home,
+            "model.gguf",
+            "/home/alice/models/releases",
+            "/home/alice/models",
+            "/home/alice",
+            non_home,
+            "draft.gguf",
+            "/srv/private/weights/releases",
+            "/srv/private/weights",
+            "/srv/private",
+        }
+        canaries = redaction_canaries((home, non_home))
+        self.assertEqual(canaries, tuple(sorted(expected, key=lambda value: (-len(value), value))))
+        for generic in ("/", "/home", "/srv"):
+            self.assertNotIn(generic, canaries)
+        shared = redaction_canaries(
+            (
+                "/srv/private/models/releases/model.gguf",
+                "/srv/private/drafters/releases/model.gguf",
+            )
+        )
+        self.assertEqual(shared.count("model.gguf"), 1)
+        self.assertEqual(shared.count("/srv/private"), 1)
+
+
+    def test_interleaved_ansi_c0_c1_path_is_redacted_at_every_chunk_boundary(self) -> None:
+        secret = "/srv/private/weights/releases/model.gguf"
+        markers = ("\x1b[31m", "\x00", "\x85", "\x1b[0m")
+        obfuscated = "".join(
+            character + (markers[index % len(markers)] if index + 1 < len(secret) else "")
+            for index, character in enumerate(secret)
+        )
+        record = ("path=" + obfuscated).encode("utf-8")
+        canaries = redaction_canaries((secret,))
+        for cut in range(len(record) + 1):
+            with self.subTest(cut=cut):
+                redactor = StreamingRedactor(canaries)
+                output = (
+                    redactor.feed(record[:cut])
+                    + redactor.feed(record[cut:])
+                    + redactor.feed(b"\n")
+                    + redactor.finalize()
+                )
+                self.assertIn("[REDACTED]", output)
+                for raw in (secret, "/srv/private/weights", "/srv/private"):
+                    self.assertNotIn(raw, output)
+                for control in ("\x1b", "\x00", "\x85"):
+                    self.assertNotIn(control, output)
+
+
+    def test_streaming_redaction_accepts_full_configuration_path_limit_and_bounds_secrets(self) -> None:
+        components = [("d" + ("x" * 127)) for _ in range(31)]
+        components.append("z" + ("y" * 95))
+        secret = "/" + "/".join(components)
+        self.assertEqual(len(secret.encode("utf-8")), 4096)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "targets.toml"
+            config.write_text(
+                """schema_version = 1
+[spark]
+name = "spark"
+mode = "ssh"
+ssh_host = "target-alias"
+workdir = "/mnt/ds4-data/spark/work"
+run_dir = "/mnt/ds4-data/spark/run"
+api_base_url = "http://127.0.0.1:8080"
+model_path = "/mnt/ds4-models/primary/release"
+drafter_path = "%s"
+""" % secret,
+                encoding="utf-8",
+            )
+            target = load_target(root, "spark", config)
+            target.validate_for("logs")
+            configured_secret = target.drafter_path or ""
+        self.assertEqual(configured_secret, secret)
+
+        redactor = StreamingRedactor([configured_secret])
+        output = (
+            redactor.feed(configured_secret[:1023])
+            + redactor.feed(configured_secret[1023:3071])
+            + redactor.feed(configured_secret[3071:] + "\n")
+            + redactor.finalize()
+        )
+        self.assertEqual(output, "[REDACTED]\n")
+        second_secret = "/" + "/".join("e" + component[1:] for component in components)
+        max_depth_canaries = redaction_canaries((secret, second_secret))
+        self.assertEqual(len(max_depth_canaries), 64)
+        self.assertLessEqual(
+            sum(len(value.encode("utf-8")) for value in max_depth_canaries),
+            MAX_REDACTION_SECRET_AGGREGATE_BYTES,
+        )
+        StreamingRedactor(max_depth_canaries)
+
+
+        with self.assertRaises(TargetError) as oversized:
+            StreamingRedactor([secret + "x"])
+        self.assertEqual(oversized.exception.code, "redaction_secret_invalid")
+        with self.assertRaises(TargetError) as excessive:
+            StreamingRedactor([f"private-{index}" for index in range(MAX_REDACTION_SECRETS + 1)])
+        self.assertEqual(excessive.exception.code, "redaction_secret_invalid")
 
     def test_one_shot_redaction_is_bounded(self) -> None:
         output = redact_text("x" * 100, max_output=16)

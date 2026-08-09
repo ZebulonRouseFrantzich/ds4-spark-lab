@@ -603,6 +603,16 @@ def _lc_hex(value):
   return isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
 def _lc_id(value):
   return isinstance(value,str) and 8<=len(value)<=64 and all(c.islower() or c.isdigit() or c=='-' for c in value) and value[0].isalnum()
+def _lc_active_build(build,data,binary_hash):
+  keys={'schema_version','record_type','source_snapshot_id','source_applied_tree_hash','build_id','binary_sha256','binary_size','version','sass','build_log_sha256','exit_code','duration_ns'}
+  if not isinstance(build,dict)or set(build)!=keys or build['schema_version']!=1 or build['record_type']!='build':return False
+  if build['source_snapshot_id']!=data['source_snapshot_id']or build['source_applied_tree_hash']!=data['applied_tree_hash']or build['build_id']!=data['build_id']:return False
+  if not all(_lc_hex(build[name])for name in('source_snapshot_id','source_applied_tree_hash','build_id','binary_sha256','build_log_sha256')):return False
+  version=build['version']
+  if not isinstance(version,str)or not 1<=len(version)<=64 or not 1<=len(version.split('.'))<=4 or any(not part or not part.isascii()or not part.isdigit()for part in version.split('.')):return False
+  if not isinstance(build['binary_size'],int)or isinstance(build['binary_size'],bool)or not 1<=build['binary_size']<=(1<<63)-1:return False
+  if build['sass']!='verified'or build['exit_code']!=0 or isinstance(build['exit_code'],bool)or not isinstance(build['duration_ns'],int)or isinstance(build['duration_ns'],bool)or not 1<=build['duration_ns']<=3630000000000:return False
+  return hmac.compare_digest(build['binary_sha256'],binary_hash)
 def _lc_atom(root_fd,name,data):
   raw=json.dumps(data,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')
   if len(raw)>_LC_MAX_STATE:_fail('unsafe_state')
@@ -737,13 +747,13 @@ def _lc_open_dir(paths):
     if sv_fd is not None:os.close(sv_fd)
     raise
 def _lc_secret_values(paths):
-  values=(paths['workdir'],paths['run_dir'],paths['model_path'],paths['drafter_path'],os.path.basename(paths['model_path']),os.path.basename(paths['drafter_path']))
-  result=[]
-  for value in values:
-    try:encoded=value.encode('utf-8')
-    except UnicodeEncodeError:continue
-    if 4<=len(encoded)<=512 and value not in result:result.append(value)
-  return result
+  try:
+    return list(_targetctl_redaction_canaries(
+      (paths['model_path'],paths['drafter_path']),
+      (paths['workdir'],paths['run_dir']),
+    ))
+  except (TypeError,ValueError):
+    _fail('invalid_runtime_inputs')
 def _lc_file_present(root_fd,name):
   try:
     os.stat(name,dir_fd=root_fd,follow_symlinks=False)
@@ -886,8 +896,7 @@ def lifecycle_serve(payload):
     except HelperError:_fail('startup_failed')
     try:build=_lc_read(root_fd,'build.json')
     except HelperError:_fail('startup_failed')
-    expected_hash=build.get('binary_sha256')if isinstance(build,dict)else None
-    if not isinstance(build,dict)or build.get('schema_version')!=1 or build.get('build_id')!=data['build_id']or build.get('source_snapshot_id')!=data['source_snapshot_id']or build.get('source_applied_tree_hash')!=data['applied_tree_hash']or build.get('exit_code')!=0 or not isinstance(build.get('duration_ns'),int) or isinstance(build.get('duration_ns'),bool) or build['duration_ns']<=0 or not _lc_hex(expected_hash)or not hmac.compare_digest(expected_hash,binary_hash):_fail('startup_failed')
+    if not _lc_active_build(build,data,binary_hash):_fail('startup_failed')
     binary_exec='/proc/self/fd/%d/%s'%(sv_dir_fd,data['binary_path'])
     argv=(['/usr/bin/python3',binary_exec]if data['binary_path'].endswith('.py')else[binary_exec])+['--cuda','-m',paths['model_path'],'-c','32768','--host','127.0.0.1','--port',str(data['port'])]
     try:

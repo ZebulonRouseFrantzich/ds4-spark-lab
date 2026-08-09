@@ -1,20 +1,51 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+import signal
 import subprocess
 import tempfile
 import unittest
+import time
 from types import SimpleNamespace
 from unittest import mock
 
 from scripts.targetctl import source as source_module
-from scripts.targetctl.common import TargetError
+from scripts.targetctl.common import TargetError, record_id_for
 from scripts.targetctl.source import _SOURCE_EXTENSION, _stage_snapshot, build_snapshot, qualified_clean, sync_source, verify_applied_tree
 from scripts.targetctl.remote import LAUNCH_PROFILE
 from scripts.targetctl.transport import CommandResult, LocalTransport, SSHTransport
+
+
+def _active_build_manifest(snapshot_id: str, applied_tree_hash: str, binary: bytes) -> dict[str, object]:
+    binary_hash = hashlib.sha256(binary).hexdigest()
+    version = "1.2.3"
+    identity = {
+        "schema_version": 1,
+        "source_snapshot_id": snapshot_id,
+        "source_applied_tree_hash": applied_tree_hash,
+        "binary_sha256": binary_hash,
+        "version": version,
+        "binary_size": len(binary),
+        "sass": "sm_121",
+    }
+    return {
+        "schema_version": 1,
+        "record_type": "build",
+        "source_snapshot_id": snapshot_id,
+        "source_applied_tree_hash": applied_tree_hash,
+        "build_id": record_id_for(identity),
+        "binary_sha256": binary_hash,
+        "binary_size": len(binary),
+        "version": version,
+        "sass": "verified",
+        "build_log_sha256": hashlib.sha256(b"successful build\n").hexdigest(),
+        "exit_code": 0,
+        "duration_ns": 1,
+    }
 
 
 class SourceFixture(unittest.TestCase):
@@ -173,6 +204,66 @@ class TargetHelperSourceTests(unittest.TestCase):
         with self.assertRaises(TargetError) as error:
             self.transport.run_helper("source_preflight", request, extension_source=_SOURCE_EXTENSION, allowed_error_codes={"source_lifecycle", "unexpected_entry"})
         self.assertEqual(error.exception.code, "source_lifecycle")
+
+    def test_source_state_refuses_non_active_or_multiply_linked_build_manifest(self) -> None:
+        run = Path(self.payload["run_dir"])
+        build_path = run / "build.json"
+        lock = self.transport.run_helper(
+            "acquire_lock",
+            {"run_dir": self.payload["run_dir"], "run_token": self.tokens["run_token"], "lease_seconds": 60},
+        )
+        request = {
+            "run_dir": self.payload["run_dir"],
+            "run_token": self.tokens["run_token"],
+            "lock_token": lock["lock_token"],
+            "snapshot_id": "1" * 64,
+            "applied_tree_hash": "2" * 64,
+            "dirty": False,
+        }
+        try:
+            malformed = b'{"record_type":"build-attempt","schema_version":1}'
+            build_path.write_bytes(malformed)
+            os.chmod(build_path, 0o600)
+            with self.assertRaises(TargetError) as malformed_error:
+                self.transport.run_helper(
+                    "source_write_state",
+                    request,
+                    extension_source=_SOURCE_EXTENSION,
+                    allowed_error_codes={"unsafe_state", "unsafe_lock"},
+                )
+            self.assertEqual(malformed_error.exception.code, "unsafe_state")
+            self.assertEqual(build_path.read_bytes(), malformed)
+            self.assertFalse((run / "source.json").exists())
+
+            build_path.unlink()
+            active = _active_build_manifest("1" * 64, "2" * 64, b"binary")
+            active_raw = json.dumps(active, sort_keys=True, separators=(",", ":")).encode("ascii")
+            build_path.write_bytes(active_raw)
+            os.chmod(build_path, 0o600)
+            linked = run / "build-link-canary"
+            os.link(build_path, linked)
+            with self.assertRaises(TargetError) as linked_error:
+                self.transport.run_helper(
+                    "source_write_state",
+                    request,
+                    extension_source=_SOURCE_EXTENSION,
+                    allowed_error_codes={"unsafe_state", "unsafe_lock"},
+                )
+            self.assertEqual(linked_error.exception.code, "unsafe_state")
+            self.assertEqual(build_path.read_bytes(), active_raw)
+            self.assertEqual(linked.read_bytes(), active_raw)
+            self.assertFalse((run / "source.json").exists())
+            self.assertTrue((run / ".targetctl-operation-lock-v1").exists())
+        finally:
+            self.transport.run_helper(
+                "release_lock",
+                {
+                    "run_dir": self.payload["run_dir"],
+                    "run_token": self.tokens["run_token"],
+                    "lock_token": lock["lock_token"],
+                },
+            )
+        self.assertFalse((run / ".targetctl-operation-lock-v1").exists())
 class GuardedRsyncTests(unittest.TestCase):
     def test_receiver_argv_uses_fixed_binary_and_guard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -204,12 +295,15 @@ class _FakeSSHRsyncBase(unittest.TestCase):
         source = self.base / "source"
         source.mkdir()
         self._git(source, "init")
+        self._write_commit(source, ".gitignore", b"/targets/\n")
         self._write_commit(source, "hello.txt", b"hello world\n")
         for name, dest in (("engine", "engine/ds4"), ("integration", "spark/ds4-on-spark")):
             upstream = self.base / name
             upstream.mkdir()
             self._git(upstream, "init")
             self._write_commit(upstream, "src.py", f"# {name}".encode())
+            if name == "engine":
+                self._write_commit(upstream, ".gitignore", b"/ds4-server\n")
             self._git(source, "-c", "protocol.file.allow=always", "submodule", "add", os.fspath(upstream), dest)
         self._git(source, "add", "-A")
         self._git(source, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "submodules")
@@ -259,52 +353,284 @@ class FakeSSHRsyncTests(_FakeSSHRsyncBase):
         transport = SSHTransport("target", ssh_binary=self.fake_ssh_path)
         workdir = Path(config.workdir)
         run_dir = Path(config.run_dir)
+        real_run_helper = transport.run_helper
+        milestones: list[str] = []
+        completed_reports: list[dict[str, object]] = []
+        released_locks: list[bool] = []
+        build_invalidations: list[bool] = []
+        acquired_lock_tokens: list[str] = []
 
-        # Call 1: initialize and transfer.
-        result = sync_source(config, transport)
-        self.assertTrue(result.initialized)
-        self.assertEqual(result.applied_tree_hash, result.snapshot.applied_tree_hash)
-        self.assertEqual((workdir / "hello.txt").read_bytes(), b"hello world\n")
+        def traced_helper(action: str, *args: object, **kwargs: object) -> object:
+            if action in {
+                "source_receiver_postflight",
+                "source_verify",
+                "source_write_state",
+                "source_complete_receiver",
+                "release_lock",
+            }:
+                milestones.append(action)
+            if action in {"source_write_state", "release_lock"}:
+                payload = args[0]
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                self.assertEqual(payload["lock_token"], acquired_lock_tokens[-1])
+            if action == "source_complete_receiver":
+                payload = args[0]
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                report_path = Path(str(payload["receiver"])).with_suffix(".report.json")
+                report = json.loads(report_path.read_text(encoding="ascii"))
+                self.assertEqual(report["snapshot_id"], payload["snapshot_id"])
+                self.assertEqual(report["applied_tree_hash"], payload["applied_tree_hash"])
+                self.assertTrue(report["child_group_gone"])
+                self.assertFalse(any("token" in key for key in report))
+                self.assertTrue((run_dir / ".targetctl-operation-lock-v1").exists())
+                self.assertEqual(
+                    json.loads((run_dir / "source.json").read_text(encoding="ascii")),
+                    {
+                        "schema_version": 1,
+                        "snapshot_id": payload["snapshot_id"],
+                        "applied_tree_hash": payload["applied_tree_hash"],
+                        "dirty": False,
+                    },
+                )
+                completed_reports.append(report)
+            if action == "release_lock":
+                self.assertEqual(list(run_dir.glob(".targetctl-source-receiver-*")), [])
+                self.assertTrue((run_dir / ".targetctl-operation-lock-v1").exists())
+            result = real_run_helper(action, *args, **kwargs)
+            if action == "acquire_lock":
+                self.assertIsInstance(result, dict)
+                assert isinstance(result, dict)
+                acquired_lock_tokens.append(result["lock_token"])
+            if action == "source_write_state":
+                self.assertIsInstance(result, dict)
+                assert isinstance(result, dict)
+                self.assertEqual(set(result), {"stored", "build_invalidated"})
+                build_invalidations.append(result["build_invalidated"])
+            if action == "release_lock":
+                released_locks.append(not (run_dir / ".targetctl-operation-lock-v1").exists())
+            return result
 
-        # Seed stale file and outside canary before transfer
-        (workdir / "stale.txt").write_bytes(b"stale")
-        canary = self.base / "outside-canary.txt"
-        canary.write_bytes(b"canary")
+        with mock.patch.object(transport, "run_helper", side_effect=traced_helper):
+            # Call 1: initialize and transfer.
+            first = sync_source(config, transport)
+            self.assertTrue(first.initialized)
+            self.assertEqual(first.applied_tree_hash, first.snapshot.applied_tree_hash)
+            self.assertEqual((workdir / "hello.txt").read_bytes(), b"hello world\n")
 
-        # Call 2: transfer
-        result = sync_source(config, transport)
-        self.assertFalse(result.initialized)
-        self.assertEqual(result.applied_tree_hash, result.snapshot.applied_tree_hash)
+            # Seed stale file and outside canary before transfer.
+            (workdir / "stale.txt").write_bytes(b"stale")
+            canary = self.base / "outside-canary.txt"
+            canary.write_bytes(b"canary")
+            ignored_binary = workdir / "engine" / "ds4" / "ds4-server"
+            binary_bytes = b"ignored generated executable\n"
+            ignored_binary.write_bytes(binary_bytes)
+            os.chmod(ignored_binary, 0o700)
+            self.assertNotIn("engine/ds4/ds4-server", {entry.path for entry in first.snapshot.entries})
+            active_build_path = run_dir / "build.json"
+            active_build = _active_build_manifest(first.snapshot.snapshot_id, first.applied_tree_hash, binary_bytes)
+            active_build_path.write_text(json.dumps(active_build, sort_keys=True, separators=(",", ":")), encoding="ascii")
+            os.chmod(active_build_path, 0o600)
 
-        # Stale file was deleted by the transfer
+            attempt_id = "a" * 64
+            attempt_log = b"later build failed\n"
+            attempt_report = {
+                "schema_version": 1,
+                "record_type": "build-attempt",
+                "attempt_id": attempt_id,
+                "status": "failed",
+                "failure_class": "command_failed",
+                "source_snapshot_id": first.snapshot.snapshot_id,
+                "source_applied_tree_hash": first.applied_tree_hash,
+                "build_id": None,
+                "binary_sha256": None,
+                "command": "make-cuda-spark",
+                "version": None,
+                "binary_size": None,
+                "sass": None,
+                "build_log_sha256": hashlib.sha256(attempt_log).hexdigest(),
+                "exit_code": 2,
+                "duration_ns": 1,
+            }
+            attempt_report_raw = json.dumps(attempt_report, sort_keys=True, separators=(",", ":")).encode("ascii")
+            attempt_commit = {
+                "schema_version": 1,
+                "record_type": "build-attempt-commit",
+                "attempt_id": attempt_id,
+                "attempt_report_sha256": hashlib.sha256(attempt_report_raw).hexdigest(),
+                "attempt_log_sha256": hashlib.sha256(attempt_log).hexdigest(),
+            }
+            attempt_stem = ".targetctl-build-attempt-v1-" + attempt_id
+            attempt_evidence = {
+                attempt_stem + ".json": attempt_report_raw,
+                attempt_stem + ".log": attempt_log,
+                attempt_stem + ".commit.json": json.dumps(attempt_commit, sort_keys=True, separators=(",", ":")).encode("ascii"),
+            }
+            for name, content in attempt_evidence.items():
+                path = run_dir / name
+                path.write_bytes(content)
+                os.chmod(path, 0o600)
+
+            # Call 2: transfer the same exact clean snapshot.
+            second = sync_source(config, transport)
+            self.assertFalse(second.initialized)
+            self.assertEqual(second.snapshot.snapshot_id, first.snapshot.snapshot_id)
+            self.assertEqual(second.applied_tree_hash, first.applied_tree_hash)
+            self.assertEqual(second.applied_tree_hash, second.snapshot.applied_tree_hash)
+
+        self.assertEqual(
+            milestones,
+            [
+                "source_receiver_postflight",
+                "source_verify",
+                "source_write_state",
+                "source_complete_receiver",
+                "release_lock",
+            ] * 2,
+        )
+        self.assertEqual(len(completed_reports), 2)
+        self.assertEqual(released_locks, [True, True])
+        self.assertEqual(build_invalidations, [False, True])
+
+        # Stale file was deleted by the transfer.
         self.assertFalse((workdir / "stale.txt").exists())
-        # Outside canary was not touched
+        # Outside canary was not touched.
         self.assertTrue(canary.exists())
+        # The same-snapshot transfer removed the ignored executable, and the
+        # lease-pinned source commit removed only its active successful build.
+        self.assertFalse(ignored_binary.exists())
+        self.assertFalse(active_build_path.exists())
+        for name, content in attempt_evidence.items():
+            self.assertEqual((run_dir / name).read_bytes(), content)
 
-        # Source file transferred
+        # Source and submodule files transferred.
         self.assertEqual((workdir / "hello.txt").read_bytes(), b"hello world\n")
-        # Submodule files transferred
         self.assertTrue((workdir / "engine" / "ds4" / "src.py").exists())
         self.assertTrue((workdir / "spark" / "ds4-on-spark" / "src.py").exists())
 
-        # Marker preserved, 0600
+        # Marker preserved, 0600, and root preserved, 0700.
         marker = workdir / ".targetctl-owner-v1-work.json"
         self.assertTrue(marker.exists())
         self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
-        # Root 0700
         self.assertEqual(stat.S_IMODE(workdir.stat().st_mode), 0o700)
 
-        # Source state written
+        # Exact source state was written before receiver completion.
         source_json = run_dir / "source.json"
         self.assertTrue(source_json.exists())
         self.assertEqual(stat.S_IMODE(source_json.stat().st_mode), 0o600)
+        self.assertEqual(
+            json.loads(source_json.read_text(encoding="ascii")),
+            {
+                "schema_version": 1,
+                "snapshot_id": second.snapshot.snapshot_id,
+                "applied_tree_hash": second.applied_tree_hash,
+                "dirty": False,
+            },
+        )
 
-        # Receiver and auth files cleaned
-        for child in run_dir.iterdir():
-            self.assertNotIn(".targetctl-source-receiver-", child.name)
-
-        # Regular lock record cleaned/released.
+        # Receiver, authority, exact private report, and fresh lock were cleaned.
+        self.assertEqual(list(run_dir.glob(".targetctl-source-receiver-*")), [])
         self.assertFalse((run_dir / ".targetctl-operation-lock-v1").exists())
+
+    def test_ambiguous_dispatch_keeps_target_owned_lease_until_child_exit(self) -> None:
+        config = self._make_config(self.source_root)
+        transport = SSHTransport("target", ssh_binary=self.fake_ssh_path)
+        actions: list[str] = []
+        process: subprocess.Popen[bytes] | None = None
+        planted_marker = self.base / "planted-import-ran"
+        real_run_helper = transport.run_helper
+
+        def record_helper(action: str, *args: object, **kwargs: object) -> object:
+            actions.append(action)
+            return real_run_helper(action, *args, **kwargs)
+
+        def lose_response(
+            source_root: Path,
+            remote_workdir: str,
+            *,
+            receiver: str,
+            filters: object = (),
+            filter_file: Path | None = None,
+            timeout: float | None = 300.0,
+        ) -> None:
+            nonlocal process
+            del source_root, filters, filter_file, timeout
+            run_dir = Path(config.run_dir)
+            for module in ("hashlib.py", "hmac.py", "json.py"):
+                (run_dir / module).write_text(
+                    f'open({os.fspath(planted_marker)!r}, "ab").write({module.encode()!r})\n'
+                    'raise RuntimeError("writable run_dir import executed")\n'
+                )
+            process = subprocess.Popen(
+                (
+                    receiver,
+                    "--server",
+                    "-tprxe.iLsfxCIvu",
+                    "--delete-excluded",
+                    ".",
+                    remote_workdir + "/",
+                ),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            auth_path = Path(receiver).with_suffix(".json")
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    owner = json.loads(auth_path.read_text(encoding="ascii"))
+                except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+                    time.sleep(0.02)
+                    continue
+                if owner.get("phase") == "running" and owner.get("child_pid", 0) > 0:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("target receiver did not assume the transfer lease")
+            self.assertFalse(planted_marker.exists())
+            raise TargetError("rsync_timeout", "simulated response loss")
+
+        try:
+            with (
+                mock.patch.object(transport, "run_helper", side_effect=record_helper),
+                mock.patch.object(transport, "guarded_rsync", side_effect=lose_response),
+            ):
+                with self.assertRaises(TargetError) as error:
+                    sync_source(config, transport)
+                self.assertEqual(error.exception.code, "rsync_timeout")
+                self.assertIsNotNone(process)
+                self.assertIsNone(process.poll())
+                self.assertFalse(planted_marker.exists())
+                self.assertNotIn("source_cleanup_receiver", actions)
+                self.assertNotIn("release_lock", actions)
+
+                with self.assertRaises(TargetError) as busy:
+                    sync_source(config, transport)
+                self.assertEqual(busy.exception.code, "lock_busy")
+                self.assertIsNone(process.poll())
+                self.assertNotIn("source_cleanup_receiver", actions)
+                self.assertNotIn("release_lock", actions)
+
+            process.send_signal(signal.SIGHUP)
+            process.wait(timeout=10.0)
+            run_dir = Path(config.run_dir)
+            self.assertFalse((run_dir / ".targetctl-operation-lock-v1").exists())
+            self.assertFalse(Path(process.args[0]).exists())
+            self.assertFalse(Path(process.args[0]).with_suffix(".json").exists())
+            reports = list(run_dir.glob(".targetctl-source-receiver-*.report.json"))
+            self.assertEqual(len(reports), 1)
+            report = json.loads(reports[0].read_text(encoding="ascii"))
+            self.assertTrue(report["child_group_gone"])
+            self.assertFalse(any("token" in key for key in report))
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=10.0)
+            if process is not None:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
 
 
 

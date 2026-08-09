@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import codecs
 import re
 from typing import Iterable
 
 from .common import TargetError
+from .config import _MAX_REMOTE_PATH_DEPTH, _MAX_REMOTE_PATH_LENGTH
 
 
 # Escape sequences are removed before C0/C1 controls.  An incomplete sequence
@@ -58,11 +60,96 @@ _HOME_RE = re.compile(
     r"~[A-Za-z0-9._-]*(?:/[^\s\x00-\x1f\x7f]*)*)"
 )
 _MAX_PENDING_LINE = 4_096
+# Each producer has at most two validated private runtime paths plus three
+# fixed invocation values (controller/work/run identity).  A depth-N path
+# contributes its full spelling, basename, and N-2 nontrivial ancestors: at
+# most N canaries.  These formulae deliberately overbound aggregate bytes
+# without ever shortening a canary.
+MAX_REDACTION_PRIVATE_PATHS = 2
+MAX_REDACTION_ADDITIONAL_SECRETS = 3
+MAX_REDACTION_SECRET_BYTES = _MAX_REMOTE_PATH_LENGTH
+MAX_REDACTION_SECRETS = (
+    MAX_REDACTION_PRIVATE_PATHS * _MAX_REMOTE_PATH_DEPTH
+    + MAX_REDACTION_ADDITIONAL_SECRETS
+)
+MAX_REDACTION_SECRET_AGGREGATE_BYTES = (
+    MAX_REDACTION_SECRETS * MAX_REDACTION_SECRET_BYTES
+)
 _REDACTED = "[REDACTED]"
 _REDACTED_OVERSIZE = "[REDACTED_OVERSIZE]"
 _REDACTED_HOME = "[REDACTED_HOME]"
 _REDACTED_ADDRESS = "[REDACTED_ADDRESS]"
 _TRUNCATED = "[TRUNCATED]"
+def redaction_canaries(
+    paths: Iterable[str] = (),
+    *,
+    additional: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Derive the bounded, deterministic private values used by all producers."""
+
+    known: set[str] = set()
+    aggregate_bytes = 0
+
+    def add(candidate: str, *, allow_short: bool) -> None:
+        nonlocal aggregate_bytes
+        if "\n" in candidate or "\r" in candidate:
+            raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+        encoded_size = len(candidate.encode("utf-8"))
+        if encoded_size > MAX_REDACTION_SECRET_BYTES:
+            raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+        if (allow_short or encoded_size >= 4) and candidate and candidate not in known:
+            if (
+                len(known) >= MAX_REDACTION_SECRETS
+                or aggregate_bytes + encoded_size > MAX_REDACTION_SECRET_AGGREGATE_BYTES
+            ):
+                raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+            known.add(candidate)
+            aggregate_bytes += encoded_size
+
+    try:
+        path_iterator = iter(paths)
+    except TypeError:
+        raise TargetError("redaction_secret_invalid", "redaction secret is invalid") from None
+    supplied_paths = 0
+    for path in path_iterator:
+        supplied_paths += 1
+        if (
+            supplied_paths > MAX_REDACTION_PRIVATE_PATHS
+            or not isinstance(path, str)
+            or not path.isascii()
+            or not path.startswith("/")
+            or path == "/"
+            or path.endswith("/")
+            or "//" in path
+            or "\x00" in path
+        ):
+            raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+        components = path.split("/")[1:]
+        if (
+            len(components) > _MAX_REMOTE_PATH_DEPTH
+            or any(component in {"", ".", ".."} for component in components)
+        ):
+            raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+        add(path, allow_short=True)
+        add(components[-1], allow_short=True)
+        for depth in range(len(components) - 1, 1, -1):
+            add("/" + "/".join(components[:depth]), allow_short=True)
+
+    try:
+        additional_iterator = iter(additional)
+    except TypeError:
+        raise TargetError("redaction_secret_invalid", "redaction secret is invalid") from None
+    supplied_additional = 0
+    for candidate in additional_iterator:
+        supplied_additional += 1
+        if (
+            supplied_additional > MAX_REDACTION_ADDITIONAL_SECRETS
+            or not isinstance(candidate, str)
+        ):
+            raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+        add(candidate, allow_short=False)
+
+    return tuple(sorted(known, key=lambda value: (-len(value), value)))
 
 
 class StreamingRedactor:
@@ -76,6 +163,7 @@ class StreamingRedactor:
 
     __slots__ = (
         "_buffer",
+        "_decoder",
         "_discarding",
         "_emitted",
         "_finalized",
@@ -96,12 +184,17 @@ class StreamingRedactor:
         self._max_output = self._valid_limit(max_output, "redaction_limit_invalid")
         self._max_pending = self._valid_limit(max_pending, "redaction_pending_limit_invalid")
 
-        known: list[str] = []
+        known: set[str] = set()
+        aggregate_bytes = 0
+        supplied = 0
         try:
             iterator = iter(secrets)
         except TypeError:
             raise TargetError("redaction_secret_invalid", "redaction secret is invalid") from None
         for secret in iterator:
+            supplied += 1
+            if supplied > MAX_REDACTION_SECRETS:
+                raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
             if isinstance(secret, bytes):
                 item = secret.decode("utf-8", "replace")
             elif isinstance(secret, str):
@@ -110,12 +203,19 @@ class StreamingRedactor:
                 raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
             if "\n" in item or "\r" in item:
                 raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
-            if item:
-                known.append(item)
-        known_secrets = tuple(sorted(set(known), key=len, reverse=True))
+            encoded_size = len(item.encode("utf-8"))
+            if encoded_size > MAX_REDACTION_SECRET_BYTES:
+                raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+            if item and item not in known:
+                aggregate_bytes += encoded_size
+                if aggregate_bytes > MAX_REDACTION_SECRET_AGGREGATE_BYTES:
+                    raise TargetError("redaction_secret_invalid", "redaction secret is invalid")
+                known.add(item)
+        known_secrets = tuple(sorted(known, key=lambda secret: (-len(secret), secret)))
         self._secret_re = (
             re.compile("|".join(re.escape(secret) for secret in known_secrets)) if known_secrets else None
         )
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._buffer = ""
         self._discarding = False
         self._emitted = 0
@@ -136,12 +236,13 @@ class StreamingRedactor:
             raise TargetError(code, "redaction limit is invalid")
         return value
 
-    @staticmethod
-    def _decode(chunk: str | bytes) -> str:
-        if isinstance(chunk, str):
-            return chunk
+    def _decode(self, chunk: str | bytes) -> str:
         if isinstance(chunk, bytes):
-            return chunk.decode("utf-8", "replace")
+            return self._decoder.decode(chunk, final=False)
+        if isinstance(chunk, str):
+            pending = self._decoder.decode(b"", final=True)
+            self._decoder.reset()
+            return pending + chunk
         raise TargetError("redaction_chunk_invalid", "redaction input is invalid")
 
     def _bounded(self, text: str) -> str:
@@ -176,6 +277,7 @@ class StreamingRedactor:
     def _redact_line(self, text: str) -> str:
         text = _ANSI_RE.sub("", text)
         text = _UNTERMINATED_ESCAPE_RE.sub("", text)
+        text = _CONTROL_RE.sub("", text)
         if self._secret_re is not None:
             text = self._secret_re.sub(_REDACTED, text)
         text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
@@ -184,8 +286,7 @@ class StreamingRedactor:
         text = _TOKEN_SIGNATURE_RE.sub(_REDACTED, text)
         text = _HOME_RE.sub(_REDACTED_HOME, text)
         text = _IPV6_RE.sub(_REDACTED_ADDRESS, text)
-        text = _IPV4_RE.sub(_REDACTED_ADDRESS, text)
-        return _CONTROL_RE.sub("", text)
+        return _IPV4_RE.sub(_REDACTED_ADDRESS, text)
 
     def _emit_line(self, text: str, *, terminated: bool) -> str:
         if self._truncated:
@@ -228,7 +329,10 @@ class StreamingRedactor:
 
         if self._finalized:
             raise TargetError("redaction_finalized", "redactor is already finalized")
-        text = self._decode(chunk)
+        return self._feed_text(self._decode(chunk))
+
+    def _feed_text(self, text: str) -> str:
+        """Consume decoded text while retaining one bounded incomplete record."""
         output: list[str] = []
         offset = 0
 
@@ -282,19 +386,22 @@ class StreamingRedactor:
 
         if self._finalized:
             return ""
+        decoder_tail = self._decoder.decode(b"", final=True)
+        self._decoder.reset()
+        prefix = self._feed_text(decoder_tail)
         self._finalized = True
         if self._discarding:
             self._buffer = ""
             self._discarding = False
             self._pending_cr = False
-            return ""
+            return prefix
         # A trailing CR cannot form a CRLF once finalization starts.  It is an
         # unsafe control character and will not be visible, so retaining it is
         # unnecessary and would needlessly consume pending-line capacity.
         self._pending_cr = False
         result = self._emit_line(self._buffer, terminated=False)
         self._buffer = ""
-        return result
+        return prefix + result
 
 
 def redact_text(
@@ -315,7 +422,7 @@ def redact_text(
 # A concise spelling for producer code that only has one complete string.
 redact = redact_text
 REMOTE_REDACTION_EXTENSION = r'''
-import codecs as _targetctl_codecs, os as _targetctl_os, re as _targetctl_re
+import codecs as _targetctl_codecs, re as _targetctl_re
 _targetctl_ansi=_targetctl_re.compile(r'(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[PX^_][\s\S]*?\x1b\\|\x1b[^\[\]PX^_])')
 _targetctl_unterminated=_targetctl_re.compile(r'\x1b(?:\][\s\S]*|\[[\s\S]*|[PX^_][\s\S]*|[\s\S]?)$')
 _targetctl_url=_targetctl_re.compile(r'\b([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s@]+@')
@@ -325,13 +432,47 @@ _targetctl_token=_targetctl_re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|sk-[A-Z
 _targetctl_ipv6=_targetctl_re.compile(r'(?i)(?<![0-9a-f:])(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:[0-9a-f]{1,4}|::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?)(?![0-9a-f:])')
 _targetctl_ipv4=_targetctl_re.compile(r'(?<![0-9.])(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}(?![0-9.])')
 _targetctl_home=_targetctl_re.compile(r'(?:(?:/home|/Users)/[A-Za-z0-9._-]+(?:/[^\s\x00-\x1f\x7f]*)*|~[A-Za-z0-9._-]*(?:/[^\s\x00-\x1f\x7f]*)*)')
+_targetctl_path_bytes=4096
+_targetctl_path_depth=32
+_targetctl_path_count=2
+_targetctl_additional_count=3
+_targetctl_secret_bytes=_targetctl_path_bytes
+_targetctl_secret_count=_targetctl_path_count*_targetctl_path_depth+_targetctl_additional_count
+_targetctl_secret_aggregate=_targetctl_secret_count*_targetctl_secret_bytes
+def _targetctl_redaction_canaries(paths=(),additional=()):
+    values=set(); aggregate=0; supplied=0
+    def add(candidate,allow_short):
+        nonlocal aggregate
+        if '\n' in candidate or '\r' in candidate: raise ValueError('invalid redaction secrets')
+        size=len(candidate.encode('utf-8'))
+        if size>_targetctl_secret_bytes: raise ValueError('invalid redaction secrets')
+        if candidate and (allow_short or size>=4) and candidate not in values:
+            if len(values)>=_targetctl_secret_count or aggregate+size>_targetctl_secret_aggregate: raise ValueError('invalid redaction secrets')
+            values.add(candidate); aggregate+=size
+    for item in paths:
+        supplied+=1
+        if supplied>_targetctl_path_count or not isinstance(item,str) or not item.isascii() or not item.startswith('/') or item=='/' or item.endswith('/') or '//' in item or '\x00' in item: raise ValueError('invalid redaction secrets')
+        components=item.split('/')[1:]
+        if len(components)>_targetctl_path_depth or any(component in ('','.','..') for component in components): raise ValueError('invalid redaction secrets')
+        add(item,True); add(components[-1],True)
+        for depth in range(len(components)-1,1,-1): add('/'+'/'.join(components[:depth]),True)
+    supplied=0
+    for item in additional:
+        supplied+=1
+        if supplied>_targetctl_additional_count or not isinstance(item,str): raise ValueError('invalid redaction secrets')
+        add(item,False)
+    return tuple(sorted(values,key=lambda value:(-len(value),value)))
 def _targetctl_redactor(secrets):
-    values=set()
+    values=set(); supplied=0; aggregate=0
     for item in secrets:
-        if isinstance(item,str):
-            for candidate in (item,_targetctl_os.path.basename(item)):
-                if 4<=len(candidate.encode('utf-8'))<=512: values.add(candidate)
-    return {'secrets':tuple(sorted(values,key=len,reverse=True)),'buffer':'','discard':False,'out':bytearray(),'full':False,'decoder':_targetctl_codecs.getincrementaldecoder('utf-8')('replace')}
+        supplied+=1
+        if supplied>_targetctl_secret_count or not isinstance(item,str) or '\n' in item or '\r' in item: raise ValueError('invalid redaction secrets')
+        size=len(item.encode('utf-8'))
+        if size>_targetctl_secret_bytes: raise ValueError('invalid redaction secrets')
+        if item and item not in values:
+            if aggregate+size>_targetctl_secret_aggregate: raise ValueError('invalid redaction secrets')
+            values.add(item); aggregate+=size
+    return {'secrets':tuple(sorted(values,key=lambda value:(-len(value),value))),'buffer':'','discard':False,'out':bytearray(),'full':False,'decoder':_targetctl_codecs.getincrementaldecoder('utf-8')('replace')}
 def _targetctl_append(state,text):
     if state['full'] or not text: return
     encoded=text.encode('utf-8'); remaining=1048576-len(state['out'])
@@ -346,6 +487,7 @@ def _targetctl_append(state,text):
     state['full']=True
 def _targetctl_clean(state,text):
     text=_targetctl_ansi.sub('',text); text=_targetctl_unterminated.sub('',text)
+    text=''.join(character for character in text if not (ord(character)<32 or 127<=ord(character)<160))
     for secret in state['secrets']: text=text.replace(secret,'[REDACTED]')
     text=_targetctl_url.sub(r'\1[REDACTED]@',text)
     text=_targetctl_credential.sub('[REDACTED]',text)
@@ -353,8 +495,7 @@ def _targetctl_clean(state,text):
     text=_targetctl_token.sub('[REDACTED]',text)
     text=_targetctl_home.sub('[REDACTED_HOME]',text)
     text=_targetctl_ipv6.sub('[REDACTED_ADDRESS]',text)
-    text=_targetctl_ipv4.sub('[REDACTED_ADDRESS]',text)
-    return ''.join(character for character in text if character=='\n' or not (ord(character)<32 or 127<=ord(character)<160))
+    return _targetctl_ipv4.sub('[REDACTED_ADDRESS]',text)
 def _targetctl_redact_feed(state,chunk,final=False):
     text=state['decoder'].decode(chunk,final)
     for character in text:

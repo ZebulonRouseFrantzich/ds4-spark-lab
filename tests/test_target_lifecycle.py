@@ -49,16 +49,18 @@ def _write_server(path: Path, port: int, secrets: tuple[str, ...] = ()) -> None:
 def _write_server_with_secret(path: Path, port: int, secret: str) -> None:
     """Write a server that prints a secret to stdout."""
     path.write_text(
-        "import http.server, json, sys\n"
+        "import http.server, json, sys, time\n"
         "class H(http.server.BaseHTTPRequestHandler):\n"
         "  def do_GET(self):\n"
         "    if self.path == '/v1/models':\n"
         "      self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(json.dumps({'data':[{'id':'ds4'}]}).encode()); return\n"
         "    self.send_response(404); self.end_headers()\n"
         "  def log_message(self, fmt, *args): pass\n"
-        "half = len(" + repr(secret) + ") // 2\n"
-        "sys.stdout.write(" + repr(secret) + "[:half]); sys.stdout.flush()\n"
-        "sys.stdout.write(" + repr(secret) + "[half:] + '\\n'); sys.stdout.flush()\n"
+        "secret = " + repr(secret.encode("utf-8")) + "\n"
+        "half = len(secret) // 2\n"
+        "sys.stdout.buffer.write(b'producer-prefix ' + secret[:half]); sys.stdout.buffer.flush()\n"
+        "time.sleep(0.1)\n"
+        "sys.stdout.buffer.write(secret[half:] + b' producer-suffix\\n'); sys.stdout.buffer.flush()\n"
         "s = http.server.HTTPServer(('127.0.0.1', " + str(port) + "), H)\n"
         "s.serve_forever()\n",
         encoding="utf-8",
@@ -70,9 +72,12 @@ def _write_build_json(run_dir: Path, work_dir: Path, binary_name: str) -> str:
     binary_path = work_dir / binary_name
     binary_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
     build = {
-        "schema_version": 1, "build_id": "3" * 64,
+        "schema_version": 1, "record_type": "build", "build_id": "3" * 64,
         "source_snapshot_id": "1" * 64, "source_applied_tree_hash": "2" * 64,
-        "binary_sha256": binary_hash, "exit_code": 0, "duration_ns": 1,
+        "binary_sha256": binary_hash, "binary_size": binary_path.stat().st_size,
+        "version": "1.0", "sass": "verified",
+        "build_log_sha256": hashlib.sha256(b"").hexdigest(),
+        "exit_code": 0, "duration_ns": 1,
     }
     for name, data in [("build.json", json.dumps(build).encode("ascii")), ("server.log", b"")]:
         fd = os.open(str(run_dir / name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
@@ -170,10 +175,15 @@ class LifecycleTests(unittest.TestCase):
         binary_hash = hashlib.sha256(server_path.read_bytes()).hexdigest()
         build = {
             "schema_version": 1,
+            "record_type": "build",
             "build_id": "3" * 64,
             "source_snapshot_id": "1" * 64,
             "source_applied_tree_hash": "2" * 64,
             "binary_sha256": binary_hash,
+            "binary_size": server_path.stat().st_size,
+            "version": "1.0",
+            "sass": "verified",
+            "build_log_sha256": hashlib.sha256(b"").hexdigest(),
             "exit_code": 0,
             "duration_ns": 1,
         }
@@ -443,6 +453,26 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse((self.run / "run.json").exists())
         self.assertFalse((self.run / ".targetctl-operation-lock-v1").exists())
 
+    def test_attempt_report_is_not_accepted_as_active_build_manifest(self) -> None:
+        self._setup_work()
+        build_path = self.run / "build.json"
+        build = json.loads(build_path.read_text(encoding="ascii"))
+        build.update({
+            "record_type": "build-attempt",
+            "attempt_id": "9" * 64,
+            "status": "succeeded",
+            "failure_class": None,
+            "command": "make-cuda-spark",
+        })
+        build_path.write_text(json.dumps(build), encoding="ascii")
+        build_path.chmod(0o600)
+
+        with self.assertRaises(TargetError) as ctx:
+            serve(self.config, self.transport, self.runtime, run_id="run-refused-attempt-0001")
+        self.assertEqual(ctx.exception.code, "serve_not_dispatched")
+        self.assertFalse((self.run / "run.json").exists())
+        self.assertFalse((self.run / ".targetctl-operation-lock-v1").exists())
+
     def test_local_lock_contention_is_classified_before_helper_dispatch(self) -> None:
         self._setup_work()
         config = SimpleNamespace(
@@ -593,20 +623,38 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual((self.run / "server.log").read_bytes(), prior_log)
     # ---- Cross-chunk secret redaction in log ------------------------------
 
-    def test_cross_chunk_secret_redaction(self) -> None:
+    def test_cross_chunk_non_home_ancestor_redaction(self) -> None:
         port = self._setup_work()
         server_path = self.work / "server.py"
-        # A tracked work-root canary is split across writes; only 4..512-byte
-        # path/basename secrets are part of the supervisor redaction contract.
-        long_secret = str(self.work)
-        _write_server_with_secret(server_path, port, long_secret)
+        long_secret = (
+            "/mnt/targetctl-private/models/drafter/"
+            + "/".join(f"segment-{index:02d}-" + ("x" * 96) for index in range(6))
+            + "/draft.gguf"
+        )
+        self.assertGreater(len(long_secret), 512)
+        self.assertLessEqual(len(long_secret), 4096)
+        self.runtime = RuntimeInputs(
+            self.runtime.model_path, long_secret,
+            self.runtime.source_snapshot_id, self.runtime.applied_tree_hash,
+            self.runtime.build_id, self.runtime.work_token, self.runtime.run_token,
+            self.runtime.port, binary_path=self.runtime.binary_path,
+        )
+        emitted_ancestor = str(Path(long_secret).parents[2])
+        markers = ("\x1b[31m", "\x00", "\x85", "\x1b[0m")
+        obfuscated_ancestor = "".join(
+            character + (markers[index % len(markers)] if index + 1 < len(emitted_ancestor) else "")
+            for index, character in enumerate(emitted_ancestor)
+        )
+        _write_server_with_secret(server_path, port, obfuscated_ancestor)
         server_path.chmod(0o700)
-        binary_hash = _write_build_json(self.run, self.work, "server.py")
+        _write_build_json(self.run, self.work, "server.py")
         result = serve(self.config, self.transport, self.runtime)
         time.sleep(0.3)
         log_content = logs(self.config, self.transport, self.runtime)
-        # The secret should NOT appear in the log (it was printed to stdout → supervisor log)
-        self.assertNotIn(long_secret.encode(), log_content)
+        self.assertIn(b"[REDACTED]", log_content)
+        self.assertIn(b"producer-prefix [REDACTED] producer-suffix", log_content)
+        for private in (emitted_ancestor, "/mnt/targetctl-private"):
+            self.assertNotIn(private.encode(), log_content)
         stop(self.config, self.transport, self.runtime, run_id=result.run_id)
 
     # ---- Control bytes stripped from log -----------------------------------

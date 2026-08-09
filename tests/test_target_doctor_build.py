@@ -48,6 +48,126 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail(f"descendant {pid} survived process-group termination")
+    @staticmethod
+    def _successful_remote_payload(snapshot: SourceSnapshot) -> dict[str, object]:
+        binary_hash = "c" * 64
+        version = "1.2.3"
+        size = 10
+        return {
+            "status": "succeeded",
+            "failure_class": None,
+            "source_snapshot_id": snapshot.snapshot_id,
+            "source_applied_tree_hash": snapshot.applied_tree_hash,
+            "build_id": build_module._build_id(snapshot, binary_hash, version, size),
+            "binary_sha256": binary_hash,
+            "command": "make-cuda-spark",
+            "version": version,
+            "binary_size": size,
+            "sass": "verified",
+            "build_log_sha256": "d" * 64,
+            "exit_code": 0,
+            "duration_ns": 17,
+        }
+
+    @staticmethod
+    def _reconciliation_payload(
+        result: dict[str, object],
+        attempt_id: str,
+        *,
+        lease_state: str = "released",
+    ) -> dict[str, object]:
+        report = {
+            "schema_version": 1,
+            "record_type": "build-attempt",
+            "attempt_id": attempt_id,
+            **result,
+        }
+        encoded = json.dumps(
+            report, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")
+        return {
+            "report": report,
+            "report_sha256": hashlib.sha256(encoded).hexdigest(),
+            "build_log_sha256": result["build_log_sha256"],
+            "lease_state": lease_state,
+        }
+
+    @staticmethod
+    def _remote_build_config() -> SimpleNamespace:
+        return SimpleNamespace(
+            validate_for=mock.Mock(),
+            mode="ssh",
+            source_root="/controller/source",
+            name="spark",
+            run_dir="/target/run",
+        )
+
+    def _call_remote_build(
+        self,
+        snapshot: SourceSnapshot,
+        side_effect: list[object],
+        attempt_id: str,
+    ) -> tuple[BuildResult, mock.Mock]:
+        transport = mock.Mock(spec=build_module.SSHTransport)
+        transport.run_helper.side_effect = side_effect
+        state = {"run_token": "f" * 64}
+        with (
+            mock.patch.object(build_module, "_validate_snapshot", return_value=snapshot),
+            mock.patch.object(build_module, "_load_capabilities", return_value=state),
+            mock.patch.object(build_module, "_remote_payload", return_value={"entries": []}),
+            mock.patch.object(build_module, "_expect_root_identities"),
+            mock.patch.object(build_module.secrets, "token_hex", return_value=attempt_id),
+        ):
+            result = build_module.build(
+                self._remote_build_config(), transport, snapshot=snapshot, jobs=1,
+            )
+        return result, transport
+
+    @staticmethod
+    def _remote_action_fixture(
+        root: Path,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(
+            helper_source(
+                build_module._SOURCE_EXTENSION
+                + build_module.REMOTE_REDACTION_EXTENSION
+                + build_module.REMOTE_BUILD_EXTENSION
+            ),
+            namespace,
+        )
+        model = root / "models" / "model.gguf"
+        drafter = root / "models" / "draft.gguf"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"model")
+        drafter.write_bytes(b"draft")
+        roots = {
+            "workdir": str(root / "work"),
+            "run_dir": str(root / "run"),
+            "model_path": str(model),
+            "drafter_path": str(drafter),
+        }
+        initialized = namespace["initialize_roots"](roots)  # type: ignore[index,operator]
+        applied_hash = namespace["_frame_hash"]([])  # type: ignore[index,operator]
+        payload = {
+            **roots,
+            "work_token": initialized["work"]["token"],  # type: ignore[index]
+            "run_token": initialized["run"]["token"],  # type: ignore[index]
+            "entries": [],
+            "snapshot_id": "a" * 64,
+            "applied_tree_hash": applied_hash,
+            "dirty": False,
+            "allow_dirty": None,
+            "jobs": 1,
+            "attempt_id": "e" * 64,
+        }
+        lock = namespace["acquire_lock"]({  # type: ignore[index,operator]
+            "run_dir": roots["run_dir"],
+            "run_token": payload["run_token"],
+            "lease_seconds": build_module.BUILD_LOCK_LEASE_SECONDS,
+        })
+        payload["lock_token"] = lock["lock_token"]
+        return namespace, payload, roots
 
     def test_doctor_payload_is_finite_and_contains_no_runtime_input(self) -> None:
         runtime = RuntimeInput("/private/model.gguf", "/private/drafter.gguf", 8123)
@@ -142,6 +262,44 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             result.sass = "missing"  # type: ignore[misc]
 
+    def test_invalid_jobs_fail_before_source_verification_or_remote_calls(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        for jobs in (0, 257, True, "1"):
+            with self.subTest(jobs=jobs):
+                config = self._remote_build_config()
+                transport = mock.Mock(spec=build_module.SSHTransport)
+                with (
+                    mock.patch.object(build_module, "_validate_snapshot") as validate_snapshot,
+                    mock.patch.object(build_module, "_failed", wraps=build_module._failed) as failed,
+                ):
+                    result = build_module.build(
+                        config, transport, snapshot=snapshot, jobs=jobs,  # type: ignore[arg-type]
+                    )
+                failed.assert_called_once_with("build_jobs_invalid", snapshot)
+                validate_snapshot.assert_not_called()
+                transport.run_helper.assert_not_called()
+                self.assertEqual((result.status, result.failure_class), ("failed", "preflight"))
+
+    def test_remote_build_reuses_jobs_normalized_once(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        attempt_id = "e" * 64
+        verified = {"sha256": snapshot.applied_tree_hash, "entry_count": 0}
+        lock = {
+            "lock_token": "c" * 64,
+            "reclaimed": False,
+            "stale_receiver_pairs_cleaned": 0,
+            "stale_lock_stages_cleaned": 0,
+        }
+        with mock.patch.object(build_module, "_jobs", wraps=build_module._jobs) as normalize:
+            result, transport = self._call_remote_build(
+                snapshot,
+                [verified, lock, self._successful_remote_payload(snapshot)],
+                attempt_id,
+            )
+        normalize.assert_called_once_with(1)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(transport.run_helper.call_args_list[2].args[1]["jobs"], 1)
+
     def test_local_attempt_results_retain_sanitized_evidence(self) -> None:
         snapshot = SimpleNamespace(snapshot_id="a" * 64, applied_tree_hash="b" * 64)
         with tempfile.TemporaryDirectory() as temporary:
@@ -228,6 +386,565 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             with self.assertRaisesRegex(TargetError, "build_command_failed"):
                 build_module._remote_result(invalid, snapshot)
 
+    def test_remote_response_loss_reconciles_exact_success_and_failure_evidence(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        attempt_id = "e" * 64
+        verified = {"sha256": snapshot.applied_tree_hash, "entry_count": 0}
+        lock = {
+            "lock_token": "c" * 64,
+            "reclaimed": False,
+            "stale_receiver_pairs_cleaned": 0,
+            "stale_lock_stages_cleaned": 0,
+        }
+        succeeded = self._successful_remote_payload(snapshot)
+        direct, direct_transport = self._call_remote_build(
+            snapshot, [verified, lock, succeeded], attempt_id,
+        )
+        reconciled, lost_transport = self._call_remote_build(
+            snapshot,
+            [
+                verified,
+                lock,
+                TargetError("helper_execution_failed", "target helper failed"),
+                self._reconciliation_payload(succeeded, attempt_id),
+            ],
+            attempt_id,
+        )
+        self.assertEqual(reconciled, direct)
+        failed_payload = {
+            **succeeded,
+            "status": "failed",
+            "failure_class": "command_failed",
+            "build_id": None,
+            "binary_sha256": None,
+            "version": None,
+            "binary_size": None,
+            "sass": None,
+            "exit_code": 2,
+        }
+        failed, _ = self._call_remote_build(
+            snapshot,
+            [
+                verified,
+                lock,
+                TargetError("helper_timeout", "target helper timed out"),
+                self._reconciliation_payload(failed_payload, attempt_id),
+            ],
+            attempt_id,
+        )
+        self.assertEqual(
+            (failed.status, failed.failure_class, failed.exit_code, failed.build_log_sha256),
+            ("failed", "command_failed", 2, succeeded["build_log_sha256"]),
+        )
+        for transport in (direct_transport, lost_transport):
+            actions = [call.args[0] for call in transport.run_helper.call_args_list]
+            self.assertNotIn("release_lock", actions)
+        self.assertEqual(
+            [call.args[0] for call in lost_transport.run_helper.call_args_list],
+            ["source_verify", "acquire_lock", "target_build", "target_build_reconcile"],
+        )
+
+    def test_remote_release_failure_after_persistence_is_reconciled(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        attempt_id = "e" * 64
+        succeeded = self._successful_remote_payload(snapshot)
+        result, transport = self._call_remote_build(
+            snapshot,
+            [
+                {"sha256": snapshot.applied_tree_hash, "entry_count": 0},
+                {
+                    "lock_token": "c" * 64,
+                    "reclaimed": False,
+                    "stale_receiver_pairs_cleaned": 0,
+                    "stale_lock_stages_cleaned": 0,
+                },
+                TargetError("lock_release_failed", "target lock release failed"),
+                self._reconciliation_payload(
+                    succeeded, attempt_id, lease_state="retained",
+                ),
+            ],
+            attempt_id,
+        )
+        self.assertEqual(result.controller_payload(), succeeded)
+        self.assertNotIn(
+            "release_lock",
+            [call.args[0] for call in transport.run_helper.call_args_list],
+        )
+
+    def test_remote_reconciliation_after_reacquisition_rejects_unusable_evidence(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        attempt_id = "e" * 64
+        verified = {"sha256": snapshot.applied_tree_hash, "entry_count": 0}
+        lock = {
+            "lock_token": "c" * 64,
+            "reclaimed": False,
+            "stale_receiver_pairs_cleaned": 0,
+            "stale_lock_stages_cleaned": 0,
+        }
+        for name, reconciliation_code in (
+            ("missing", "build_reconcile_unavailable"),
+            ("malformed-or-prior", "build_reconcile_invalid"),
+        ):
+            with self.subTest(name=name), self.assertRaises(TargetError) as raised:
+                self._call_remote_build(
+                    snapshot,
+                    [
+                        verified,
+                        lock,
+                        TargetError("helper_timeout", "target helper timed out"),
+                        TargetError(reconciliation_code, "target evidence is unusable"),
+                    ],
+                    attempt_id,
+                )
+            self.assertEqual(raised.exception.code, "build_reconciliation_failed")
+
+    def test_response_loss_while_target_activity_is_unknown_retains_lease(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        attempt_id = "e" * 64
+        transport = mock.Mock(spec=build_module.SSHTransport)
+        transport.run_helper.side_effect = [
+            {"sha256": snapshot.applied_tree_hash, "entry_count": 0},
+            {
+                "lock_token": "c" * 64,
+                "reclaimed": False,
+                "stale_receiver_pairs_cleaned": 0,
+                "stale_lock_stages_cleaned": 0,
+            },
+            TargetError("helper_timeout", "target helper timed out"),
+            TargetError("lock_busy", "target lock is active"),
+        ]
+        with (
+            mock.patch.object(build_module, "_validate_snapshot", return_value=snapshot),
+            mock.patch.object(build_module, "_load_capabilities", return_value={"run_token": "f" * 64}),
+            mock.patch.object(build_module, "_remote_payload", return_value={"entries": []}),
+            mock.patch.object(build_module, "_expect_root_identities"),
+            mock.patch.object(build_module.secrets, "token_hex", return_value=attempt_id),
+            self.assertRaises(TargetError) as raised,
+        ):
+            build_module.build(
+                self._remote_build_config(), transport, snapshot=snapshot, jobs=1,
+            )
+        self.assertEqual(raised.exception.code, "build_reconciliation_required")
+        self.assertNotIn(
+            "release_lock",
+            [call.args[0] for call in transport.run_helper.call_args_list],
+        )
+
+    def test_owned_live_lock_retains_unusable_commit_without_strict_loading(self) -> None:
+        prior_commit = json.dumps(
+            {
+                "schema_version": 1,
+                "record_type": "build-attempt-commit",
+                "attempt_id": "9" * 64,
+                "attempt_report_sha256": "c" * 64,
+                "attempt_log_sha256": "d" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        for name, commit_content in (
+            ("missing", None),
+            ("malformed", b'{"attempt_id":'),
+            ("prior-attempt", prior_commit),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+                run_dir = Path(roots["run_dir"])
+                lock_path = run_dir / namespace["LOCK_NAME"]  # type: ignore[index]
+                commit_path = run_dir / namespace["_build_attempt_names"](payload["attempt_id"])[2]  # type: ignore[index,operator]
+                if commit_content is not None:
+                    commit_path.write_bytes(commit_content)
+                original_lock = lock_path.read_bytes()
+                strict_loader = mock.Mock(wraps=namespace["_build_load_commit"])
+                namespace["_build_load_commit"] = strict_loader
+                applied_hash = mock.Mock(
+                    side_effect=AssertionError("source evidence inspected before live ownership"),
+                )
+                namespace["_build_applied_hash"] = applied_hash
+
+                helper_error = namespace["HelperError"]
+                with self.assertRaises(helper_error) as raised:  # type: ignore[arg-type]
+                    namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+
+                self.assertEqual(raised.exception.code, "lock_busy")
+                strict_loader.assert_not_called()
+                applied_hash.assert_not_called()
+                self.assertEqual(lock_path.read_bytes(), original_lock)
+                if commit_content is None:
+                    self.assertFalse(commit_path.exists())
+                else:
+                    self.assertEqual(commit_path.read_bytes(), commit_content)
+
+    def test_response_loss_with_live_second_attempt_does_not_reuse_first_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, first_payload, roots = self._remote_action_fixture(Path(temporary))
+            binary_hash = "c" * 64
+            namespace["_build_make"] = mock.Mock(
+                return_value=(0, 17, b"sanitized build output\n", False, False, False),
+            )
+            namespace["_build_file_hash"] = mock.Mock(return_value=(binary_hash, 10))
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server 1.2.3\n", b"", False, False),
+                (0, b"Function : sm_121\n", b"", False, False),
+            ])
+            first_result = namespace["target_build"](first_payload)  # type: ignore[index,operator]
+            run_dir = Path(roots["run_dir"])
+            lock_path = run_dir / namespace["LOCK_NAME"]  # type: ignore[index]
+            commit_path = run_dir / namespace["_build_attempt_names"](first_payload["attempt_id"])[2]  # type: ignore[index,operator]
+            self.assertFalse(lock_path.exists())
+            self.assertEqual(
+                json.loads(commit_path.read_text(encoding="ascii"))["attempt_id"],
+                first_payload["attempt_id"],
+            )
+
+            snapshot = SourceSnapshot(
+                repositories=(),
+                entries=(),
+                dirty=False,
+                applied_tree_hash=first_payload["applied_tree_hash"],
+                snapshot_id=first_payload["snapshot_id"],
+            )
+            source_payload = {
+                key: first_payload[key]
+                for key in (
+                    "workdir", "run_dir", "model_path", "drafter_path",
+                    "work_token", "run_token", "entries",
+                )
+            }
+            second_attempt_id = "9" * 64
+            second_payload: dict[str, object] = {}
+            helper_error = namespace["HelperError"]
+
+            def response_loss(action: str, payload: dict[str, object], **_: object) -> object:
+                if action == "source_verify":
+                    return {
+                        "sha256": snapshot.applied_tree_hash,
+                        "entry_count": len(snapshot.entries),
+                    }
+                if action == "acquire_lock":
+                    return namespace["acquire_lock"](payload)  # type: ignore[index,operator]
+                if action == "target_build":
+                    second_payload.update(payload)
+                    raise TargetError("helper_timeout", "target helper timed out")
+                if action == "target_build_reconcile":
+                    try:
+                        return namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+                    except helper_error as error:  # type: ignore[misc]
+                        raise TargetError(error.code, error.safe_message) from None
+                self.fail(f"unexpected helper action: {action}")
+
+            transport = build_module.SSHTransport("spark")
+            transport.run_helper = mock.Mock(side_effect=response_loss)  # type: ignore[method-assign]
+            config = self._remote_build_config()
+            config.run_dir = roots["run_dir"]
+            with (
+                mock.patch.object(build_module, "_validate_snapshot", return_value=snapshot),
+                mock.patch.object(
+                    build_module,
+                    "_load_capabilities",
+                    return_value={"run_token": first_payload["run_token"]},
+                ),
+                mock.patch.object(build_module, "_remote_payload", return_value=source_payload),
+                mock.patch.object(build_module, "_expect_root_identities"),
+                mock.patch.object(
+                    build_module.secrets, "token_hex", return_value=second_attempt_id,
+                ),
+                self.assertRaises(TargetError) as raised,
+            ):
+                build_module.build(config, transport, snapshot=snapshot, jobs=1)
+
+            self.assertEqual(raised.exception.code, "build_reconciliation_required")
+            self.assertEqual(second_payload["attempt_id"], second_attempt_id)
+            self.assertTrue(lock_path.is_file())
+            self.assertEqual(
+                json.loads(lock_path.read_text(encoding="ascii"))["token"],
+                second_payload["lock_token"],
+            )
+            self.assertEqual(
+                json.loads(commit_path.read_text(encoding="ascii"))["attempt_id"],
+                first_payload["attempt_id"],
+            )
+            self.assertNotEqual(first_result["build_id"], None)  # type: ignore[index]
+
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server 1.2.3\n", b"", False, False),
+                (0, b"Function : sm_121\n", b"", False, False),
+            ])
+            second_result = namespace["target_build"](second_payload)  # type: ignore[index,operator]
+            self.assertFalse(lock_path.exists())
+            eventual = namespace["target_build_reconcile"](second_payload)  # type: ignore[index,operator]
+            self.assertEqual(eventual["report"]["attempt_id"], second_attempt_id)  # type: ignore[index]
+            self.assertEqual(
+                {key: eventual["report"][key] for key in namespace["_BUILD_RESULT_KEYS"]},  # type: ignore[index]
+                second_result,
+            )
+            self.assertFalse(lock_path.exists())
+
+            stale_payload = dict(second_payload)
+            stale_payload["attempt_id"] = "8" * 64
+            with self.assertRaises(helper_error) as stale:  # type: ignore[arg-type]
+                namespace["target_build_reconcile"](stale_payload)  # type: ignore[index,operator]
+            self.assertEqual(stale.exception.code, "build_reconcile_unavailable")
+            self.assertFalse(lock_path.exists())
+
+            namespace["_build_file_hash"] = mock.Mock(return_value=("f" * 64, 10))
+            with self.assertRaises(helper_error) as injected:  # type: ignore[arg-type]
+                namespace["target_build_reconcile"](second_payload)  # type: ignore[index,operator]
+            self.assertEqual(injected.exception.code, "build_reconcile_invalid")
+            self.assertFalse(lock_path.exists())
+
+    def test_reconciliation_rejects_stale_injected_and_mismatched_reports(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        attempt_id = "e" * 64
+        payload = self._successful_remote_payload(snapshot)
+        valid = self._reconciliation_payload(payload, attempt_id)
+        self.assertEqual(
+            build_module._remote_reconciled_result(valid, snapshot, attempt_id).build_id,
+            payload["build_id"],
+        )
+        malformed: list[dict[str, object]] = []
+        stale = self._reconciliation_payload(payload, "9" * 64)
+        malformed.append(stale)
+        wrong_source_payload = {**payload, "source_snapshot_id": "9" * 64}
+        malformed.append(
+            self._reconciliation_payload(wrong_source_payload, attempt_id),
+        )
+        wrong_binary_payload = {**payload, "binary_sha256": "9" * 64}
+        malformed.append(
+            self._reconciliation_payload(wrong_binary_payload, attempt_id),
+        )
+        wrong_log = self._reconciliation_payload(payload, attempt_id)
+        wrong_log["build_log_sha256"] = "9" * 64
+        malformed.append(wrong_log)
+        injected = self._reconciliation_payload(payload, attempt_id)
+        injected["report"] = {**injected["report"], "private": "/target/private"}  # type: ignore[arg-type]
+        malformed.append(injected)
+        for candidate in malformed:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(TargetError) as raised:
+                    build_module._remote_reconciled_result(
+                        candidate, snapshot, attempt_id,
+                    )
+                self.assertEqual(raised.exception.code, "build_reconciliation_failed")
+
+    def test_target_action_persists_digest_bound_report_before_releasing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+            binary_hash = "c" * 64
+            namespace["_build_make"] = mock.Mock(
+                return_value=(0, 17, b"sanitized build output\n", False, False, False),
+            )
+            namespace["_build_file_hash"] = mock.Mock(return_value=(binary_hash, 10))
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server 1.2.3\n", b"", False, False),
+                (0, b"Function : sm_121\n", b"", False, False),
+            ])
+            direct = namespace["target_build"](payload)  # type: ignore[index,operator]
+            capture_calls = namespace["_build_capture"].call_args_list  # type: ignore[attr-defined,index]
+            self.assertEqual(len(capture_calls), 2)
+            version_call, sass_call = (call.args for call in capture_calls)
+            self.assertEqual(version_call[3], sass_call[3])
+            self.assertIs(version_call[4], sass_call[4])
+            pinned_binary = f"/proc/self/fd/{version_call[3]}/engine/ds4/ds4-server"
+            self.assertEqual(version_call[0], (pinned_binary, "--version"))
+            self.assertEqual(
+                sass_call[0],
+                ("/usr/local/cuda/bin/cuobjdump", "--dump-sass", pinned_binary),
+            )
+            lock_path = Path(roots["run_dir"]) / namespace["LOCK_NAME"]  # type: ignore[index]
+            self.assertFalse(lock_path.exists())
+            run_dir = Path(roots["run_dir"])
+            report_name, attempt_log_name, commit_name = namespace["_build_attempt_names"](payload["attempt_id"])  # type: ignore[index,operator]
+            active_path = run_dir / "build.json"
+            report_path = run_dir / report_name
+            attempt_log_path = run_dir / attempt_log_name
+            commit_path = run_dir / commit_name
+            self.assertTrue(active_path.is_file())
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(attempt_log_path.is_file())
+            self.assertTrue(commit_path.is_file())
+            active = json.loads(active_path.read_text(encoding="ascii"))
+            self.assertEqual(set(active), namespace["_BUILD_ACTIVE_KEYS"])  # type: ignore[index]
+            self.assertEqual(active["record_type"], "build")
+            self.assertNotIn("attempt_id", active)
+            commit = json.loads(commit_path.read_text(encoding="ascii"))
+            self.assertEqual(commit["record_type"], "build-attempt-commit")
+            self.assertEqual(commit["attempt_id"], payload["attempt_id"])
+            self.assertEqual(commit["attempt_report_sha256"], hashlib.sha256(report_path.read_bytes()).hexdigest())
+            self.assertEqual(commit["attempt_log_sha256"], hashlib.sha256(attempt_log_path.read_bytes()).hexdigest())
+            reconciled = namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+            self.assertEqual(
+                {key: reconciled["report"][key] for key in namespace["_BUILD_RESULT_KEYS"]},  # type: ignore[index]
+                direct,
+            )
+            self.assertEqual(reconciled["lease_state"], "released")  # type: ignore[index]
+            self.assertFalse(lock_path.exists())
+
+            payload = dict(payload)
+            payload["attempt_id"] = "9" * 64
+            lock = namespace["acquire_lock"]({  # type: ignore[index,operator]
+                "run_dir": roots["run_dir"],
+                "run_token": payload["run_token"],
+                "lease_seconds": build_module.BUILD_LOCK_LEASE_SECONDS,
+            })
+            payload["lock_token"] = lock["lock_token"]
+            report_name, attempt_log_name, commit_name = namespace["_build_attempt_names"](payload["attempt_id"])  # type: ignore[index,operator]
+            report_path = run_dir / report_name
+            attempt_log_path = run_dir / attempt_log_name
+            commit_path = run_dir / commit_name
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server 1.2.3\n", b"", False, False),
+                (0, b"Function : sm_121\n", b"", False, False),
+            ])
+            release = namespace["_release_lock_at_root"]
+            release_observation: list[tuple[bool, bool, bool]] = []
+
+            def fail_release(*_: object) -> None:
+                release_observation.append((report_path.is_file(), attempt_log_path.is_file(), commit_path.is_file()))
+                raise namespace["HelperError"]("lock_release_failed")  # type: ignore[index,operator]
+
+            namespace["_release_lock_at_root"] = fail_release
+            with self.assertRaises(namespace["HelperError"]):  # type: ignore[arg-type,index]
+                namespace["target_build"](payload)  # type: ignore[index,operator]
+            self.assertEqual(release_observation, [(True, True, True)])
+            self.assertTrue(lock_path.exists())
+            namespace["_release_lock_at_root"] = release
+            recovered = namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+            self.assertEqual(recovered["lease_state"], "released")  # type: ignore[index]
+            self.assertFalse(lock_path.exists())
+
+    def test_target_action_pre_spawn_failure_persists_evidence_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+            kill_group = mock.Mock()
+            namespace["_build_kill_group"] = kill_group
+            release = namespace["_release_lock_at_root"]
+            released_tokens: list[str] = []
+
+            def record_release(*args: object) -> object:
+                released_tokens.append(args[3])  # type: ignore[arg-type]
+                return release(*args)  # type: ignore[operator]
+
+            namespace["_release_lock_at_root"] = record_release
+            with mock.patch.object(
+                namespace["_build_subprocess"],  # type: ignore[arg-type,index]
+                "Popen",
+                side_effect=OSError("private spawn detail"),
+            ):
+                result = namespace["target_build"](payload)  # type: ignore[index,operator]
+
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            self.assertEqual(result["status"], "failed")  # type: ignore[index]
+            self.assertEqual(result["failure_class"], "command_failed")  # type: ignore[index]
+            self.assertEqual(result["command"], "make-cuda-spark")  # type: ignore[index]
+            self.assertIsNone(result["exit_code"])  # type: ignore[index]
+            self.assertEqual(result["build_log_sha256"], empty_hash)  # type: ignore[index]
+            self.assertTrue(
+                all(
+                    result[key] is None  # type: ignore[index]
+                    for key in ("build_id", "binary_sha256", "version", "binary_size", "sass")
+                )
+            )
+            self.assertGreaterEqual(result["duration_ns"], 1)  # type: ignore[index]
+            self.assertLessEqual(result["duration_ns"], 3_630_000_000_000)  # type: ignore[index]
+            run_dir = Path(roots["run_dir"])
+            self.assertEqual((run_dir / "build.log").read_bytes(), b"")
+            report_name, attempt_log_name, commit_name = namespace["_build_attempt_names"](payload["attempt_id"])  # type: ignore[index,operator]
+            report_path = run_dir / report_name
+            report = json.loads(report_path.read_text(encoding="ascii"))
+            self.assertNotIn(
+                "private spawn detail",
+                report_path.read_text(encoding="ascii"),
+            )
+            self.assertEqual(report["record_type"], "build-attempt")
+            self.assertEqual(report["attempt_id"], payload["attempt_id"])
+            self.assertEqual(
+                {key: report[key] for key in namespace["_BUILD_RESULT_KEYS"]},  # type: ignore[index]
+                result,
+            )
+            self.assertEqual((run_dir / attempt_log_name).read_bytes(), b"")
+            self.assertTrue((run_dir / commit_name).is_file())
+            self.assertFalse((run_dir / "build.json").exists())
+            self.assertFalse((run_dir / namespace["LOCK_NAME"]).exists())  # type: ignore[index]
+            self.assertEqual(released_tokens, [payload["lock_token"]])
+            kill_group.assert_not_called()
+
+    def test_failed_later_attempt_reconciles_without_replacing_active_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, first_payload, roots = self._remote_action_fixture(Path(temporary))
+            namespace["_build_make"] = mock.Mock(side_effect=[
+                (0, 17, b"successful build\n", False, False, False),
+                (None, 19, b"", False, False, True),
+            ])
+            namespace["_build_file_hash"] = mock.Mock(return_value=("c" * 64, 10))
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server 1.2.3\n", b"", False, False),
+                (0, b"Function : sm_121\n", b"", False, False),
+            ])
+            first = namespace["target_build"](first_payload)  # type: ignore[index,operator]
+            run_dir = Path(roots["run_dir"])
+            active_path = run_dir / "build.json"
+            active_success = active_path.read_bytes()
+
+            second_payload = dict(first_payload)
+            second_payload["attempt_id"] = "9" * 64
+            lock = namespace["acquire_lock"]({  # type: ignore[index,operator]
+                "run_dir": roots["run_dir"],
+                "run_token": second_payload["run_token"],
+                "lease_seconds": build_module.BUILD_LOCK_LEASE_SECONDS,
+            })
+            second_payload["lock_token"] = lock["lock_token"]
+            second = namespace["target_build"](second_payload)  # type: ignore[index,operator]
+
+            self.assertEqual(first["status"], "succeeded")  # type: ignore[index]
+            self.assertEqual((second["status"], second["failure_class"]), ("failed", "command_failed"))  # type: ignore[index]
+            self.assertEqual(active_path.read_bytes(), active_success)
+            active = json.loads(active_success)
+            self.assertEqual(active["build_id"], first["build_id"])  # type: ignore[index]
+            self.assertNotIn("attempt_id", active)
+            for attempt_id in (first_payload["attempt_id"], second_payload["attempt_id"]):
+                self.assertTrue(all((run_dir / name).is_file() for name in namespace["_build_attempt_names"](attempt_id)))  # type: ignore[index,operator]
+
+            reconciled = namespace["target_build_reconcile"](second_payload)  # type: ignore[index,operator]
+            self.assertEqual(
+                {key: reconciled["report"][key] for key in namespace["_BUILD_RESULT_KEYS"]},  # type: ignore[index]
+                second,
+            )
+            self.assertEqual(active_path.read_bytes(), active_success)
+
+    def test_target_action_post_spawn_group_ambiguity_retains_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+            release = mock.Mock()
+            namespace["_release_lock_at_root"] = release
+
+            def ambiguous_group(
+                cwd: str,
+                jobs: int,
+                private_paths: tuple[str, ...],
+                additional_secrets: tuple[str, ...],
+                activity: dict[str, bool],
+            ) -> tuple[object, ...]:
+                self.assertRegex(cwd, r"\A/proc/self/fd/[0-9]+\Z")
+                self.assertEqual(jobs, payload["jobs"])
+                self.assertEqual(private_paths, (payload["model_path"], payload["drafter_path"]))
+                self.assertEqual(additional_secrets, (payload["workdir"], payload["run_dir"]))
+                self.assertEqual(activity, {"mutation_dispatched": False, "process_groups_gone": True})
+                activity["mutation_dispatched"] = True
+                activity["process_groups_gone"] = False
+                raise namespace["HelperError"]("build_process_unknown")  # type: ignore[index,operator]
+
+            namespace["_build_make"] = mock.Mock(side_effect=ambiguous_group)
+            with self.assertRaises(namespace["HelperError"]) as raised:  # type: ignore[arg-type,index]
+                namespace["target_build"](payload)  # type: ignore[index,operator]
+            self.assertEqual(raised.exception.code, "build_process_unknown")
+            run_dir = Path(roots["run_dir"])
+            self.assertTrue((run_dir / namespace["LOCK_NAME"]).is_file())  # type: ignore[index]
+            release.assert_not_called()
+            self.assertFalse((run_dir / "build.log").exists())
+            self.assertFalse((run_dir / "build.json").exists())
+            self.assertFalse(any(run_dir.glob(".targetctl-build-attempt-v1-*")))
+
     def test_local_build_refuses_uncompleted_lifecycle_before_make(self) -> None:
         snapshot = SimpleNamespace(snapshot_id="a" * 64, applied_tree_hash="b" * 64)
         with tempfile.TemporaryDirectory() as temporary:
@@ -255,31 +972,87 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         namespace: dict[str, object] = {"HelperError": Exception, "_fail": lambda code: (_ for _ in ()).throw(TargetError(code))}
         extension = build_module.REMOTE_REDACTION_EXTENSION + build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
         exec(extension, namespace)
-        code, stdout, stderr, timed_out, oversize = namespace["_build_capture"]((sys.executable, "-c", "import sys; sys.stdout.write('x' * 65536)"), 10, 32)  # type: ignore[operator]
-        self.assertTrue(oversize)
-        self.assertFalse(timed_out)
-        self.assertLessEqual(len(stdout), 32)
-        self.assertLessEqual(len(stderr), 32)
-        self.assertIsInstance(code, int)
-        with tempfile.TemporaryDirectory() as temporary:
-            pid_path = Path(temporary) / "descendant.pid"
-            started = time.monotonic()
-            code, stdout, stderr, timed_out, oversize = namespace["_build_capture"](self._leader_exits_while_descendant_holds_pipes(pid_path), 0.05, 32)  # type: ignore[operator]
-            elapsed = time.monotonic() - started
-            descendant = int(pid_path.read_text(encoding="ascii"))
-            try:
-                self.assertLess(elapsed, 2)
-                self.assertTrue(timed_out)
-                self.assertFalse(oversize)
-                self.assertLessEqual(len(stdout), 32)
-                self.assertLessEqual(len(stderr), 32)
-                self.assertIsInstance(code, int)
-                self.assert_process_not_running(descendant)
-            finally:
+        work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        activity = {"mutation_dispatched": True, "process_groups_gone": True}
+        try:
+            code, stdout, stderr, timed_out, oversize = namespace["_build_capture"]((sys.executable, "-c", "import sys; sys.stdout.write('x' * 65536)"), 10, 32, work_fd, activity)  # type: ignore[operator]
+            self.assertTrue(oversize)
+            self.assertFalse(timed_out)
+            self.assertLessEqual(len(stdout), 32)
+            self.assertLessEqual(len(stderr), 32)
+            self.assertIsInstance(code, int)
+            self.assertTrue(activity["process_groups_gone"])
+            with tempfile.TemporaryDirectory() as temporary:
+                pid_path = Path(temporary) / "descendant.pid"
+                started = time.monotonic()
+                code, stdout, stderr, timed_out, oversize = namespace["_build_capture"](self._leader_exits_while_descendant_holds_pipes(pid_path), 0.05, 32, work_fd, activity)  # type: ignore[operator]
+                elapsed = time.monotonic() - started
+                descendant = int(pid_path.read_text(encoding="ascii"))
                 try:
-                    os.kill(descendant, 9)
-                except ProcessLookupError:
-                    pass
+                    self.assertLess(elapsed, 2)
+                    self.assertTrue(timed_out)
+                    self.assertFalse(oversize)
+                    self.assertLessEqual(len(stdout), 32)
+                    self.assertLessEqual(len(stderr), 32)
+                    self.assertIsInstance(code, int)
+                    self.assertTrue(activity["process_groups_gone"])
+                    self.assert_process_not_running(descendant)
+                finally:
+                    try:
+                        os.kill(descendant, 9)
+                    except ProcessLookupError:
+                        pass
+        finally:
+            os.close(work_fd)
+
+    def test_remote_post_build_captures_inherit_pinned_work_descriptor(self) -> None:
+        namespace: dict[str, object] = {"HelperError": Exception, "_fail": lambda code: (_ for _ in ()).throw(TargetError(code))}
+        extension = build_module.REMOTE_REDACTION_EXTENSION + build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "engine" / "ds4" / "ds4-server"
+            binary.parent.mkdir(parents=True)
+            binary.write_text(
+                f"#!{sys.executable}\nprint('ds4-server 1.2.3')\n",
+                encoding="ascii",
+            )
+            binary.chmod(0o700)
+            work_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            pinned_binary = f"/proc/self/fd/{work_fd}/engine/ds4/ds4-server"
+            activity = {"mutation_dispatched": True, "process_groups_gone": True}
+            real_popen = namespace["_build_subprocess"].Popen  # type: ignore[attr-defined,index]
+            inherited: list[tuple[int, ...]] = []
+
+            def record_popen(*args: object, **kwargs: object) -> object:
+                inherited.append(kwargs["pass_fds"])  # type: ignore[arg-type]
+                return real_popen(*args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    namespace["_build_subprocess"],  # type: ignore[arg-type,index]
+                    "Popen",
+                    side_effect=record_popen,
+                ):
+                    version = namespace["_build_capture"]((pinned_binary, "--version"), 10, 16_384, work_fd, activity)  # type: ignore[operator]
+                    sass = namespace["_build_capture"](
+                        (
+                            sys.executable,
+                            "-c",
+                            "import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes(); print('Function : sm_121')",
+                            pinned_binary,
+                        ),
+                        10,
+                        16_384,
+                        work_fd,
+                        activity,
+                    )  # type: ignore[operator]
+            finally:
+                os.close(work_fd)
+            self.assertEqual(version, (0, b"ds4-server 1.2.3\n", b"", False, False))
+            self.assertEqual(sass, (0, b"Function : sm_121\n", b"", False, False))
+            self.assertEqual(inherited, [(work_fd,), (work_fd,)])
+            self.assertTrue(activity["process_groups_gone"])
 
 
     def test_dirty_snapshot_is_rejected_before_local_nix_work(self) -> None:
@@ -395,3 +1168,118 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                     os.kill(descendant, 9)
                 except ProcessLookupError:
                     pass
+
+    def _persist_remote_success(
+        self,
+        namespace: dict[str, object],
+        payload: dict[str, object],
+    ) -> None:
+        namespace["_build_make"] = mock.Mock(
+            return_value=(0, 17, b"sanitized build output\n", False, False, False),
+        )
+        namespace["_build_file_hash"] = mock.Mock(return_value=("c" * 64, 10))
+        namespace["_build_capture"] = mock.Mock(side_effect=[
+            (0, b"ds4-server 1.2.3\n", b"", False, False),
+            (0, b"Function : sm_121\n", b"", False, False),
+        ])
+        namespace["target_build"](payload)  # type: ignore[index,operator]
+
+    def test_reconciliation_rejects_expiry_or_reclaim_during_validation(self) -> None:
+        for event in ("expiry", "reclaim"):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as temporary:
+                namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+                self._persist_remote_success(namespace, payload)
+                run_dir = Path(roots["run_dir"])
+                lock_path = run_dir / namespace["LOCK_NAME"]  # type: ignore[index]
+                if event == "expiry":
+                    lock = namespace["acquire_lock"]({  # type: ignore[index,operator]
+                        "run_dir": roots["run_dir"],
+                        "run_token": payload["run_token"],
+                        "lease_seconds": build_module.BUILD_RECONCILE_LEASE_SECONDS,
+                    })
+                    payload["lock_token"] = lock["lock_token"]
+                validate = namespace["_build_validate_result"]
+                replacement: dict[str, object] = {}
+
+                def invalidate_lease(*args: object) -> object:
+                    result = validate(*args)  # type: ignore[operator]
+                    state = json.loads(lock_path.read_text(encoding="ascii"))
+                    state["deadline_monotonic_ns"] = time.monotonic_ns() - 1
+                    lock_path.write_text(
+                        json.dumps(state, sort_keys=True, separators=(",", ":")),
+                        encoding="ascii",
+                    )
+                    if event == "reclaim":
+                        replacement.update(namespace["acquire_lock"]({  # type: ignore[index,operator]
+                            "run_dir": roots["run_dir"],
+                            "run_token": payload["run_token"],
+                            "lease_seconds": build_module.BUILD_RECONCILE_LEASE_SECONDS,
+                        }))
+                    return result
+
+                namespace["_build_validate_result"] = invalidate_lease
+                helper_error = namespace["HelperError"]
+                with self.assertRaises(helper_error) as raised:  # type: ignore[arg-type]
+                    namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+                self.assertEqual(raised.exception.code, "build_reconcile_invalid")
+                retained = json.loads(lock_path.read_text(encoding="ascii"))
+                expected_token = (
+                    payload["lock_token"]
+                    if event == "expiry"
+                    else replacement["lock_token"]
+                )
+                self.assertEqual(retained["token"], expected_token)
+
+    def test_reconciliation_release_failure_requires_exact_live_ownership(self) -> None:
+        self.assertGreater(
+            build_module.BUILD_LOCK_LEASE_SECONDS,
+            build_module.BUILD_TIMEOUT_SECONDS
+            + 30.0
+            + build_module.BUILD_RECONCILE_TIMEOUT_SECONDS,
+        )
+        self.assertGreater(
+            build_module.BUILD_RECONCILE_LEASE_SECONDS,
+            build_module.BUILD_RECONCILE_TIMEOUT_SECONDS,
+        )
+        for event in ("exact-live", "replaced"):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as temporary:
+                namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+                self._persist_remote_success(namespace, payload)
+                run_dir = Path(roots["run_dir"])
+                lock_path = run_dir / namespace["LOCK_NAME"]  # type: ignore[index]
+                replacement: dict[str, object] = {}
+                released_token: list[str] = []
+
+                def fail_release(*args: object) -> None:
+                    released_token.append(args[3])  # type: ignore[arg-type]
+                    if event == "replaced" and not replacement:
+                        state = json.loads(lock_path.read_text(encoding="ascii"))
+                        state["deadline_monotonic_ns"] = time.monotonic_ns() - 1
+                        lock_path.write_text(
+                            json.dumps(state, sort_keys=True, separators=(",", ":")),
+                            encoding="ascii",
+                        )
+                        replacement.update(namespace["acquire_lock"]({  # type: ignore[index,operator]
+                            "run_dir": roots["run_dir"],
+                            "run_token": payload["run_token"],
+                            "lease_seconds": build_module.BUILD_RECONCILE_LEASE_SECONDS,
+                        }))
+                    raise namespace["HelperError"]("lock_release_failed")  # type: ignore[index,operator]
+
+                namespace["_release_lock_at_root"] = fail_release
+                if event == "exact-live":
+                    reconciled = namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+                    self.assertEqual(reconciled["lease_state"], "retained")
+                    state = json.loads(lock_path.read_text(encoding="ascii"))
+                    self.assertEqual(state["token"], released_token[0])
+                    self.assertGreater(
+                        state["deadline_monotonic_ns"],
+                        time.monotonic_ns(),
+                    )
+                else:
+                    helper_error = namespace["HelperError"]
+                    with self.assertRaises(helper_error) as raised:  # type: ignore[arg-type]
+                        namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+                    self.assertEqual(raised.exception.code, "build_reconcile_invalid")
+                    state = json.loads(lock_path.read_text(encoding="ascii"))
+                    self.assertEqual(state["token"], replacement["lock_token"])

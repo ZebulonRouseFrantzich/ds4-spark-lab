@@ -917,14 +917,21 @@ def _source_validate_runtime_paths(paths, work_fd, run_fd):
     finally:
         for parent_fd, fd, _, _ in opened:
             os.close(fd); os.close(parent_fd)
-def _source_receiver_program(run_dir, auth_name):
-    return """#!/usr/bin/python3
-import hashlib, hmac, json, os, stat, sys, time
+def _source_receiver_program(run_dir, auth_name, report_name):
+    return """#!/usr/bin/python3 -I
+import sys
+if not sys.flags.isolated or not getattr(sys.flags, "safe_path", False):
+    raise SystemExit(126)
+import errno, hashlib, hmac, json, os, signal, stat, time
 RUN = %r
 AUTH = %r
+REPORT = %r
+PROGRAM = AUTH[:-5] + ".py"
 MARKER = ".targetctl-owner-v1-work.json"
 LOCK = ".targetctl-operation-lock-v1"
 EXPECTED_PREFIX = ["--server", "-tprxe.iLsfxCIvu", "--delete-excluded", "."]
+child_pid = 0
+forwarded_signal = 0
 def fail():
     raise SystemExit(126)
 def dopen(path):
@@ -936,28 +943,69 @@ def dopen(path):
         return fd
     except OSError:
         os.close(fd); fail()
-def regular(fd, name):
+def regular(fd, name, mode):
     try:
         out = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
         info = os.fstat(out)
-    except OSError: fail()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+    except OSError:
+        fail()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != mode:
         os.close(out); fail()
-    return out
-def contents(fd, name, limit=65536):
-    out = regular(fd, name)
+    return out, info
+def read_fd(fd, limit):
     try:
-        data = os.read(out, limit + 1)
-        if len(data) > limit: fail()
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, limit + 1)
+        if len(data) > limit or os.read(fd, 1):
+            fail()
         return data
-    finally: os.close(out)
-def root(path, kind, token, identity):
+    except OSError:
+        fail()
+def same_named(fd, name, info):
+    try:
+        live = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        fail()
+    if (live.st_dev, live.st_ino, live.st_uid, stat.S_IFMT(live.st_mode), stat.S_IMODE(live.st_mode)) != (info.st_dev, info.st_ino, info.st_uid, stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode)):
+        fail()
+def expected_identity(value):
+    if (not isinstance(value, dict) or set(value) != {"device", "inode"} or
+        not all(isinstance(value[key], int) and not isinstance(value[key], bool) and value[key] >= 0 for key in ("device", "inode"))):
+        fail()
+    return value
+def identity(info):
+    return {"device": info.st_dev, "inode": info.st_ino}
+def rewrite(fd, name, info, value):
+    data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    try:
+        out = os.open(name, os.O_WRONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
+        current = os.fstat(out)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            os.close(out); fail()
+        os.ftruncate(out, 0)
+        view = memoryview(data)
+        while view:
+            written = os.write(out, view)
+            if written <= 0:
+                os.close(out); fail()
+            view = view[written:]
+        os.fsync(out); os.close(out)
+        same_named(fd, name, info); os.fsync(fd)
+    except OSError:
+        fail()
+def root(path, kind, token, expected):
     fd = dopen(path); info = os.fstat(fd)
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700 or
-        (info.st_dev, info.st_ino) != (identity["device"], identity["inode"])): os.close(fd); fail()
-    try: marker = json.loads(contents(fd, ".targetctl-owner-v1-" + kind + ".json", 4096).decode("ascii"))
-    except Exception: os.close(fd); fail()
-    if not isinstance(marker, dict) or marker.get("kind") != kind or marker.get("version") != 1 or not hmac.compare_digest(marker.get("token", ""), token): os.close(fd); fail()
+        identity(info) != expected):
+        os.close(fd); fail()
+    marker_fd, _ = regular(fd, ".targetctl-owner-v1-" + kind + ".json", 0o600)
+    try:
+        marker = json.loads(read_fd(marker_fd, 4096).decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        os.close(marker_fd); os.close(fd); fail()
+    os.close(marker_fd)
+    if not isinstance(marker, dict) or marker.get("kind") != kind or marker.get("version") != 1 or not hmac.compare_digest(marker.get("token", ""), token):
+        os.close(fd); fail()
     return fd
 def mount_path(value):
     decoded = []
@@ -965,7 +1013,8 @@ def mount_path(value):
     while index < len(value):
         if value[index] != "\\\\":
             decoded.append(value[index]); index += 1; continue
-        if index + 3 >= len(value) or any(bit not in "01234567" for bit in value[index + 1:index + 4]): fail()
+        if index + 3 >= len(value) or any(bit not in "01234567" for bit in value[index + 1:index + 4]):
+            fail()
         decoded.append(chr(int(value[index + 1:index + 4], 8))); index += 4
     return "".join(decoded)
 def no_nested_mounts(fd):
@@ -974,75 +1023,316 @@ def no_nested_mounts(fd):
         pinned = os.fstat(fd)
         live = os.stat(path)
         if (not path.startswith("/") or path.endswith(" (deleted)") or
-            (pinned.st_dev, pinned.st_ino) != (live.st_dev, live.st_ino)): fail()
+            (pinned.st_dev, pinned.st_ino) != (live.st_dev, live.st_ino)):
+            fail()
         prefix = path.rstrip("/") + "/"
         with open("/proc/self/mountinfo", "rt", encoding="ascii", errors="strict") as mounts:
             for line in mounts:
                 fields = line.split()
-                if len(fields) <= 4: fail()
-                if mount_path(fields[4]).startswith(prefix): fail()
-    except OSError: fail()
-run_fd = dopen(RUN)
-try:
-    raw = contents(run_fd, AUTH)
-    auth = json.loads(raw.decode("ascii"))
-    if not isinstance(auth, dict) or set(auth) != {"workdir","work_token","run_token","work_identity","run_identity","lock_token","lock_boot_id","lock_deadline_monotonic_ns"}: fail()
-    run_info = os.fstat(run_fd)
-    if (not stat.S_ISDIR(run_info.st_mode) or run_info.st_uid != os.geteuid() or stat.S_IMODE(run_info.st_mode) != 0o700 or
-        (run_info.st_dev, run_info.st_ino) != (auth["run_identity"]["device"], auth["run_identity"]["inode"])): fail()
-    marker = json.loads(contents(run_fd, ".targetctl-owner-v1-run.json", 4096).decode("ascii"))
-    if not isinstance(marker, dict) or marker.get("kind") != "run" or marker.get("version") != 1 or not hmac.compare_digest(marker.get("token", ""), auth["run_token"]): fail()
-    lock_fd = os.open(LOCK, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=run_fd)
+                if len(fields) <= 4:
+                    fail()
+                if mount_path(fields[4]).startswith(prefix):
+                    fail()
+    except OSError:
+        fail()
+def lock_value(fd):
     try:
-        lock_info = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.geteuid() or stat.S_IMODE(lock_info.st_mode) != 0o600: fail()
+        value = json.loads(read_fd(fd, 1024).decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        fail()
+    if (not isinstance(value, dict) or set(value) != {"boot_id", "deadline_monotonic_ns", "token"} or
+        not isinstance(value.get("boot_id"), str) or
+        not isinstance(value.get("deadline_monotonic_ns"), int) or isinstance(value.get("deadline_monotonic_ns"), bool) or
+        not isinstance(value.get("token"), str)):
+        fail()
+    return value
+def boot_id():
+    try:
+        value = open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii", errors="strict").read(64).strip()
+    except (OSError, UnicodeError):
+        fail()
+    return value
+def valid_lock(value, auth):
+    if (not hmac.compare_digest(value["token"], auth["lock_token"]) or
+        not hmac.compare_digest(value["boot_id"], auth["lock_boot_id"]) or
+        value["deadline_monotonic_ns"] != auth["lock_deadline_monotonic_ns"] or
+        not hmac.compare_digest(value["boot_id"], boot_id())):
+        fail()
+def scan_work(fd):
+    no_nested_mounts(fd)
+    root_dev = os.fstat(fd).st_dev
+    seen = [0]
+    def scan(current):
         try:
-            raw_lock = os.read(lock_fd, 1025)
-            if len(raw_lock) > 1024: fail()
-            lock = json.loads(raw_lock.decode("ascii"))
-            boot = open("/proc/sys/kernel/random/boot_id", "rt", encoding="ascii").read(64).strip()
-        except Exception: fail()
-        if (not isinstance(lock, dict) or set(lock) != {"boot_id","deadline_monotonic_ns","token"} or
-            not isinstance(lock.get("deadline_monotonic_ns"), int) or isinstance(lock.get("deadline_monotonic_ns"), bool) or
-            not isinstance(lock.get("boot_id"), str) or not hmac.compare_digest(lock.get("token", ""), auth["lock_token"]) or
-            not hmac.compare_digest(lock["boot_id"], auth["lock_boot_id"]) or lock["deadline_monotonic_ns"] != auth["lock_deadline_monotonic_ns"] or
-            not hmac.compare_digest(boot, lock["boot_id"]) or time.monotonic_ns() >= lock["deadline_monotonic_ns"]): fail()
-    finally: os.close(lock_fd)
-    work_fd = root(auth["workdir"], "work", auth["work_token"], auth["work_identity"])
-    try:
-        no_nested_mounts(work_fd)
-        root_dev = os.fstat(work_fd).st_dev
-        seen = [0]
-        def scan(fd):
-            with os.scandir(os.dup(fd)) as children:
+            with os.scandir(os.dup(current)) as children:
                 for child in children:
                     seen[0] += 1
-                    if seen[0] > 100000: fail()
+                    if seen[0] > 100000:
+                        fail()
                     item = child.stat(follow_symlinks=False)
-                    if not (stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode)) or item.st_dev != root_dev: fail()
+                    if not (stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode)) or item.st_dev != root_dev:
+                        fail()
                     if stat.S_ISDIR(item.st_mode):
-                        next_fd = os.open(child.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
-                        try: scan(next_fd)
-                        finally: os.close(next_fd)
-        scan(work_fd)
+                        next_fd = os.open(child.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=current)
+                        try:
+                            scan(next_fd)
+                        finally:
+                            os.close(next_fd)
+        except OSError:
+            fail()
+    scan(fd)
+def forward(signum, frame):
+    global forwarded_signal
+    if not forwarded_signal:
+        forwarded_signal = signum
+    if child_pid:
+        try:
+            os.killpg(child_pid, signum)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            fail()
+def group_gone(group):
+    try:
+        os.killpg(group, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+def finish_group(group):
+    if group_gone(group):
+        return True
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, signum)
+        except ProcessLookupError:
+            return True
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if group_gone(group):
+                return True
+            time.sleep(0.02)
+    return group_gone(group)
+def wait_code(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 125
+def main():
+    global child_pid
+    if sys.argv[0] != RUN + "/" + PROGRAM:
+        fail()
+    run_fd = dopen(RUN)
+    auth_fd = lock_fd = work_fd = program_fd = -1
+    try:
+        auth_fd, auth_info = regular(run_fd, AUTH, 0o600)
+        raw_auth = read_fd(auth_fd, 65536)
+        try:
+            auth = json.loads(raw_auth.decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            fail()
+        required = {"workdir","work_token","run_token","work_identity","run_identity","lock_token","lock_boot_id","lock_deadline_monotonic_ns","receiver_nonce","snapshot_id","applied_tree_hash"}
+        if not isinstance(auth, dict) or set(auth) != required:
+            fail()
+        for key in ("lock_token", "snapshot_id", "applied_tree_hash"):
+            if not isinstance(auth[key], str) or len(auth[key]) != 64 or any(character not in "0123456789abcdef" for character in auth[key]):
+                fail()
+        if (not isinstance(auth["receiver_nonce"], str) or len(auth["receiver_nonce"]) != 32 or
+            any(character not in "0123456789abcdef" for character in auth["receiver_nonce"]) or
+            REPORT != ".targetctl-source-receiver-" + auth["receiver_nonce"] + ".report.json"):
+            fail()
+        work_identity = expected_identity(auth["work_identity"])
+        run_identity = expected_identity(auth["run_identity"])
+        run_info = os.fstat(run_fd)
+        if (not stat.S_ISDIR(run_info.st_mode) or run_info.st_uid != os.geteuid() or stat.S_IMODE(run_info.st_mode) != 0o700 or
+            identity(run_info) != run_identity):
+            fail()
+        run_marker = root(RUN, "run", auth["run_token"], run_identity)
+        os.close(run_marker)
+        program_fd, program_info = regular(run_fd, PROGRAM, 0o700)
+        lock_fd, lock_info = regular(run_fd, LOCK, 0o600)
+        lock = lock_value(lock_fd)
+        valid_lock(lock, auth)
+        if time.monotonic_ns() >= lock["deadline_monotonic_ns"]:
+            fail()
+        work_fd = root(auth["workdir"], "work", auth["work_token"], work_identity)
+        scan_work(work_fd)
         args = sys.argv[1:]
-        if args != EXPECTED_PREFIX + [auth["workdir"] + "/"]: fail()
-        args[-1] = "."
-        os.unlink(AUTH, dir_fd=run_fd)
-        os.unlink(sys.argv[0])
-        os.fchdir(work_fd)
-        os.execve("/usr/bin/rsync", ["/usr/bin/rsync", *args], {"LANG":"C","LC_ALL":"C","PATH":"/usr/bin:/bin"})
-    finally: os.close(work_fd)
-finally: os.close(run_fd)
-""" % (run_dir, auth_name)
+        if args != EXPECTED_PREFIX + [auth["workdir"] + "/"]:
+            fail()
+        owned = dict(auth)
+        owned.update({"phase": "owned", "owner_pid": os.getpid(), "authority_sha256": hashlib.sha256(raw_auth).hexdigest()})
+        rewrite(run_fd, AUTH, auth_info, owned)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, forward)
+        child_pid = os.fork()
+        if child_pid == 0:
+            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                signal.signal(signum, signal.SIG_DFL)
+            os.setpgid(0, 0)
+            os.fchdir(work_fd)
+            args[-1] = "."
+            os.execve("/usr/bin/rsync", ["/usr/bin/rsync", *args], {"LANG":"C","LC_ALL":"C","PATH":"/usr/bin:/bin"})
+            os._exit(126)
+        try:
+            os.setpgid(child_pid, child_pid)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.ESRCH):
+                fail()
+        owned.update({"phase": "running", "child_pid": child_pid, "child_group": child_pid})
+        rewrite(run_fd, AUTH, auth_info, owned)
+        if forwarded_signal:
+            try:
+                os.killpg(child_pid, forwarded_signal)
+            except ProcessLookupError:
+                pass
+        while True:
+            try:
+                waited, status = os.waitpid(child_pid, 0)
+                if waited == child_pid:
+                    break
+            except InterruptedError:
+                continue
+        code = wait_code(status)
+        if not finish_group(child_pid):
+            fail()
+        child_pid = 0
+        if identity(os.fstat(run_fd)) != run_identity or identity(os.fstat(work_fd)) != work_identity:
+            fail()
+        confirm_run = root(RUN, "run", auth["run_token"], run_identity)
+        os.close(confirm_run)
+        confirm_work = root(auth["workdir"], "work", auth["work_token"], work_identity)
+        os.close(confirm_work)
+        scan_work(work_fd)
+        same_named(run_fd, LOCK, lock_info)
+        valid_lock(lock_value(lock_fd), auth)
+        report = {
+            "schema_version": 1,
+            "kind": "source_receiver_postflight",
+            "receiver_nonce": auth["receiver_nonce"],
+            "snapshot_id": auth["snapshot_id"],
+            "applied_tree_hash": auth["applied_tree_hash"],
+            "work": work_identity,
+            "run": run_identity,
+            "child_pid": waited,
+            "child_exit_code": code,
+            "child_group_gone": True,
+        }
+        report_data = json.dumps(report, sort_keys=True, separators=(",", ":")).encode("ascii")
+        try:
+            report_fd = os.open(REPORT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=run_fd)
+            view = memoryview(report_data)
+            while view:
+                written = os.write(report_fd, view)
+                if written <= 0:
+                    os.close(report_fd); fail()
+                view = view[written:]
+            os.fsync(report_fd); os.close(report_fd); os.fsync(run_fd)
+        except OSError:
+            fail()
+        same_named(run_fd, AUTH, auth_info)
+        same_named(run_fd, PROGRAM, program_info)
+        try:
+            os.unlink(AUTH, dir_fd=run_fd)
+            os.unlink(PROGRAM, dir_fd=run_fd)
+            os.fsync(run_fd)
+        except OSError:
+            fail()
+        same_named(run_fd, LOCK, lock_info)
+        valid_lock(lock_value(lock_fd), auth)
+        try:
+            os.unlink(LOCK, dir_fd=run_fd)
+            os.fsync(run_fd)
+        except OSError:
+            fail()
+        return code
+    finally:
+        for fd in (program_fd, work_fd, lock_fd, auth_fd, run_fd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+try:
+    raise SystemExit(main())
+except SystemExit:
+    raise
+except BaseException:
+    raise SystemExit(126)
+""" % (run_dir, auth_name, report_name)
+
+def _source_report_identity(value):
+    if (not isinstance(value, dict) or set(value) != {"device", "inode"} or
+            any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
+                for key in ("device", "inode"))):
+        _fail("unsafe_state")
+    return {"device": value["device"], "inode": value["inode"]}
+
+
+def _source_cleanup_stale_postflights(run_fd, work_identity, run_identity):
+    prefix = ".targetctl-source-receiver-"
+    suffix_text = ".report.json"
+    records = []
+    try:
+        with os.scandir(os.dup(run_fd)) as children:
+            for count, child in enumerate(children, start=1):
+                if count > MAX_ENTRIES:
+                    _fail("unsafe_state")
+                name = child.name
+                if not name.startswith(prefix) or not name.endswith(suffix_text):
+                    continue
+                nonce = name[len(prefix):-len(suffix_text)]
+                if len(nonce) != 32 or any(character not in "0123456789abcdef" for character in nonce):
+                    continue
+                fd, item = _open_regular(name, dir_fd=run_fd)
+                try:
+                    if item.st_size > 65536:
+                        _fail("unsafe_state")
+                    raw = os.read(fd, 65537)
+                    if len(raw) != item.st_size:
+                        _fail("unsafe_state")
+                    try:
+                        report = json.loads(raw.decode("ascii"))
+                    except (UnicodeDecodeError, ValueError):
+                        _fail("unsafe_state")
+                    fields = {"schema_version", "kind", "receiver_nonce", "snapshot_id", "applied_tree_hash", "work", "run", "child_pid", "child_exit_code", "child_group_gone"}
+                    if (not isinstance(report, dict) or set(report) != fields or
+                        report["schema_version"] != 1 or report["kind"] != "source_receiver_postflight" or
+                        report["receiver_nonce"] != nonce or
+                        _source_report_identity(report["work"]) != work_identity or
+                        _source_report_identity(report["run"]) != run_identity or
+                        any(not isinstance(report[key], str) or len(report[key]) != 64 or
+                            any(character not in "0123456789abcdef" for character in report[key])
+                            for key in ("snapshot_id", "applied_tree_hash")) or
+                        not isinstance(report["child_pid"], int) or isinstance(report["child_pid"], bool) or report["child_pid"] <= 0 or
+                        not isinstance(report["child_exit_code"], int) or isinstance(report["child_exit_code"], bool) or
+                        report["child_group_gone"] is not True):
+                        _fail("unsafe_state")
+                    records.append((name, _identity(fd)))
+                finally:
+                    os.close(fd)
+        for name, report_identity in records:
+            _assert_named_identity(run_fd, name, report_identity, "unsafe_state")
+            os.unlink(name, dir_fd=run_fd)
+        if records:
+            os.fsync(run_fd)
+    except HelperError:
+        raise
+    except OSError:
+        _fail("unsafe_state")
 
 @register_action("source_prepare_receiver")
 def source_prepare_receiver(payload):
-    data = _require_object(payload, {"workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token", "entries", "lock_token", "receiver_nonce"})
+    data = _require_object(payload, {"workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token", "entries", "lock_token", "receiver_nonce", "snapshot_id", "applied_tree_hash"})
     paths = _root_payload({key: data[key] for key in ("workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token")}, require_tokens=True)
     if (not isinstance(data["lock_token"], str) or len(data["lock_token"]) != 64 or
         not isinstance(data["receiver_nonce"], str) or len(data["receiver_nonce"]) != 32 or
-        any(character not in "0123456789abcdef" for character in data["receiver_nonce"])):
+        any(character not in "0123456789abcdef" for character in data["receiver_nonce"]) or
+        any(not isinstance(data[key], str) or len(data[key]) != 64 or
+            any(character not in "0123456789abcdef" for character in data[key])
+            for key in ("snapshot_id", "applied_tree_hash"))):
         _fail("unsafe_lock")
     work_fd, run_fd, work_identity, run_identity = _source_open(paths)
     try:
@@ -1062,15 +1352,22 @@ def source_prepare_receiver(payload):
                     not hmac.compare_digest(lock_state["boot_id"], _boot_id()) or
                     time.monotonic_ns() >= lock_state["deadline_monotonic_ns"]):
                 _fail("unsafe_lock")
+            _source_cleanup_stale_postflights(run_fd, work_identity, run_identity)
+            lock_state = _lock_state(lock_fd)
+            if (not hmac.compare_digest(lock_state["token"], data["lock_token"]) or
+                    not hmac.compare_digest(lock_state["boot_id"], _boot_id()) or
+                    time.monotonic_ns() >= lock_state["deadline_monotonic_ns"]):
+                _fail("unsafe_lock")
         finally:
             os.close(lock_fd)
         suffix = data["receiver_nonce"]
         auth_name = ".targetctl-source-receiver-" + suffix + ".json"
         receiver_name = ".targetctl-source-receiver-" + suffix + ".py"
-        auth = json.dumps({"workdir": paths["workdir"], "work_token": paths["work_token"], "run_token": paths["run_token"], "work_identity": work_identity, "run_identity": run_identity, "lock_token": data["lock_token"], "lock_boot_id": lock_state["boot_id"], "lock_deadline_monotonic_ns": lock_state["deadline_monotonic_ns"]}, sort_keys=True, separators=(",", ":")).encode("ascii")
+        report_name = ".targetctl-source-receiver-" + suffix + ".report.json"
+        auth = json.dumps({"workdir": paths["workdir"], "work_token": paths["work_token"], "run_token": paths["run_token"], "work_identity": work_identity, "run_identity": run_identity, "lock_token": data["lock_token"], "lock_boot_id": lock_state["boot_id"], "lock_deadline_monotonic_ns": lock_state["deadline_monotonic_ns"], "receiver_nonce": suffix, "snapshot_id": data["snapshot_id"], "applied_tree_hash": data["applied_tree_hash"]}, sort_keys=True, separators=(",", ":")).encode("ascii")
         created = []
         try:
-            for name, content, mode in ((auth_name, auth, 0o600), (receiver_name, _source_receiver_program(paths["run_dir"], auth_name).encode("ascii"), 0o700)):
+            for name, content, mode in ((auth_name, auth, 0o600), (receiver_name, _source_receiver_program(paths["run_dir"], auth_name, report_name).encode("ascii"), 0o700)):
                 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), mode, dir_fd=run_fd)
                 created.append(name)
                 try:
@@ -1113,13 +1410,105 @@ def source_cleanup_receiver(payload):
     try:
         _root_identity(run_fd, "run", data["run_token"])
         stem = ".targetctl-source-receiver-" + suffix
-        for leaf in (stem + ".py", stem + ".json"):
+        for leaf in (stem + ".py", stem + ".json", stem + ".report.json"):
             try: os.unlink(leaf, dir_fd=run_fd)
             except FileNotFoundError: pass
             except OSError: _fail("unsafe_state")
         os.fsync(run_fd)
         return {"cleaned": True}
     finally: os.close(run_fd)
+
+def _source_postflight_payload(payload):
+    fields = {"workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token", "entries", "receiver", "snapshot_id", "applied_tree_hash"}
+    data = _require_object(payload, fields)
+    paths = _root_payload({key: data[key] for key in ("workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token")}, require_tokens=True)
+    prefix = paths["run_dir"] + "/.targetctl-source-receiver-"
+    receiver = data["receiver"]
+    if not isinstance(receiver, str) or not receiver.startswith(prefix) or not receiver.endswith(".py"):
+        _fail("invalid_payload")
+    suffix = receiver[len(prefix):-3]
+    if (len(suffix) != 32 or any(character not in "0123456789abcdef" for character in suffix) or
+        any(not isinstance(data[key], str) or len(data[key]) != 64 or
+            any(character not in "0123456789abcdef" for character in data[key])
+            for key in ("snapshot_id", "applied_tree_hash"))):
+        _fail("invalid_payload")
+    return data, paths, suffix
+
+
+def _source_read_postflight(run_fd, data, suffix, work_identity, run_identity):
+    report_name = ".targetctl-source-receiver-" + suffix + ".report.json"
+    report_fd, report_item = _open_regular(report_name, dir_fd=run_fd)
+    try:
+        if report_item.st_size > 65536:
+            _fail("unsafe_state")
+        raw = os.read(report_fd, 65537)
+        if len(raw) != report_item.st_size:
+            _fail("unsafe_state")
+        try:
+            report = json.loads(raw.decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            _fail("unsafe_state")
+        fields = {"schema_version", "kind", "receiver_nonce", "snapshot_id", "applied_tree_hash", "work", "run", "child_pid", "child_exit_code", "child_group_gone"}
+        if (not isinstance(report, dict) or set(report) != fields or
+            report["schema_version"] != 1 or report["kind"] != "source_receiver_postflight" or
+            report["receiver_nonce"] != suffix or report["snapshot_id"] != data["snapshot_id"] or
+            report["applied_tree_hash"] != data["applied_tree_hash"] or
+            _source_report_identity(report["work"]) != work_identity or
+            _source_report_identity(report["run"]) != run_identity or
+            not isinstance(report["child_pid"], int) or isinstance(report["child_pid"], bool) or report["child_pid"] <= 0 or
+            not isinstance(report["child_exit_code"], int) or isinstance(report["child_exit_code"], bool) or report["child_exit_code"] != 0 or
+            report["child_group_gone"] is not True):
+            _fail("unsafe_state")
+        report_identity = _identity(report_fd)
+        _assert_named_identity(run_fd, report_name, report_identity, "unsafe_state")
+        stem = ".targetctl-source-receiver-" + suffix
+        for leaf in (stem + ".py", stem + ".json"):
+            try:
+                os.stat(leaf, dir_fd=run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                _fail("unsafe_state")
+            _fail("unsafe_state")
+        return report_name, report_identity
+    finally:
+        os.close(report_fd)
+
+
+@register_action("source_receiver_postflight")
+def source_receiver_postflight(payload):
+    data, paths, suffix = _source_postflight_payload(payload)
+    work_fd, run_fd, work_identity, run_identity = _source_open(paths)
+    try:
+        _source_read_postflight(run_fd, data, suffix, work_identity, run_identity)
+        _assert_pinned_root(work_fd, work_identity)
+        _assert_pinned_root(run_fd, run_identity)
+        _read_marker(work_fd, "work", paths["work_token"])
+        _read_marker(run_fd, "run", paths["run_token"])
+        return {"work": work_identity, "run": run_identity}
+    finally:
+        os.close(work_fd); os.close(run_fd)
+
+
+@register_action("source_complete_receiver")
+def source_complete_receiver(payload):
+    data, paths, suffix = _source_postflight_payload(payload)
+    work_fd, run_fd, work_identity, run_identity = _source_open(paths)
+    try:
+        report_name, report_identity = _source_read_postflight(run_fd, data, suffix, work_identity, run_identity)
+        _assert_named_identity(run_fd, report_name, report_identity, "unsafe_state")
+        try:
+            os.unlink(report_name, dir_fd=run_fd)
+            os.fsync(run_fd)
+        except OSError:
+            _fail("unsafe_state")
+        _assert_pinned_root(work_fd, work_identity)
+        _assert_pinned_root(run_fd, run_identity)
+        _read_marker(work_fd, "work", paths["work_token"])
+        _read_marker(run_fd, "run", paths["run_token"])
+        return {"work": work_identity, "run": run_identity, "cleaned": True}
+    finally:
+        os.close(work_fd); os.close(run_fd)
 
 @register_action("source_preflight")
 def source_preflight(payload):
@@ -1174,32 +1563,213 @@ def source_verify(payload):
         os.close(work_fd)
         os.close(run_fd)
 
+_SOURCE_ACTIVE_BUILD_FIELDS = {
+    "schema_version", "record_type", "source_snapshot_id",
+    "source_applied_tree_hash", "build_id", "binary_sha256",
+    "binary_size", "version", "sass", "build_log_sha256",
+    "exit_code", "duration_ns",
+}
+_SOURCE_ACTIVE_BUILD_LIMIT = 65536
+
+
+def _source_hex(value):
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _source_record_id(value):
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    digest = hashlib.sha256()
+    for part in (b"targetctl.record.v1", raw):
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()
+
+
+def _source_active_build(value):
+    if (not isinstance(value, dict) or set(value) != _SOURCE_ACTIVE_BUILD_FIELDS or
+            type(value["schema_version"]) is not int or value["schema_version"] != 1 or
+            value["record_type"] != "build" or
+            not all(_source_hex(value[key]) for key in (
+                "source_snapshot_id", "source_applied_tree_hash", "build_id",
+                "binary_sha256", "build_log_sha256",
+            ))):
+        _fail("unsafe_state")
+    version = value["version"]
+    if (not isinstance(version, str) or not 1 <= len(version) <= 64 or not version.isascii() or
+            not 1 <= len(version.split(".")) <= 4 or
+            any(not part or not part.isdigit() for part in version.split(".")) or
+            not isinstance(value["binary_size"], int) or isinstance(value["binary_size"], bool) or
+            not 1 <= value["binary_size"] <= (1 << 63) - 1 or
+            value["sass"] != "verified" or
+            not isinstance(value["exit_code"], int) or isinstance(value["exit_code"], bool) or
+            value["exit_code"] != 0 or
+            not isinstance(value["duration_ns"], int) or isinstance(value["duration_ns"], bool) or
+            not 1 <= value["duration_ns"] <= 3630000000000):
+        _fail("unsafe_state")
+    identity = {
+        "schema_version": 1,
+        "source_snapshot_id": value["source_snapshot_id"],
+        "source_applied_tree_hash": value["source_applied_tree_hash"],
+        "binary_sha256": value["binary_sha256"],
+        "version": version,
+        "binary_size": value["binary_size"],
+        "sass": "sm_121",
+    }
+    if not hmac.compare_digest(_source_record_id(identity), value["build_id"]):
+        _fail("unsafe_state")
+
+
+def _source_file_pin(item):
+    return (
+        item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+        item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+    )
+
+
+def _source_invalidate_active_build(run_fd):
+    try:
+        os.stat("build.json", dir_fd=run_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _fail("unsafe_state")
+    fd, before = _open_regular("build.json", dir_fd=run_fd)
+    try:
+        if before.st_nlink != 1 or before.st_size > _SOURCE_ACTIVE_BUILD_LIMIT:
+            _fail("unsafe_state")
+        try:
+            raw = bytearray()
+            while len(raw) <= _SOURCE_ACTIVE_BUILD_LIMIT:
+                block = os.read(fd, min(65536, _SOURCE_ACTIVE_BUILD_LIMIT + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+            after = os.fstat(fd)
+        except OSError:
+            _fail("unsafe_state")
+        if len(raw) != before.st_size or len(raw) > _SOURCE_ACTIVE_BUILD_LIMIT or _source_file_pin(after) != _source_file_pin(before):
+            _fail("unsafe_state")
+        def unique(pairs):
+            result = {}
+            for key, item in pairs:
+                if key in result:
+                    _fail("unsafe_state")
+                result[key] = item
+            return result
+        try:
+            value = json.loads(raw.decode("ascii"), object_pairs_hook=unique)
+        except HelperError:
+            raise
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            _fail("unsafe_state")
+        _source_active_build(value)
+        _assert_named_identity(run_fd, "build.json", _identity(fd), "unsafe_state")
+        try:
+            live = os.stat("build.json", dir_fd=run_fd, follow_symlinks=False)
+        except OSError:
+            _fail("unsafe_state")
+        if _source_file_pin(live) != _source_file_pin(before):
+            _fail("unsafe_state")
+        try:
+            os.unlink("build.json", dir_fd=run_fd)
+            os.fsync(run_fd)
+        except OSError:
+            _fail("unsafe_state")
+        try:
+            os.stat("build.json", dir_fd=run_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            _fail("unsafe_state")
+        _fail("unsafe_state")
+    finally:
+        os.close(fd)
+
+
+def _source_assert_lock(run_fd, run_identity, run_token, lock_token, expected=None):
+    if not _source_hex(lock_token):
+        _fail("unsafe_lock")
+    lock_fd, before = _open_regular(LOCK_NAME, dir_fd=run_fd)
+    try:
+        if before.st_nlink != 1:
+            _fail("unsafe_lock")
+        state = _lock_state(lock_fd)
+        after = os.fstat(lock_fd)
+        if _source_file_pin(after) != _source_file_pin(before):
+            _fail("unsafe_lock")
+        lock_identity = _identity(lock_fd)
+        pin = (
+            lock_identity["device"], lock_identity["inode"],
+            state["boot_id"], state["deadline_monotonic_ns"], state["token"],
+        )
+        if (not hmac.compare_digest(state["token"], lock_token) or
+                expected is not None and pin != expected):
+            _fail("unsafe_lock")
+        _assert_named_identity(run_fd, LOCK_NAME, lock_identity, "unsafe_lock")
+        _assert_pinned_root(run_fd, run_identity)
+        _read_marker(run_fd, "run", run_token)
+        if not hmac.compare_digest(state["boot_id"], _boot_id()) or time.monotonic_ns() >= state["deadline_monotonic_ns"]:
+            _fail("unsafe_lock")
+        return pin
+    finally:
+        os.close(lock_fd)
+
+
 @register_action("source_write_state")
 def source_write_state(payload):
-    data = _require_object(payload, {"run_dir", "run_token", "snapshot_id", "applied_tree_hash", "dirty"})
-    if not isinstance(data["snapshot_id"], str) or not isinstance(data["applied_tree_hash"], str) or not isinstance(data["dirty"], bool) or not all(len(data[key]) == 64 and all(c in "0123456789abcdef" for c in data[key]) for key in ("snapshot_id", "applied_tree_hash")):
+    data = _require_object(payload, {"run_dir", "run_token", "lock_token", "snapshot_id", "applied_tree_hash", "dirty"})
+    if (not _source_hex(data["lock_token"]) or not _source_hex(data["snapshot_id"]) or
+            not _source_hex(data["applied_tree_hash"]) or not isinstance(data["dirty"], bool)):
         _fail("invalid_payload")
     run_fd = _open_root(_canonical(_validate_absolute_path(data["run_dir"])))
+    temporary = None
+    fd = -1
     try:
         identity = _root_identity(run_fd, "run", data["run_token"])
+        lease_pin = _source_assert_lock(run_fd, identity, data["run_token"], data["lock_token"])
+        invalidated = _source_invalidate_active_build(run_fd)
+        _source_assert_lock(run_fd, identity, data["run_token"], data["lock_token"], lease_pin)
         raw = json.dumps({"schema_version": 1, "snapshot_id": data["snapshot_id"], "applied_tree_hash": data["applied_tree_hash"], "dirty": data["dirty"]}, sort_keys=True, separators=(",", ":")).encode("ascii")
         temporary = ".source-state-" + secrets.token_hex(16)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=run_fd)
         try:
-            os.write(fd, raw); os.fsync(fd)
+            view = memoryview(raw)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError
+                view = view[written:]
+            os.fsync(fd)
         finally:
             os.close(fd)
+            fd = -1
         try:
             existing = os.stat("source.json", dir_fd=run_fd, follow_symlinks=False)
-            if not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid() or stat.S_IMODE(existing.st_mode) != 0o600: _fail("unsafe_state")
+            if (not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid() or
+                    stat.S_IMODE(existing.st_mode) != 0o600 or existing.st_nlink != 1):
+                _fail("unsafe_state")
         except FileNotFoundError:
             pass
+        _source_assert_lock(run_fd, identity, data["run_token"], data["lock_token"], lease_pin)
         os.replace(temporary, "source.json", src_dir_fd=run_fd, dst_dir_fd=run_fd)
+        temporary = None
         os.fsync(run_fd)
-        _assert_pinned_root(run_fd, identity)
-        _read_marker(run_fd, "run", data["run_token"])
-        return {"stored": True}
+        _source_assert_lock(run_fd, identity, data["run_token"], data["lock_token"], lease_pin)
+        return {"stored": True, "build_invalidated": invalidated}
+    except HelperError:
+        raise
+    except OSError:
+        _fail("unsafe_state")
     finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=run_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                _fail("unsafe_state")
         os.close(run_fd)
 '''
 
@@ -1258,6 +1828,9 @@ def sync_source(config: Any, transport: LocalTransport | SSHTransport, *, snapsh
         raise _error("lock_failed", "target synchronization lock could not be acquired")
     primary: BaseException | None = None
     stage: Path | None = None
+    transfer_dispatched = False
+    postflight_lock: Mapping[str, Any] | None = None
+    postflight_complete = False
     receiver_nonce = secrets.token_hex(16)
     receiver = config.run_dir + "/.targetctl-source-receiver-" + receiver_nonce + ".py"
     try:
@@ -1265,39 +1838,103 @@ def sync_source(config: Any, transport: LocalTransport | SSHTransport, *, snapsh
         _expect_root_identities(preflight, state)
         verify_applied_tree(root, source)
         stage, filter_path = _stage_snapshot(root, source, root)
-        prepared = transport.run_helper("source_prepare_receiver", {**payload, "lock_token": lock["lock_token"], "receiver_nonce": receiver_nonce}, extension_source=_SOURCE_EXTENSION, allowed_error_codes=_EXTENSION_ERRORS | {"marker_mismatch", "unsafe_root", "unsafe_state", "unsafe_lock", "unsafe_mount", "missing_path", "path_overlap"})
+        prepared = transport.run_helper(
+            "source_prepare_receiver",
+            {
+                **payload,
+                "lock_token": lock["lock_token"],
+                "receiver_nonce": receiver_nonce,
+                "snapshot_id": source.snapshot_id,
+                "applied_tree_hash": source.applied_tree_hash,
+            },
+            extension_source=_SOURCE_EXTENSION,
+            allowed_error_codes=_EXTENSION_ERRORS | {"marker_mismatch", "unsafe_root", "unsafe_state", "unsafe_lock", "unsafe_mount", "missing_path", "path_overlap"},
+        )
         _expect_root_identities(prepared, state)
         if not isinstance(prepared, Mapping) or prepared.get("receiver") != receiver:
             raise _error("receiver_prepare_failed", "target source receiver could not be prepared")
+        # Enter the ambiguity boundary before invoking transport: from this
+        # point only the target receiver owns the transfer lease.
+        transfer_dispatched = True
         transport.guarded_rsync(stage, config.workdir, receiver=receiver, filter_file=filter_path)
+        postflight_lock = transport.run_helper(
+            "acquire_lock",
+            {"run_dir": config.run_dir, "run_token": state["run_token"], "lease_seconds": SOURCE_LOCK_LEASE_SECONDS},
+            allowed_error_codes={"lock_busy", "lock_failed", "unsafe_lock", "invalid_lease", "marker_mismatch", "unsafe_root"},
+        )
+        if not isinstance(postflight_lock, Mapping) or not isinstance(postflight_lock.get("lock_token"), str):
+            raise _error("lock_failed", "target synchronization postflight lock could not be acquired")
+        postflight_payload = {
+            **payload,
+            "receiver": receiver,
+            "snapshot_id": source.snapshot_id,
+            "applied_tree_hash": source.applied_tree_hash,
+        }
+        receiver_postflight = transport.run_helper(
+            "source_receiver_postflight",
+            postflight_payload,
+            extension_source=_SOURCE_EXTENSION,
+            allowed_error_codes=_EXTENSION_ERRORS | {"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"},
+        )
+        _expect_root_identities(receiver_postflight, state)
         verified = transport.run_helper("source_verify", payload, extension_source=_SOURCE_EXTENSION, allowed_error_codes=_EXTENSION_ERRORS | {"entry_changed", "marker_mismatch", "unsafe_entry", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"})
         _expect_root_identities(verified, state)
         if not isinstance(verified, Mapping) or verified.get("sha256") != source.applied_tree_hash or verified.get("entry_count") != len(source.entries):
             raise _error("applied_hash_mismatch", "target source contents do not match the snapshot")
-        transport.run_helper("source_write_state", {"run_dir": config.run_dir, "run_token": state["run_token"], "snapshot_id": source.snapshot_id, "applied_tree_hash": source.applied_tree_hash, "dirty": source.dirty}, extension_source=_SOURCE_EXTENSION, allowed_error_codes={"unsafe_state", "marker_mismatch", "unsafe_root", "missing_path"})
+        committed = transport.run_helper(
+            "source_write_state",
+            {
+                "run_dir": config.run_dir,
+                "run_token": state["run_token"],
+                "lock_token": postflight_lock["lock_token"],
+                "snapshot_id": source.snapshot_id,
+                "applied_tree_hash": source.applied_tree_hash,
+                "dirty": source.dirty,
+            },
+            extension_source=_SOURCE_EXTENSION,
+            allowed_error_codes={"unsafe_state", "unsafe_lock", "marker_mismatch", "unsafe_root", "missing_path"},
+        )
+        if (type(committed) is not dict or set(committed) != {"stored", "build_invalidated"} or
+                committed["stored"] is not True or type(committed["build_invalidated"]) is not bool):
+            raise _error("state_write_failed", "target source state could not be stored")
         final_roots = transport.run_helper("inspect_roots", {key: payload[key] for key in ("workdir", "run_dir", "model_path", "drafter_path", "work_token", "run_token")}, allowed_error_codes={"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"})
         _expect_root_identities(final_roots, state)
+        completed = transport.run_helper(
+            "source_complete_receiver",
+            postflight_payload,
+            extension_source=_SOURCE_EXTENSION,
+            allowed_error_codes=_EXTENSION_ERRORS | {"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path", "path_overlap"},
+        )
+        _expect_root_identities(completed, state)
+        postflight_complete = True
         return SyncResult(source, initialized_now, source.applied_tree_hash)
     except BaseException as error:
         primary = error
         raise
     finally:
         cleanup_error: BaseException | None = None
-        try:
-            transport.run_helper("source_cleanup_receiver", {"run_dir": config.run_dir, "run_token": state["run_token"], "receiver": receiver}, extension_source=_SOURCE_EXTENSION, allowed_error_codes={"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path"})
-        except BaseException as error:
-            cleanup_error = error
+        if not transfer_dispatched:
+            try:
+                transport.run_helper("source_cleanup_receiver", {"run_dir": config.run_dir, "run_token": state["run_token"], "receiver": receiver}, extension_source=_SOURCE_EXTENSION, allowed_error_codes={"marker_mismatch", "unsafe_root", "unsafe_state", "missing_path"})
+            except BaseException as error:
+                cleanup_error = error
         if stage is not None:
             try:
                 shutil.rmtree(stage)
             except OSError as error:
                 if cleanup_error is None:
                     cleanup_error = error
-        try:
-            transport.run_helper("release_lock", {"run_dir": config.run_dir, "run_token": state["run_token"], "lock_token": lock["lock_token"]}, allowed_error_codes={"lock_token_mismatch", "lock_release_failed", "unsafe_lock", "marker_mismatch", "unsafe_root"})
-        except BaseException:
-            if primary is None:
-                raise _error("lock_release_failed", "target synchronization lock could not be released") from None
+        release_token: str | None = None
+        if not transfer_dispatched:
+            release_token = lock["lock_token"]
+        elif postflight_complete and postflight_lock is not None:
+            release_token = postflight_lock["lock_token"]
+        if release_token is not None:
+            try:
+                transport.run_helper("release_lock", {"run_dir": config.run_dir, "run_token": state["run_token"], "lock_token": release_token}, allowed_error_codes={"lock_token_mismatch", "lock_release_failed", "unsafe_lock", "marker_mismatch", "unsafe_root"})
+            except BaseException:
+                if primary is None:
+                    raise _error("lock_release_failed", "target synchronization lock could not be released") from None
         if cleanup_error is not None and primary is None:
             raise _error("staging_cleanup_failed", "source synchronization temporary data could not be removed") from None
 

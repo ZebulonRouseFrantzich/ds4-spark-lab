@@ -27,7 +27,12 @@ from .common import (
     validate_object_keys,
     write_json_atomic,
 )
-from .redaction import StreamingRedactor
+from .redaction import (
+    MAX_REDACTION_SECRET_AGGREGATE_BYTES,
+    MAX_REDACTION_SECRET_BYTES,
+    MAX_REDACTION_SECRETS,
+    StreamingRedactor,
+)
 from .remote import LAUNCH_PROFILE
 
 
@@ -1045,14 +1050,26 @@ class ArtifactBundle:
         if not isinstance(chunk_bytes, int) or isinstance(chunk_bytes, bool) or not 1 <= chunk_bytes <= 65_536:
             raise _fail("artifact_limit_invalid", "artifact chunk limit is invalid")
         checked_canaries: list[str] = []
+        seen_canaries: set[str] = set()
+        aggregate_canary_bytes = 0
+        supplied_canaries = 0
         try:
             iterator = iter(canaries)
         except TypeError:
             raise _fail("artifact_canary_invalid", "artifact canary is invalid") from None
         for canary in iterator:
-            if not isinstance(canary, str) or not canary or len(canary) > MAX_VALUE_TEXT:
+            supplied_canaries += 1
+            if supplied_canaries > MAX_REDACTION_SECRETS or not isinstance(canary, str) or not canary or "\n" in canary or "\r" in canary:
                 raise _fail("artifact_canary_invalid", "artifact canary is invalid")
-            checked_canaries.append(canary)
+            encoded_size = len(canary.encode("utf-8"))
+            if encoded_size > MAX_REDACTION_SECRET_BYTES:
+                raise _fail("artifact_canary_invalid", "artifact canary is invalid")
+            if canary not in seen_canaries:
+                aggregate_canary_bytes += encoded_size
+                if aggregate_canary_bytes > MAX_REDACTION_SECRET_AGGREGATE_BYTES:
+                    raise _fail("artifact_canary_invalid", "artifact canary is invalid")
+                seen_canaries.add(canary)
+                checked_canaries.append(canary)
         source_path = Path(source)
         try:
             before = os.lstat(source_path)
@@ -1062,7 +1079,7 @@ class ArtifactBundle:
             raise _fail("artifact_source_unsafe", "artifact text source is unsafe")
         if before.st_size > max_bytes:
             raise _fail("artifact_too_large", "artifact text exceeds its size limit")
-        output: list[str] = []
+        output = bytearray()
         total = 0
         try:
             fd = os.open(source_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -1079,7 +1096,10 @@ class ArtifactBundle:
                 total += len(chunk)
                 if total > max_bytes:
                     raise _fail("artifact_too_large", "artifact text exceeds its size limit")
-                output.append(redactor.feed(chunk))
+                safe_chunk = redactor.feed(chunk).encode("utf-8")
+                if len(output) + len(safe_chunk) > MAX_TEXT_BYTES:
+                    raise _fail("artifact_too_large", "artifact text exceeds its size limit")
+                output.extend(safe_chunk)
             after = os.fstat(fd)
         except TargetError:
             raise
@@ -1089,16 +1109,16 @@ class ArtifactBundle:
             os.close(fd)
         if not stat.S_ISREG(after.st_mode) or after.st_dev != before.st_dev or after.st_ino != before.st_ino:
             raise _fail("artifact_source_unsafe", "artifact text source changed during reading")
-        output.append(redactor.finalize())
-        safe_text = "".join(output)
-        if len(safe_text.encode("utf-8")) > MAX_TEXT_BYTES:
+        final_chunk = redactor.finalize().encode("utf-8")
+        if len(output) + len(final_chunk) > MAX_TEXT_BYTES:
             raise _fail("artifact_too_large", "artifact text exceeds its size limit")
-        if any(canary in safe_text for canary in checked_canaries):
+        output.extend(final_chunk)
+        if any(canary.encode("utf-8") in output for canary in checked_canaries):
             raise _fail("artifact_canary_detected", "artifact redaction did not remove a canary")
         destination_dir = self._staging / "texts"
         _ensure_private_directory(destination_dir, create=True)
         destination = destination_dir / f"{text_name}.txt"
-        _atomic_bytes(destination, safe_text.encode("utf-8"))
+        _atomic_bytes(destination, output)
         return _safe_relative(self._repo_root, self._final / "texts" / f"{text_name}.txt")
 
     def finalize(self) -> str:

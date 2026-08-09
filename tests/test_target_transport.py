@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import socket
 import sys
 import time
+import threading
 from pathlib import Path
 import shlex
 import tempfile
@@ -481,22 +483,141 @@ class SSHForwardTests(unittest.TestCase):
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.ssh_config = Path(self._temporary_directory.name) / "config"
-        self.ssh_config.write_text("Host *\n", encoding="utf-8")
+        self.ssh_config.write_text(
+            "Host *\n"
+            "  LocalForward 49101 127.0.0.1:49111\n"
+            "  RemoteForward 49102 127.0.0.1:49112\n"
+            "  DynamicForward 49103\n",
+            encoding="utf-8",
+        )
         self.ssh_config.chmod(0o600)
 
-    def test_forward_has_one_loopback_mapping_and_disables_all_other_channels(self) -> None:
+    def test_forward_uses_fixed_stdio_bridge_and_clears_configured_forwards(self) -> None:
         transport = SSHTransport("spark_1.example", ssh_binary="/usr/bin/ssh", ssh_config=self.ssh_config)
-        forward = SSHForward(transport, target_port=43123)
-        forward.local_port = 32123
-        argv = forward.argv
+        argv = SSHForward(transport, target_port=43123).argv
         self.assertEqual(argv[:3], ("/usr/bin/ssh", "-F", str(self.ssh_config)))
-        # The isolated config keeps alias resolution while fixed options override
-        # every safety-critical channel and command setting.
         self.assertEqual(argv[-2:], ("--", "spark_1.example"))
-        self.assertEqual(argv[argv.index("-L") + 1], "127.0.0.1:32123:127.0.0.1:43123")
-        self.assertEqual(argv.count("-L"), 1)
+        self.assertEqual(argv[argv.index("-W") + 1], "127.0.0.1:43123")
+        self.assertEqual(argv.count("-W"), 1)
+        self.assertFalse(any(flag in argv for flag in ("-L", "-R", "-D")))
         options = {argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-o"}
-        self.assertTrue({"ForwardAgent=no", "ForwardX11=no", "RequestTTY=no", "RemoteCommand=none", "ControlMaster=no", "ClearAllForwardings=no", "ExitOnForwardFailure=yes"}.issubset(options))
+        self.assertTrue(
+            {
+                "ForwardAgent=no",
+                "ForwardX11=no",
+                "RequestTTY=no",
+                "RemoteCommand=none",
+                "ControlMaster=no",
+                "ClearAllForwardings=yes",
+                "ConnectionAttempts=1",
+            }.issubset(options)
+        )
+        self.assertNotIn("ClearAllForwardings=no", options)
+
+    def test_bridge_serves_sequential_http_connections_and_reaps_on_interrupt(self) -> None:
+        fake_ssh = Path(self._temporary_directory.name) / "ssh"
+        fake_ssh.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, socket, sys, threading\n"
+            "destination = sys.argv[sys.argv.index('-W') + 1]\n"
+            "host, raw_port = destination.rsplit(':', 1)\n"
+            "connection = socket.create_connection((host, int(raw_port)), timeout=3)\n"
+            "def upload():\n"
+            "  try:\n"
+            "    while True:\n"
+            "      data = os.read(0, 16384)\n"
+            "      if not data:\n"
+            "        connection.shutdown(socket.SHUT_WR)\n"
+            "        return\n"
+            "      connection.sendall(data)\n"
+            "  except OSError:\n"
+            "    return\n"
+            "threading.Thread(target=upload, daemon=True).start()\n"
+            "try:\n"
+            "  while True:\n"
+            "    data = connection.recv(16384)\n"
+            "    if not data:\n"
+            "      break\n"
+            "    view = memoryview(data)\n"
+            "    while view:\n"
+            "      view = view[os.write(1, view):]\n"
+            "finally:\n"
+            "  connection.close()\n",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o700)
+        requests: list[bytes] = []
+        server_errors: list[BaseException] = []
+        processes: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def record_process(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as target:
+            target.bind(("127.0.0.1", 0))
+            target.listen(2)
+            target.settimeout(4)
+            target_port = int(target.getsockname()[1])
+
+            def serve() -> None:
+                try:
+                    for _ in range(2):
+                        connection, _ = target.accept()
+                        with connection:
+                            connection.settimeout(3)
+                            request = bytearray()
+                            while b"\r\n\r\n" not in request:
+                                chunk = connection.recv(4096)
+                                if not chunk:
+                                    break
+                                request.extend(chunk)
+                            requests.append(bytes(request))
+                            connection.sendall(
+                                b"HTTP/1.0 200 OK\r\n"
+                                b"Content-Length: 2\r\n"
+                                b"Connection: close\r\n\r\nok"
+                            )
+                except BaseException as error:
+                    server_errors.append(error)
+
+            server = threading.Thread(target=serve, daemon=True)
+            server.start()
+            transport = SSHTransport("spark_1.example", ssh_binary=str(fake_ssh), ssh_config=self.ssh_config)
+            forward = SSHForward(transport, target_port=target_port, timeout=3)
+
+            def request(path: str) -> bytes:
+                with socket.create_connection(("127.0.0.1", forward.local_port), timeout=3) as client:
+                    client.settimeout(3)
+                    client.sendall(f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii"))
+                    response = bytearray()
+                    while True:
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            return bytes(response)
+                        response.extend(chunk)
+
+            with self.assertRaises(KeyboardInterrupt):
+                with mock.patch("scripts.targetctl.transport.subprocess.Popen", side_effect=record_process):
+                    with forward:
+                        bridge_port = forward.local_port
+                        self.assertIn(b"\r\n\r\nok", request("/health"))
+                        self.assertIn(b"\r\n\r\nok", request("/v1/models"))
+                        raise KeyboardInterrupt
+            server.join(timeout=4)
+
+        self.assertFalse(server.is_alive())
+        self.assertEqual(server_errors, [])
+        self.assertEqual([item.split(b" ", 2)[1] for item in requests], [b"/health", b"/v1/models"])
+        self.assertEqual(len(processes), 2)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        self.assertFalse(forward._workers)
+        self.assertFalse(forward._processes)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", bridge_port)), 0)
 
 
 if __name__ == "__main__":
