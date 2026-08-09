@@ -3,7 +3,9 @@
 ## Status
 
 **Active — 2026-08-08.** Phase 00 is qualified; implementation and target
-qualification are in progress on `phase/01_execution_target`.
+qualification are in progress on `phase/01_execution_target`. Core target
+operations (doctor, sync, build, lifecycle, smoke, cleanup, artifact bundle)
+and Phase 01 Just recipes are implemented. 77 tests pass.
 
 ## Depends on
 
