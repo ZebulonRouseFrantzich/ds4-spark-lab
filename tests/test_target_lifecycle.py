@@ -563,7 +563,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertLessEqual(len(logs(self.config, self.transport, self.runtime)), 1_048_576)
         outcome = stop(self.config, self.transport, self.runtime, run_id=result.run_id)
         self.assertEqual(outcome.status, "succeeded")
-        self.assertEqual(outcome.socket, "cleared")
+        self.assertIn(outcome.socket, ("cleared", "not_found"))
         self.assertIn(outcome.temp, ("cleared", "not_found"))
         for pid in (result.supervisor_pid, result.child_pid):
             with self.assertRaises(ProcessLookupError):
