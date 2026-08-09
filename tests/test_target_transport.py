@@ -9,12 +9,13 @@ from pathlib import Path
 import shlex
 import tempfile
 import unittest
+from types import SimpleNamespace
 import warnings
 from unittest import mock
 
 from scripts.targetctl import remote
 from scripts.targetctl.common import PROTOCOL_VERSION, TargetError
-from scripts.targetctl.transport import CommandResult, LocalTransport, SSHForward, SSHTransport
+from scripts.targetctl.transport import CommandResult, LocalTransport, SSHForward, SSHTransport, select_transport
 
 
 def roots(tmp_path: Path) -> dict[str, str]:
@@ -172,9 +173,16 @@ class RemoteRootTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.ssh_config = Path(self._temporary_directory.name) / "config"
+        self.ssh_config.write_text("Host *\n", encoding="utf-8")
+        self.ssh_config.chmod(0o600)
+
     def test_ssh_helper_uses_one_fixed_no_forwarding_command_and_round_trips_quoting(self) -> None:
         captured: dict[str, object] = {}
-        transport = SSHTransport("spark_1.example", runner=successful_runner(captured))
+        transport = SSHTransport("spark_1.example", runner=successful_runner(captured), ssh_config=self.ssh_config)
         result = transport.run_helper(
             "extension",
             {"value": "quoted value"},
@@ -183,6 +191,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result, {"registered": True})
 
         argv = captured["argv"]
+        self.assertEqual(argv[:3], ("ssh", "-F", str(self.ssh_config)))
         host_index = argv.index("--") + 1
         self.assertEqual(argv[host_index], "spark_1.example")
         self.assertEqual(len(argv), host_index + 2)
@@ -229,6 +238,61 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(captured["cwd"], "/")
         self.assertEqual(captured["env"], {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"})
 
+    def test_select_transport_uses_only_a_validated_current_user_ssh_config(self) -> None:
+        home = Path(self._temporary_directory.name) / "home"
+        config = home / ".ssh" / "config"
+        config.parent.mkdir(parents=True)
+        config.write_text("Host *\n", encoding="utf-8")
+        config.chmod(0o600)
+        captured: dict[str, object] = {}
+
+        with mock.patch("scripts.targetctl.transport.Path.home", return_value=home):
+            transport = select_transport(SimpleNamespace(mode="ssh", ssh_host="spark"), runner=successful_runner(captured))
+            transport.run_helper("handshake", {})
+        self.assertEqual(captured["argv"][:3], ("ssh", "-F", str(config)))
+
+        config.chmod(0o620)
+        with mock.patch("scripts.targetctl.transport.Path.home", return_value=home):
+            with self.assertRaises(TargetError) as error:
+                select_transport(SimpleNamespace(mode="ssh", ssh_host="spark"))
+        self.assertEqual(error.exception.code, "ssh_config_invalid")
+        self.assertNotIn(str(config), str(error.exception))
+
+        config.chmod(0o600)
+        config.unlink()
+        config.symlink_to(self.ssh_config)
+        with mock.patch("scripts.targetctl.transport.Path.home", return_value=home):
+            with self.assertRaises(TargetError) as error:
+                select_transport(SimpleNamespace(mode="ssh", ssh_host="spark"))
+        self.assertEqual(error.exception.code, "ssh_config_invalid")
+        self.assertNotIn(str(config), str(error.exception))
+
+        config.unlink()
+        with mock.patch("scripts.targetctl.transport.Path.home", return_value=home):
+            with self.assertRaises(TargetError) as error:
+                select_transport(SimpleNamespace(mode="ssh", ssh_host="spark"))
+        self.assertEqual(error.exception.code, "ssh_config_invalid")
+        self.assertNotIn(str(config), str(error.exception))
+
+    def test_rsync_uses_the_isolated_ssh_config(self) -> None:
+        source = Path(self._temporary_directory.name) / "source"
+        source.mkdir()
+        captured: dict[str, object] = {}
+
+        def runner(argv, input_bytes, timeout, cwd, env, cap):
+            captured["argv"] = tuple(argv)
+            return CommandResult(0, False, 1, b"", b"")
+
+        SSHTransport("spark", runner=mock.Mock(side_effect=runner), ssh_config=self.ssh_config).guarded_rsync(
+            source,
+            "/remote-work",
+            receiver="/usr/bin/rsync",
+        )
+        ssh_argv = shlex.split(captured["argv"][captured["argv"].index("-e") + 1])
+        self.assertEqual(ssh_argv[:3], ["ssh", "-F", str(self.ssh_config)])
+        self.assertIn("ControlPath=none", ssh_argv)
+        self.assertIn("ControlPersist=no", ssh_argv)
+
     def test_ssh_rejects_aliases_and_keeps_request_strings_out_of_options_and_shell(self) -> None:
         for alias in ("-oProxyCommand=evil", "spark host", "spark;touch", "", "spärk"):
             with self.subTest(alias=alias):
@@ -237,7 +301,7 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, "invalid_ssh_host")
 
         captured: dict[str, object] = {}
-        SSHTransport("spark", runner=successful_runner(captured)).run_helper(
+        SSHTransport("spark", runner=successful_runner(captured), ssh_config=self.ssh_config).run_helper(
             "'; touch /tmp/pwned; #",
             {"private": "$(touch /tmp/also-pwned)"},
         )
@@ -292,10 +356,10 @@ class TransportTests(unittest.TestCase):
     def test_helper_digest_protocol_and_output_fail_closed_without_command_text(self) -> None:
         captured: dict[str, object] = {}
         with self.assertRaises(TargetError) as error:
-            SSHTransport("spark", runner=successful_runner(captured, bad_digest=True)).run_helper("handshake", {})
+            SSHTransport("spark", runner=successful_runner(captured, bad_digest=True), ssh_config=self.ssh_config).run_helper("handshake", {})
         self.assertEqual(error.exception.code, "helper_integrity_failed")
         with self.assertRaises(TargetError) as error:
-            SSHTransport("spark", runner=successful_runner({}, protocol_version=PROTOCOL_VERSION + 1)).run_helper("handshake", {})
+            SSHTransport("spark", runner=successful_runner({}, protocol_version=PROTOCOL_VERSION + 1), ssh_config=self.ssh_config).run_helper("handshake", {})
         self.assertEqual(error.exception.code, "helper_integrity_failed")
 
         def malformed(argv, input_bytes, timeout, cwd, env, cap):
@@ -309,7 +373,7 @@ class TransportTests(unittest.TestCase):
             return CommandResult(255, False, 1, b"", b"ssh very-private-host.example rejected command")
 
         with self.assertRaises(TargetError) as error:
-            SSHTransport("spark", runner=mock.Mock(side_effect=hostile_runner)).run_helper("handshake", {})
+            SSHTransport("spark", runner=mock.Mock(side_effect=hostile_runner), ssh_config=self.ssh_config).run_helper("handshake", {})
         self.assertEqual(error.exception.code, "helper_execution_failed")
         self.assertNotIn("very-private-host", str(error.exception))
 
@@ -413,15 +477,21 @@ class TransportTests(unittest.TestCase):
 
 
 class SSHForwardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.ssh_config = Path(self._temporary_directory.name) / "config"
+        self.ssh_config.write_text("Host *\n", encoding="utf-8")
+        self.ssh_config.chmod(0o600)
+
     def test_forward_has_one_loopback_mapping_and_disables_all_other_channels(self) -> None:
-        transport = SSHTransport("spark_1.example", ssh_binary="/usr/bin/ssh")
+        transport = SSHTransport("spark_1.example", ssh_binary="/usr/bin/ssh", ssh_config=self.ssh_config)
         forward = SSHForward(transport, target_port=43123)
         forward.local_port = 32123
         argv = forward.argv
-        self.assertEqual(argv[0], "/usr/bin/ssh")
-        # The logical alias still resolves through operator-managed SSH config;
-        # safety-critical channel and command settings are overridden explicitly.
-        self.assertNotIn("-F", argv)
+        self.assertEqual(argv[:3], ("/usr/bin/ssh", "-F", str(self.ssh_config)))
+        # The isolated config keeps alias resolution while fixed options override
+        # every safety-critical channel and command setting.
         self.assertEqual(argv[-2:], ("--", "spark_1.example"))
         self.assertEqual(argv[argv.index("-L") + 1], "127.0.0.1:32123:127.0.0.1:43123")
         self.assertEqual(argv.count("-L"), 1)

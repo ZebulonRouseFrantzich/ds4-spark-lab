@@ -399,6 +399,39 @@ class LocalTransport(_HelperTransport):
         return self._execute((sys.executable, "-I", "-S", "-"), program, timeout=timeout, cwd="/", env=_validate_env(helper_digest=digest, deferred=True))
 
 
+def _validated_ssh_config(value: str | Path) -> Path:
+    """Return a current-user SSH config after descriptor-based metadata checks."""
+    try:
+        path = Path(value)
+        if not path.is_absolute():
+            raise OSError
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise OSError
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _error("ssh_config_invalid", "SSH configuration is unavailable") from None
+    try:
+        opened = os.fstat(fd)
+    except OSError:
+        raise _error("ssh_config_invalid", "SSH configuration is unavailable") from None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if (
+        (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise _error("ssh_config_invalid", "SSH configuration is unavailable")
+    return path
 
 
 class SSHForward:
@@ -428,8 +461,10 @@ class SSHForward:
 
     def _argv(self) -> tuple[str, ...]:
         options = tuple(option for option in SSH_OPTIONS if option != "ClearAllForwardings=yes")
+        config_args = () if self._transport._ssh_config is None else ("-F", os.fspath(self._transport._ssh_config))
         return (
             self._transport._ssh_binary,
+            *config_args,
             *(part for option in (*options, "ClearAllForwardings=no", "ExitOnForwardFailure=yes") for part in ("-o", option)),
             "-L",
             f"127.0.0.1:{self.local_port}:127.0.0.1:{self._target_port}",
@@ -503,14 +538,25 @@ class SSHForward:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
+
+
 class SSHTransport(_HelperTransport):
     """SSH transport with forwarding, agent, X11, tty, and control sharing disabled."""
-    def __init__(self, ssh_host: str, *, runner: Runner | None = None, ssh_binary: str = "ssh", max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES) -> None:
+    def __init__(
+        self,
+        ssh_host: str,
+        *,
+        runner: Runner | None = None,
+        ssh_binary: str = "ssh",
+        ssh_config: str | Path | None = None,
+        max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES,
+    ) -> None:
         if not _valid_ssh_alias(ssh_host):
             raise _error("invalid_ssh_host", "invalid SSH host alias")
         self.ssh_host = ssh_host
         self._runner = runner
         self._ssh_binary = ssh_binary
+        self._ssh_config = _validated_ssh_config(ssh_config) if ssh_config is not None else None
         self._max_output_bytes = max_output_bytes
 
     def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
@@ -526,7 +572,15 @@ class SSHTransport(_HelperTransport):
         # fixed wrapper, including the cwd invariant, as its script.
         inner_command = f"cd -- / && exec {shlex.join(remote_argv)}"
         remote_command = shlex.join(("/bin/sh", "-c", inner_command))
-        argv = (self._ssh_binary, *(part for option in SSH_OPTIONS for part in ("-o", option)), "--", self.ssh_host, remote_command)
+        config_args = () if self._ssh_config is None else ("-F", os.fspath(self._ssh_config))
+        argv = (
+            self._ssh_binary,
+            *config_args,
+            *(part for option in SSH_OPTIONS for part in ("-o", option)),
+            "--",
+            self.ssh_host,
+            remote_command,
+        )
         return self._execute(argv, program, timeout=timeout, cwd="/", env=_validate_env())
 
     def guarded_rsync(
@@ -568,7 +622,8 @@ class SSHTransport(_HelperTransport):
                 merge_filter = (f"--filter=merge {item}",)
             except (OSError, RuntimeError):
                 raise _error("invalid_rsync_request", "source synchronization request is invalid") from None
-        ssh_command = shlex.join((self._ssh_binary, *(part for option in SSH_OPTIONS for part in ("-o", option))))
+        config_args = () if self._ssh_config is None else ("-F", os.fspath(self._ssh_config))
+        ssh_command = shlex.join((self._ssh_binary, *config_args, *(part for option in SSH_OPTIONS for part in ("-o", option))))
         argv = (
             "/usr/bin/rsync",
             *RSYNC_OPTIONS,
@@ -619,7 +674,11 @@ def select_transport(config: Any, *, repo_root: Path | None = None, runner: Runn
     if mode == "local":
         return LocalTransport(runner=runner)
     if mode == "ssh":
-        return SSHTransport(getattr(config, "ssh_host", None), runner=runner)
+        return SSHTransport(
+            getattr(config, "ssh_host", None),
+            runner=runner,
+            ssh_config=Path.home() / ".ssh" / "config",
+        )
     raise _error("invalid_target_mode", "invalid target mode")
 
 
