@@ -186,9 +186,17 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             result.status = "failed"  # type: ignore[misc]
 
-    def test_nix_identity_matches_native_paths_and_versions(self) -> None:
+    def test_nix_identity_matches_resolved_native_alias_paths_and_versions(self) -> None:
         versions = {"nvcc": "12.8", "gcc": "14.2", "g++": "14.2"}
-        tools = tuple((name, versions.get(name, "1.0"), location) for name, location in DOCTOR_TOOLS)
+        canonical = {
+            "nvcc": "/usr/local/cuda/bin/nvcc",
+            "gcc": "/usr/bin/gcc-14",
+            "g++": "/usr/bin/g++-14",
+        }
+        tools = tuple(
+            (name, versions.get(name, "1.0"), canonical.get(name, alias))
+            for name, alias in DOCTOR_TOOLS
+        )
         with tempfile.TemporaryDirectory() as temporary:
             workdir = Path(temporary)
             (workdir / "flake.nix").write_text("{}\n", encoding="ascii")
@@ -198,20 +206,31 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 if argv == ("/nix/store/test/bin/nix", "--version"):
                     return CommandResult(0, False, 1, b"nix (Nix) 2.28.5\n", b"")
                 name = argv[-1]
-                location = dict(doctor_module._NIX_COMPARE_TOOLS)[name]
                 detail = f"Copyright 2005-2025\nCuda compilation tools, release {versions[name]}, V{versions[name]}.1" if name == "nvcc" else f"{name} {versions[name]}"
-                return CommandResult(0, False, 1, f"TARGETCTL_PATH={location}\n{detail}\n".encode("ascii"), b"")
+                return CommandResult(0, False, 1, f"TARGETCTL_PATH={canonical[name]}\n{detail}\n".encode("ascii"), b"")
 
             transport.run.side_effect = run
             with mock.patch.object(doctor_module, "_find_nix", return_value="/nix/store/test/bin/nix"):
                 self.assertEqual(doctor_module._nix_identity(transport, workdir, tools), ("matched", "2.28.5"))
         self.assertEqual(transport.run.call_count, 4)
+        self.assertEqual(
+            [call.args[0][-1] for call in transport.run.call_args_list[1:]],
+            ["nvcc", "gcc", "g++"],
+        )
         for call in transport.run.call_args_list:
             self.assertEqual(call.kwargs["env"]["PATH"], "/usr/local/cuda/bin:/usr/bin:/bin")
 
     def test_nix_identity_fails_on_tool_resolution_drift(self) -> None:
         versions = {"nvcc": "12.8", "gcc": "14.2", "g++": "14.2"}
-        tools = tuple((name, versions.get(name, "1.0"), location) for name, location in DOCTOR_TOOLS)
+        canonical = {
+            "nvcc": "/usr/local/cuda/bin/nvcc",
+            "gcc": "/usr/bin/gcc-14",
+            "g++": "/usr/bin/g++-14",
+        }
+        tools = tuple(
+            (name, versions.get(name, "1.0"), canonical.get(name, alias))
+            for name, alias in DOCTOR_TOOLS
+        )
         with tempfile.TemporaryDirectory() as temporary:
             workdir = Path(temporary)
             (workdir / "flake.nix").write_text("{}\n", encoding="ascii")
@@ -221,7 +240,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 if argv[-1] == "--version":
                     return CommandResult(0, False, 1, b"nix (Nix) 2.28.5\n", b"")
                 name = argv[-1]
-                location = "/nix/store/compiler/bin/gcc" if name == "gcc" else dict(doctor_module._NIX_COMPARE_TOOLS)[name]
+                location = "/nix/store/compiler/bin/gcc" if name == "gcc" else canonical[name]
                 detail = f"Copyright 2005-2025\nCuda compilation tools, release {versions[name]}, V{versions[name]}.1" if name == "nvcc" else f"{name} {versions[name]}"
                 return CommandResult(0, False, 1, f"TARGETCTL_PATH={location}\n{detail}\n".encode("ascii"), b"")
 
@@ -230,6 +249,34 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 with self.assertRaises(TargetError) as raised:
                     doctor_module._nix_identity(transport, workdir, tools)
         self.assertEqual(raised.exception.code, "doctor_nix_mismatch")
+
+    def test_nix_identity_rejects_missing_or_duplicate_compared_tool(self) -> None:
+        versions = {"nvcc": "12.8", "gcc": "14.2", "g++": "14.2"}
+        canonical = {
+            "nvcc": "/usr/local/cuda/bin/nvcc",
+            "gcc": "/usr/bin/gcc-14",
+            "g++": "/usr/bin/g++-14",
+        }
+        tools = tuple(
+            (name, versions.get(name, "1.0"), canonical.get(name, alias))
+            for name, alias in DOCTOR_TOOLS
+        )
+        missing = tuple(tool for tool in tools if tool[0] != "g++")
+        duplicate = tools + (next(tool for tool in tools if tool[0] == "gcc"),)
+        with tempfile.TemporaryDirectory() as temporary:
+            workdir = Path(temporary)
+            (workdir / "flake.nix").write_text("{}\n", encoding="ascii")
+            with mock.patch.object(doctor_module, "_find_nix", return_value="/nix/store/test/bin/nix"):
+                for label, invalid_tools in (("missing", missing), ("duplicate", duplicate)):
+                    with self.subTest(label=label):
+                        transport = mock.Mock()
+                        transport.run.return_value = CommandResult(
+                            0, False, 1, b"nix (Nix) 2.28.5\n", b"",
+                        )
+                        with self.assertRaises(TargetError) as raised:
+                            doctor_module._nix_identity(transport, workdir, invalid_tools)
+                        self.assertEqual(raised.exception.code, "doctor_nix_mismatch")
+                        self.assertEqual(transport.run.call_count, 1)
 
     def test_nix_identity_records_absence_without_running_a_command(self) -> None:
         transport = mock.Mock()
@@ -248,6 +295,181 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         self.assertIs(namespace["ACTIONS"]["target_doctor"], namespace["target_doctor"])  # type: ignore[index]
         self.assertTrue(callable(namespace["_doctor_cmd"]))  # type: ignore[index]
         self.assertEqual(namespace["_doctor_version"]("nvcc", b"Copyright 2005-2025\nCuda compilation tools, release 12.8, V12.8.93\n"), "12.8")  # type: ignore[index,operator]
+
+    def test_embedded_nix_identity_matches_controller_resolved_path_rules(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        versions = {"nvcc": "12.8", "gcc": "14.2", "g++": "14.2"}
+        canonical = {
+            "nvcc": "/usr/local/cuda/bin/nvcc",
+            "gcc": "/usr/bin/gcc-14",
+            "g++": "/usr/bin/g++-14",
+        }
+        tools = [
+            {
+                "name": name,
+                "version": versions.get(name, "1.0"),
+                "location": canonical.get(name, alias),
+            }
+            for name, alias in DOCTOR_TOOLS
+        ]
+        probe_locations = dict(canonical)
+        nix_path = os.path.realpath(sys.executable)
+        real_realpath = os.path.realpath
+
+        def resolve_nix(candidate: str) -> str:
+            if candidate == "/nix/var/nix/profiles/default/bin/nix":
+                return nix_path
+            return real_realpath(candidate)
+
+        def run(argv: tuple[str, ...], *_: object, **__: object) -> bytes:
+            if argv == (nix_path, "--version"):
+                return b"nix (Nix) 2.28.5\n"
+            name = argv[-1]
+            detail = f"Copyright 2005-2025\nCuda compilation tools, release {versions[name]}, V{versions[name]}.1" if name == "nvcc" else f"{name} {versions[name]}"
+            return f"TARGETCTL_PATH={probe_locations[name]}\n{detail}\n".encode("ascii")
+
+        namespace["_doctor_cmd"] = mock.Mock(side_effect=run)
+        helper_error = namespace["HelperError"]
+        with tempfile.TemporaryDirectory() as temporary:
+            workdir = Path(temporary)
+            (workdir / "flake.nix").write_text("{}\n", encoding="ascii")
+            work_fd = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                with mock.patch.object(os.path, "realpath", side_effect=resolve_nix):
+                    self.assertEqual(
+                        namespace["_doctor_nix"](tools, work_fd),  # type: ignore[index,operator]
+                        {"status": "matched", "version": "2.28.5"},
+                    )
+                    probe_locations["gcc"] = "/nix/store/compiler/bin/gcc"
+                    with self.assertRaises(helper_error) as drift:  # type: ignore[arg-type]
+                        namespace["_doctor_nix"](tools, work_fd)  # type: ignore[index,operator]
+                    self.assertEqual(drift.exception.code, "doctor_nix_mismatch")
+                    probe_locations["gcc"] = canonical["gcc"]
+                    missing = [tool for tool in tools if tool["name"] != "g++"]
+                    duplicate = tools + [next(tool for tool in tools if tool["name"] == "gcc")]
+                    for label, invalid_tools in (("missing", missing), ("duplicate", duplicate)):
+                        with self.subTest(label=label):
+                            with self.assertRaises(helper_error) as invalid:  # type: ignore[arg-type]
+                                namespace["_doctor_nix"](invalid_tools, work_fd)  # type: ignore[index,operator]
+                            self.assertEqual(invalid.exception.code, "doctor_nix_mismatch")
+            finally:
+                os.close(work_fd)
+
+    def test_standard_system_tool_symlinks_resolve_to_pinned_public_locations(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        aliases = dict(DOCTOR_TOOLS)
+        available = tuple(name for name in ("gcc", "g++", "python3") if os.path.lexists(aliases[name]))
+        self.assertTrue(available)
+        for name in available:
+            alias = aliases[name]
+            with self.subTest(name=name):
+                expected = os.path.realpath(alias)
+                controller_version, controller_location = doctor_module._tool_version(name, alias)
+                embedded = namespace["_doctor_tool"](name, alias)  # type: ignore[index,operator]
+                self.assertRegex(controller_version, r"[0-9]+(?:\.[0-9]+){0,3}\Z")
+                self.assertEqual(controller_location, expected)
+                self.assertEqual(embedded["location"], expected)  # type: ignore[index]
+                self.assertRegex(embedded["version"], r"[0-9]+(?:\.[0-9]+){0,3}\Z")  # type: ignore[index]
+                self.assertRegex(expected, r"/(?:usr|nix/store)/[A-Za-z0-9._+@=/:-]+\Z")
+
+    def test_tool_alias_identity_swap_is_rejected_after_version_capture(self) -> None:
+        resolved = os.path.realpath("/usr/bin/gcc")
+        first_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        second_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        identity = doctor_module._tool_identity(os.fstat(first_fd))
+        original_chain = (("/usr/bin/gcc", identity),)
+        replaced_chain = (("/usr/bin/gcc", (*identity[:-1], identity[-1] + 1)),)
+        with (
+            mock.patch.object(
+                doctor_module,
+                "_open_tool_alias",
+                side_effect=(
+                    (resolved, first_fd, identity, original_chain),
+                    (resolved, second_fd, identity, replaced_chain),
+                ),
+            ),
+            mock.patch.object(doctor_module, "_pinned_tool_output", return_value=b"gcc 14.2\n"),
+            self.assertRaises(TargetError) as raised,
+        ):
+            doctor_module._tool_version("gcc", "/usr/bin/gcc")
+        self.assertEqual(raised.exception.code, "doctor_tool_missing")
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        embedded_first_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        embedded_second_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        embedded_identity = namespace["_doctor_tool_identity"](os.fstat(embedded_first_fd))  # type: ignore[index,operator]
+        namespace["_doctor_open_tool"] = mock.Mock(side_effect=(
+            (resolved, embedded_first_fd, embedded_identity, original_chain),
+            (resolved, embedded_second_fd, embedded_identity, replaced_chain),
+        ))
+        namespace["_doctor_cmd"] = mock.Mock(return_value=b"gcc 14.2\n")
+        with self.assertRaises(namespace["HelperError"]) as embedded_raised:  # type: ignore[arg-type,index]
+            namespace["_doctor_tool"]("gcc", "/usr/bin/gcc")  # type: ignore[index,operator]
+        self.assertEqual(embedded_raised.exception.code, "doctor_tool_missing")
+
+    def test_unsafe_tool_symlink_target_is_rejected_without_path_disclosure(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        real_lstat = os.lstat
+        alias_item = real_lstat("/usr/bin/gcc")
+        fake_link = SimpleNamespace(
+            st_dev=alias_item.st_dev,
+            st_ino=alias_item.st_ino,
+            st_mode=0o120777,
+            st_uid=os.geteuid(),
+            st_gid=alias_item.st_gid,
+            st_size=11,
+            st_mtime_ns=alias_item.st_mtime_ns,
+            st_ctime_ns=alias_item.st_ctime_ns,
+        )
+
+        def lstat(path: object, *args: object, **kwargs: object) -> object:
+            if path == "/usr/bin/gcc":
+                return fake_link
+            return real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(os, "lstat", side_effect=lstat),
+            mock.patch.object(os, "readlink", return_value="/tmp/targetctl-unsafe-tool"),
+        ):
+            with self.assertRaises(TargetError) as controller:
+                doctor_module._open_tool_alias("/usr/bin/gcc")
+            with self.assertRaises(namespace["HelperError"]) as embedded:  # type: ignore[arg-type,index]
+                namespace["_doctor_open_tool"]("/usr/bin/gcc")  # type: ignore[index,operator]
+        self.assertEqual(controller.exception.code, "doctor_tool_missing")
+        self.assertEqual(embedded.exception.code, "doctor_tool_missing")
+        self.assertNotIn("tmp", str(controller.exception))
+        self.assertNotIn("tmp", str(embedded.exception))
+
+    def test_doctor_response_accepts_only_canonical_public_tool_locations(self) -> None:
+        locations = dict(DOCTOR_TOOLS)
+        locations.update({
+            "gcc": "/usr/bin/gcc-14",
+            "g++": "/usr/bin/g++-14",
+            "python3": "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-python3/bin/python3.13",
+        })
+        result = DoctorResult(
+            "succeeded", None, "Linux", "6.12.0", "aarch64",
+            tuple((name, "1.2.3", locations[name]) for name, _ in DOCTOR_TOOLS),
+            ("GB10", "sm_121"), 1024, 2048, True, "a" * 64, "b" * 64,
+        )
+        validated = doctor_module._validate_result_payload(result.controller_payload())
+        self.assertEqual(dict((name, location) for name, _, location in validated.tools), locations)
+        for unsafe in (
+            "/tmp/gcc",
+            "/home/target/bin/gcc",
+            "/usr/bin/../private/gcc",
+            "usr/bin/gcc",
+            "/usr/bin/gcc name",
+        ):
+            with self.subTest(location=unsafe):
+                payload = result.controller_payload()
+                payload["tools"][2]["location"] = unsafe
+                with self.assertRaises(TargetError) as raised:
+                    doctor_module._validate_result_payload(payload)
+                self.assertEqual(raised.exception.code, "doctor_response_invalid")
 
     def test_build_payload_only_exposes_stable_identity(self) -> None:
         digest = "a" * 64
@@ -1116,6 +1338,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             calls: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
             real_stat = os.stat
             nix_path = "/nix/var/nix/profiles/default/bin/nix"
+            tools = [{"name": name, "version": "1.0", "location": path} for name, path in DOCTOR_TOOLS]
+            native_locations = {tool["name"]: tool["location"] for tool in tools}
 
             def stat_path(path: object, *args: object, **kwargs: object) -> os.stat_result | SimpleNamespace:
                 if path == nix_path:
@@ -1127,14 +1351,13 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 if argv[-1] == "--version":
                     return b"nix (Nix) 2.28.5\n"
                 name = argv[-1]
-                path = dict(doctor_module._NIX_COMPARE_TOOLS)[name]
+                path = native_locations[name]
                 detail = f"Cuda compilation tools, release 1.0, V1.0.0\n" if name == "nvcc" else f"{name} 1.0\n"
                 return f"TARGETCTL_PATH={path}\n{detail}".encode("ascii")
 
             try:
                 with mock.patch.object(os, "stat", side_effect=stat_path):
                     namespace["_doctor_cmd"] = doctor_cmd
-                    tools = [{"name": name, "version": "1.0", "location": path} for name, path in DOCTOR_TOOLS]
                     self.assertEqual(namespace["_doctor_nix"](tools, fd)["status"], "matched")  # type: ignore[index,operator]
             finally:
                 os.close(fd)

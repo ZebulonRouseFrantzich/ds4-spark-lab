@@ -27,7 +27,16 @@ from typing import Any, Callable, Collection, Mapping, Sequence
 from .common import PROTOCOL_VERSION, TargetError
 
 MAX_HELPER_INPUT_BYTES = 1024 * 1024
-MAX_HELPER_OUTPUT_BYTES = 1024 * 1024
+MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024
+MAX_HELPER_BODY_BYTES = 1024 * 1024
+# A successful report/log response adds exactly 220 bytes around its Base64
+# body: the outer protocol fields, two SHA-256 digests, result keys, JSON
+# punctuation, and remote._response's terminating newline.  Base64 contains no
+# JSON-escaped characters.  The full 1 MiB response is therefore finite without
+# raising the independent 1 MiB process/stderr or helper-input limits.
+MAX_HELPER_RESPONSE_METADATA_BYTES = 220
+MAX_HELPER_STDOUT_BYTES = 4 * ((MAX_HELPER_BODY_BYTES + 2) // 3) + MAX_HELPER_RESPONSE_METADATA_BYTES
+MAX_HELPER_STDERR_BYTES = MAX_PROCESS_OUTPUT_BYTES
 MAX_HELPER_ERROR_CODE_LENGTH = 64
 MAX_RSYNC_FILTER_BYTES = 16 * 1024 * 1024
 MAX_EXTENSION_ERROR_CODES = 16
@@ -151,11 +160,22 @@ def _validate_env(overrides: Mapping[str, str] | None = None, *, helper_digest: 
     return env
 
 
-def _bounded_process(argv: Sequence[str], input_bytes: bytes | None, timeout: float | None, cwd: str, env: Mapping[str, str], max_output_bytes: int) -> CommandResult:
+def _bounded_process(
+    argv: Sequence[str],
+    input_bytes: bytes | None,
+    timeout: float | None,
+    cwd: str,
+    env: Mapping[str, str],
+    max_stdout_bytes: int,
+    *,
+    max_stderr_bytes: int | None = None,
+) -> CommandResult:
     if not argv or any(not isinstance(argument, str) or "\x00" in argument for argument in argv):
         raise _error("invalid_command", "invalid command")
     if input_bytes is not None and len(input_bytes) > MAX_HELPER_INPUT_BYTES:
         raise _error("request_too_large", "helper request is too large")
+    stderr_limit = max_stdout_bytes if max_stderr_bytes is None else max_stderr_bytes
+    stream_limits = {"stdout": max_stdout_bytes, "stderr": stderr_limit}
 
     # Account for process creation and every pipe operation.  In particular,
     # writing a request before draining output can deadlock when a helper fills
@@ -237,7 +257,8 @@ def _bounded_process(argv: Sequence[str], input_bytes: bytes | None, timeout: fl
                     if events & selectors.EVENT_READ:
                         output = streams[key.data]
                         try:
-                            chunk = os.read(stream.fileno(), min(65536, max_output_bytes - len(output) + 1))
+                            limit = stream_limits[key.data]
+                            chunk = os.read(stream.fileno(), min(65536, limit - len(output) + 1))
                         except BlockingIOError:
                             continue
                         except OSError:
@@ -246,7 +267,7 @@ def _bounded_process(argv: Sequence[str], input_bytes: bytes | None, timeout: fl
                         if not chunk:
                             unregister_and_close(stream)
                             continue
-                        if len(output) + len(chunk) > max_output_bytes:
+                        if len(output) + len(chunk) > stream_limits[key.data]:
                             overflow = True
                             break
                         output.extend(chunk)
@@ -357,7 +378,11 @@ class _HelperTransport:
         result = self._execute_helper(program, digest, timeout)
         if result.timed_out:
             raise _error("helper_timeout", "target helper timed out")
-        if result.exit_code != 0 or len(result.stdout) > MAX_HELPER_OUTPUT_BYTES or len(result.stderr) > MAX_HELPER_OUTPUT_BYTES:
+        if (
+            result.exit_code != 0
+            or len(result.stdout) > MAX_HELPER_STDOUT_BYTES
+            or len(result.stderr) > MAX_HELPER_STDERR_BYTES
+        ):
             raise _error("helper_execution_failed", "target helper failed")
         response = _strict_json(result.stdout)
         if not isinstance(response, dict) or set(response) not in ({"protocol_version", "helper_sha256", "ok", "result"}, {"protocol_version", "helper_sha256", "ok", "error"}):
@@ -384,20 +409,62 @@ class _HelperTransport:
 
 class LocalTransport(_HelperTransport):
     """Local process boundary used by local target operations."""
-    def __init__(self, *, runner: Runner | None = None, max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        runner: Runner | None = None,
+        max_output_bytes: int = MAX_PROCESS_OUTPUT_BYTES,
+    ) -> None:
         self._runner = runner
         self._max_output_bytes = max_output_bytes
 
-    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+    def _execute_with_limits(
+        self,
+        argv: Sequence[str],
+        input_bytes: bytes,
+        *,
+        timeout: float | None,
+        cwd: str,
+        env: Mapping[str, str],
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> CommandResult:
         if self._runner is not None:
-            return self._runner(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
-        return _bounded_process(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
+            return self._runner(argv, input_bytes, timeout, cwd, env, max_stdout_bytes)
+        return _bounded_process(
+            argv,
+            input_bytes,
+            timeout,
+            cwd,
+            env,
+            max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
+    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+        return self._execute_with_limits(
+            argv,
+            input_bytes,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            max_stdout_bytes=self._max_output_bytes,
+            max_stderr_bytes=self._max_output_bytes,
+        )
 
     def run(self, argv: Sequence[str], *, input_bytes: bytes | None = None, timeout: float | None = None, cwd: str = "/", env: Mapping[str, str] | None = None) -> CommandResult:
         return self._execute(argv, input_bytes or b"", timeout=timeout, cwd=cwd, env=_validate_env(env))
 
     def _execute_helper(self, program: bytes, digest: str, timeout: float | None) -> CommandResult:
-        return self._execute((sys.executable, "-I", "-S", "-"), program, timeout=timeout, cwd="/", env=_validate_env(helper_digest=digest, deferred=True))
+        return self._execute_with_limits(
+            (sys.executable, "-I", "-S", "-"),
+            program,
+            timeout=timeout,
+            cwd="/",
+            env=_validate_env(helper_digest=digest, deferred=True),
+            max_stdout_bytes=MAX_HELPER_STDOUT_BYTES,
+            max_stderr_bytes=MAX_HELPER_STDERR_BYTES,
+        )
 
 
 def _validated_ssh_config(value: str | Path) -> Path:
@@ -783,7 +850,7 @@ class SSHTransport(_HelperTransport):
         runner: Runner | None = None,
         ssh_binary: str = "ssh",
         ssh_config: str | Path | None = None,
-        max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES,
+        max_output_bytes: int = MAX_PROCESS_OUTPUT_BYTES,
     ) -> None:
         if not _valid_ssh_alias(ssh_host):
             raise _error("invalid_ssh_host", "invalid SSH host alias")
@@ -793,10 +860,39 @@ class SSHTransport(_HelperTransport):
         self._ssh_config = _validated_ssh_config(ssh_config) if ssh_config is not None else None
         self._max_output_bytes = max_output_bytes
 
-    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+    def _execute_with_limits(
+        self,
+        argv: Sequence[str],
+        input_bytes: bytes,
+        *,
+        timeout: float | None,
+        cwd: str,
+        env: Mapping[str, str],
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> CommandResult:
         if self._runner is not None:
-            return self._runner(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
-        return _bounded_process(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
+            return self._runner(argv, input_bytes, timeout, cwd, env, max_stdout_bytes)
+        return _bounded_process(
+            argv,
+            input_bytes,
+            timeout,
+            cwd,
+            env,
+            max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
+    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+        return self._execute_with_limits(
+            argv,
+            input_bytes,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            max_stdout_bytes=self._max_output_bytes,
+            max_stderr_bytes=self._max_output_bytes,
+        )
 
     def _execute_helper(self, program: bytes, digest: str, timeout: float | None) -> CommandResult:
         remote_env = _validate_env(helper_digest=digest, deferred=True)
@@ -815,7 +911,15 @@ class SSHTransport(_HelperTransport):
             self.ssh_host,
             remote_command,
         )
-        return self._execute(argv, program, timeout=timeout, cwd="/", env=_validate_env())
+        return self._execute_with_limits(
+            argv,
+            program,
+            timeout=timeout,
+            cwd="/",
+            env=_validate_env(),
+            max_stdout_bytes=MAX_HELPER_STDOUT_BYTES,
+            max_stderr_bytes=MAX_HELPER_STDERR_BYTES,
+        )
 
     def guarded_rsync(
         self,

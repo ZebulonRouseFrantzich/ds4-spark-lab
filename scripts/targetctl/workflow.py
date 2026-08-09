@@ -691,7 +691,7 @@ def _promote_log_content(bundle: ArtifactBundle, text_name: str, content: bytes,
             os.fsync(fd)
         finally:
             os.close(fd)
-        bundle.promote_text(text_name, verified_path, StreamingRedactor(private), canaries=private)
+        bundle.promote_text(text_name, verified_path, StreamingRedactor(private, max_output=MAX_TEXT_BYTES), canaries=private)
     finally:
         try:
             verified_path.unlink()

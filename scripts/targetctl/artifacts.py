@@ -64,18 +64,21 @@ _HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_SYSTEM_RE = re.compile(r"[A-Za-z0-9._+@=-]{1,160}\Z")
 _SOURCE_COMPONENT_RE = re.compile(r"[A-Za-z0-9._+@%=-]{1,128}\Z")
 _VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
-_SYSTEM_TOOL_PATHS = {
-    "nvidia-smi": frozenset(("/usr/bin/nvidia-smi",)),
-    "nvcc": frozenset(("/usr/local/cuda/bin/nvcc",)),
-    "gcc": frozenset(("/usr/bin/gcc",)),
-    "g++": frozenset(("/usr/bin/g++",)),
-    "make": frozenset(("/usr/bin/make",)),
-    "python3": frozenset(("/usr/bin/python3",)),
-    "git": frozenset(("/usr/bin/git",)),
-    "rsync": frozenset(("/usr/bin/rsync",)),
-    "cuobjdump": frozenset(("/usr/local/cuda/bin/cuobjdump",)),
-}
-_DOCTOR_TOOLS = tuple(_SYSTEM_TOOL_PATHS)
+_SAFE_TOOL_LOCATION_RE = re.compile(
+    r"/(?:usr|nix/store)/(?:[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}/)*"
+    r"[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}\Z"
+)
+_DOCTOR_TOOLS = (
+    "nvidia-smi",
+    "nvcc",
+    "gcc",
+    "g++",
+    "make",
+    "python3",
+    "git",
+    "rsync",
+    "cuobjdump",
+)
 _FAILURE_CLASSES = frozenset(
     ("configuration", "preflight", "tool_missing", "command_failed", "timeout", "contract_failed", "identity_mismatch", "unavailable")
 )
@@ -459,7 +462,14 @@ def _validate_doctor(payload: Mapping[str, Any]) -> dict[str, Any]:
         if version is None:
             if succeeded:
                 raise _fail("artifact_value_invalid", "artifact value is invalid")
-        elif not not_run and isinstance(version, str) and _VERSION_RE.fullmatch(version) and isinstance(location, str) and location in _SYSTEM_TOOL_PATHS[expected_name]:
+        elif (
+            not not_run
+            and isinstance(version, str)
+            and _VERSION_RE.fullmatch(version)
+            and isinstance(location, str)
+            and len(location) <= 4096
+            and _SAFE_TOOL_LOCATION_RE.fullmatch(location)
+        ):
             pass
         else:
             raise _fail("artifact_value_invalid", "artifact value is invalid")

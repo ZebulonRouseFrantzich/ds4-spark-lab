@@ -388,6 +388,7 @@ def _release_lifecycle_lease(run_id):
         pass
 
 spec = {}
+redaction_secrets = ()
 
 child = None
 child_pgid = None
@@ -448,13 +449,30 @@ try:
   }
   if (
     not isinstance(spec, dict)
-    or set(spec) != {'argv', 'drafter', 'secrets', 'lease_seconds', 'run_id', 'launch_profile'}
+    or set(spec) != {'argv', 'drafter', 'redaction_paths', 'fixed_canaries', 'lease_seconds', 'run_id', 'launch_profile'}
     or not isinstance(spec['argv'], list)
+    or not all(isinstance(argument, str) for argument in spec['argv'])
+    or not isinstance(spec['redaction_paths'], list)
+    or len(spec['redaction_paths']) != 2
+    or not isinstance(spec['fixed_canaries'], list)
+    or len(spec['fixed_canaries']) != 2
+    or not isinstance(spec['drafter'], str)
+    or len(spec['argv']) < 9
+    or spec['argv'][-9:-7] != ['--cuda', '-m']
+    or spec['argv'][-7] != spec['redaction_paths'][0]
+    or spec['argv'][-6:-2] != ['-c', '32768', '--host', '127.0.0.1']
+    or spec['argv'][-2] != '--port'
+    or spec['drafter'] != spec['redaction_paths'][1]
     or not isinstance(spec['lease_seconds'], int)
     or not isinstance(spec['run_id'], str)
     or spec['launch_profile'] != profile
     or spec['lease_seconds'] < 1
   ):
+    raise ValueError('invalid_spec')
+  try:
+    redaction_secrets = _targetctl_redaction_canaries(
+      spec['redaction_paths'], spec['fixed_canaries'])
+  except (TypeError, ValueError):
     raise ValueError('invalid_spec')
   state = _read_json('run.json')
   supervisor_ticks = _ticks(os.getpid())
@@ -474,7 +492,7 @@ try:
   state['supervisor_cmdline_sha256'] = supervisor_cmdline_sha256
   _atom_json('run.json', state)
   failure_stage = 'log_open'
-  redactor = _targetctl_redactor(spec.get('secrets', ()))
+  redactor = _targetctl_redactor(redaction_secrets)
   log_fd = os.open('server.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), 0o600, dir_fd=RUN_FD)
   failure_stage = 'child_spawn'
   env = {'LANG': 'C', 'LC_ALL': 'C', 'PATH': '/usr/bin:/bin', 'DS4_CONT_MTP_MODE':'2', 'DS4_CONT_DSPARK':'1', 'DS4_DSPARK_MODEL': spec.get('drafter', '')}
@@ -746,14 +764,6 @@ def _lc_open_dir(paths):
     os.close(run_fd)
     if sv_fd is not None:os.close(sv_fd)
     raise
-def _lc_secret_values(paths):
-  try:
-    return list(_targetctl_redaction_canaries(
-      (paths['model_path'],paths['drafter_path']),
-      (paths['workdir'],paths['run_dir']),
-    ))
-  except (TypeError,ValueError):
-    _fail('invalid_runtime_inputs')
 def _lc_file_present(root_fd,name):
   try:
     os.stat(name,dir_fd=root_fd,follow_symlinks=False)
@@ -918,7 +928,7 @@ def lifecycle_serve(payload):
     }
     _lc_write_state(root_fd,state)
     dispatch_recorded=True
-    spec={'argv':argv,'drafter':paths['drafter_path'],'secrets':_lc_secret_values(paths),'lease_seconds':data['lease_seconds'],'run_id':data['run_id'],'launch_profile':profile}
+    spec={'argv':argv,'drafter':paths['drafter_path'],'redaction_paths':[paths['model_path'],paths['drafter_path']],'fixed_canaries':[paths['workdir'],paths['run_dir']],'lease_seconds':data['lease_seconds'],'run_id':data['run_id'],'launch_profile':profile}
     _lc_atom(root_fd,'launch.json',spec)
     sv_script='supervisor.py'
     sv_temp='.'+sv_script+'.'+secrets.token_hex(12)

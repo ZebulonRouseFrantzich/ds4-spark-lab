@@ -1,8 +1,8 @@
 """Sanitized, fixed-input target doctor operation.
 
 This module deliberately retains only the finite facts permitted in the
-``target-doctor`` artifact payload.  Paths and command output are consumed
-locally and never enter a result or exception message.
+``target-doctor`` artifact payload.  Command output and private paths are
+consumed locally; only grammar-bounded canonical system tool paths are exposed.
 """
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import stat
+import subprocess
+import time
 from typing import Any, Mapping, Protocol
 
 from .common import TargetError
@@ -27,6 +31,11 @@ _HASH_CHUNK_BYTES = 1024 * 1024
 MAX_WEIGHT_BYTES = 1 << 40
 _VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])")
 _SAFE_SYSTEM = re.compile(r"[A-Za-z0-9._+@=-]{1,160}\Z")
+_SAFE_TOOL_LOCATION = re.compile(
+    r"/(?:usr|nix/store)/(?:[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}/)*"
+    r"[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}\Z"
+)
+_MAX_TOOL_SYMLINKS = 40
 
 # Order is artifact order.  These are not searched through PATH and are part of
 _CUDA_VERSION = re.compile(
@@ -53,10 +62,10 @@ _NIX_CANDIDATES = (
     "/nix/profile/bin/nix",
     "/usr/bin/nix",
 )
-_NIX_COMPARE_TOOLS = (
-    ("nvcc", "/usr/local/cuda/bin/nvcc"),
-    ("gcc", "/usr/bin/gcc"),
-    ("g++", "/usr/bin/g++"),
+_NIX_COMPARE_TOOL_NAMES = (
+    "nvcc",
+    "gcc",
+    "g++",
 )
 _NIX_PROBE = (
     'p=$(command -v "$1") || exit 20; '
@@ -150,9 +159,19 @@ def _validate_result_payload(payload: Any) -> DoctorResult:
         raise _error("doctor_response_invalid")
     clean_tools: list[tuple[str, str | None, str | None]] = []
     for expected, item in zip(DOCTOR_TOOLS, tools, strict=True):
-        if not isinstance(item, Mapping) or set(item) != {"name", "version", "location"} or item["name"] != expected[0] or item["location"] != expected[1] or not isinstance(item["version"], str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", item["version"]):
+        if not isinstance(item, Mapping) or set(item) != {"name", "version", "location"}:
             raise _error("doctor_response_invalid")
-        clean_tools.append((expected[0], item["version"], expected[1]))
+        location = item["location"]
+        if (
+            item["name"] != expected[0]
+            or not isinstance(location, str)
+            or len(location) > 4096
+            or not _SAFE_TOOL_LOCATION.fullmatch(location)
+            or not isinstance(item["version"], str)
+            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", item["version"])
+        ):
+            raise _error("doctor_response_invalid")
+        clean_tools.append((expected[0], item["version"], location))
     gpu = payload["gpu"]
     if not isinstance(gpu, Mapping) or gpu != {"platform": "GB10", "compute_capability": "sm_121"}:
         raise _error("doctor_response_invalid")
@@ -191,14 +210,219 @@ def _version(name: str, output: bytes) -> str:
     return match.group(1).decode("ascii")
 
 
-def _tool_version(transport: _Transport, name: str, path: str) -> str:
-    try:
-        item = os.stat(path, follow_symlinks=False)
-    except OSError:
-        raise _error("doctor_tool_missing") from None
-    if not stat.S_ISREG(item.st_mode) or item.st_uid not in {0, os.geteuid()} or not (item.st_mode & stat.S_IXUSR):
+def _tool_identity(item: os.stat_result) -> tuple[int, ...]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _open_tool_alias(path: str) -> tuple[str, int, tuple[int, ...], tuple[tuple[str, tuple[int, ...]], ...]]:
+    """Resolve and pin one fixed alias without trusting ``realpath`` races."""
+
+    if not isinstance(path, str) or not path.startswith("/") or not path.isascii() or len(path) > 4096:
         raise _error("doctor_tool_missing")
-    return _version(name, _run_checked(transport, (path, "--version")))
+    owners = {0, os.geteuid()}
+    pending = path.split("/")[1:]
+    resolved: list[str] = []
+    chain: list[tuple[str, tuple[int, ...]]] = []
+    links = 0
+    while pending:
+        component = pending.pop(0)
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if not resolved:
+                raise _error("doctor_tool_missing")
+            resolved.pop()
+            continue
+        candidate = "/" + "/".join((*resolved, component))
+        if len(candidate) > 4096 or not candidate.isascii():
+            raise _error("doctor_tool_missing")
+        try:
+            item = os.lstat(candidate)
+        except OSError:
+            raise _error("doctor_tool_missing") from None
+        identity = _tool_identity(item)
+        if stat.S_ISLNK(item.st_mode):
+            if item.st_uid not in owners:
+                raise _error("doctor_tool_missing")
+            links += 1
+            if links > _MAX_TOOL_SYMLINKS:
+                raise _error("doctor_tool_missing")
+            try:
+                target = os.readlink(candidate)
+                after_link = os.lstat(candidate)
+            except OSError:
+                raise _error("doctor_tool_missing") from None
+            if (
+                not target
+                or not target.isascii()
+                or len(target) > 4096
+                or _tool_identity(after_link) != identity
+            ):
+                raise _error("doctor_tool_missing")
+            chain.append((candidate, identity))
+            remainder = pending
+            if target.startswith("/"):
+                resolved = []
+                pending = target.split("/")[1:] + remainder
+            else:
+                pending = target.split("/") + remainder
+            continue
+        chain.append((candidate, identity))
+        if pending:
+            if not stat.S_ISDIR(item.st_mode) or item.st_uid not in owners:
+                raise _error("doctor_tool_missing")
+            resolved.append(component)
+            continue
+        if (
+            not _SAFE_TOOL_LOCATION.fullmatch(candidate)
+            or not stat.S_ISREG(item.st_mode)
+            or item.st_uid not in owners
+            or not item.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            or item.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise _error("doctor_tool_missing")
+        fd: int | None = None
+        try:
+            fd = os.open(
+                candidate,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(fd)
+            pinned_location = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            raise _error("doctor_tool_missing") from None
+        if _tool_identity(opened) != identity or pinned_location != candidate:
+            os.close(fd)
+            raise _error("doctor_tool_missing")
+        return candidate, fd, identity, tuple(chain)
+    raise _error("doctor_tool_missing")
+
+
+def _kill_tool_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _pinned_tool_output(fd: int, resolved: str) -> bytes:
+    """Capture a version from the already-open executable, with bounded pipes."""
+
+    descriptor = f"/proc/self/fd/{fd}"
+    try:
+        process = subprocess.Popen(
+            (resolved, "--version"),
+            executable=descriptor,
+            pass_fds=(fd,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/",
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/local/cuda/bin:/usr/bin:/bin"},
+            start_new_session=True,
+        )
+    except OSError:
+        raise _error("doctor_command_failed") from None
+    failure: str | None = None
+    streams = {"stdout": bytearray(), "stderr": bytearray()}
+    try:
+        deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+        with selectors.DefaultSelector() as selector:
+            assert process.stdout is not None and process.stderr is not None
+            for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            while selector.get_map() or process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = "doctor_command_timeout"
+                    break
+                if not selector.get_map():
+                    try:
+                        process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        failure = "doctor_command_timeout"
+                    break
+                for key, _ in selector.select(min(0.1, remaining)):
+                    data = streams[key.data]
+                    try:
+                        block = os.read(key.fileobj.fileno(), min(65536, MAX_COMMAND_OUTPUT_BYTES + 1 - len(data)))
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        failure = "doctor_command_failed"
+                        break
+                    if not block:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    data.extend(block)
+                    if len(data) > MAX_COMMAND_OUTPUT_BYTES:
+                        failure = "doctor_command_failed"
+                        break
+                if failure is not None:
+                    break
+        if failure is not None:
+            _kill_tool_process(process)
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _kill_tool_process(process)
+            process.wait()
+            failure = "doctor_command_failed"
+        if failure is not None:
+            raise _error(failure)
+        if process.returncode != 0:
+            raise _error("doctor_command_failed")
+        return bytes(streams["stdout"])
+    finally:
+        if process.poll() is None:
+            _kill_tool_process(process)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def _tool_version(name: str, path: str) -> tuple[str, str]:
+    resolved, fd, identity, chain = _open_tool_alias(path)
+    try:
+        output = _pinned_tool_output(fd, resolved)
+        try:
+            stable_identity = _tool_identity(os.fstat(fd))
+            stable_location = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            raise _error("doctor_tool_missing") from None
+        if stable_identity != identity or stable_location != resolved:
+            raise _error("doctor_tool_missing")
+        check_resolved, check_fd, check_identity, check_chain = _open_tool_alias(path)
+        try:
+            if (check_resolved, check_identity, check_chain) != (resolved, identity, chain):
+                raise _error("doctor_tool_missing")
+        finally:
+            os.close(check_fd)
+        return _version(name, output), resolved
+    finally:
+        os.close(fd)
 
 def _find_nix() -> str | None:
     candidates = list(_NIX_CANDIDATES)
@@ -239,9 +463,19 @@ def _nix_identity(
     nix_match = _VERSION.search(nix_output)
     if nix_match is None:
         raise _error("doctor_nix_mismatch")
-    native = {name: version for name, version, _ in tools}
+    native: dict[str, tuple[str | None, str | None]] = {}
+    for expected_name in _NIX_COMPARE_TOOL_NAMES:
+        matches = [
+            (version, location)
+            for name, version, location in tools
+            if name == expected_name
+        ]
+        if len(matches) != 1:
+            raise _error("doctor_nix_mismatch")
+        native[expected_name] = matches[0]
     flake_ref = "path:" + str(workdir)
-    for name, expected_path in _NIX_COMPARE_TOOLS:
+    for name in _NIX_COMPARE_TOOL_NAMES:
+        expected_version, expected_path = native[name]
         output = _run_checked(
             transport,
             (
@@ -269,7 +503,7 @@ def _nix_identity(
             observed_version = _version(name, version_output)
         except TargetError:
             raise _error("doctor_nix_mismatch") from None
-        if resolved_path != expected_path or observed_version != native.get(name):
+        if resolved_path != expected_path or observed_version != expected_version:
             raise _error("doctor_nix_mismatch")
     return "matched", nix_match.group(1).decode("ascii")
 
@@ -320,8 +554,8 @@ def _local_facts(run_dir: Path) -> tuple[str, str, str, int, int, bool]:
     return info.sysname, info.release, info.machine, memory, disk, time_sync
 
 
-def _gpu(transport: _Transport) -> tuple[str, str]:
-    output = _run_checked(transport, ("/usr/bin/nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"))
+def _gpu(transport: _Transport, path: str) -> tuple[str, str]:
+    output = _run_checked(transport, (path, "--query-gpu=name,compute_cap", "--format=csv,noheader"))
     if len(output.splitlines()) != 1:
         raise _error("doctor_gpu_invalid")
     fields = [part.strip().lower() for part in output.decode("ascii", "ignore").split(",")]
@@ -372,10 +606,15 @@ def _local_doctor(config: Any, transport: LocalTransport, inputs: RuntimeInput, 
         if before != snapshot.applied_tree_hash:
             raise _error("doctor_source_mismatch")
         facts = _local_facts(run_dir)
-        tools = tuple((name, _tool_version(transport, name, path), path) for name, path in DOCTOR_TOOLS)
-        _run_checked(transport, ("/usr/local/cuda/bin/nvcc", "-ccbin", "/usr/bin/g++", "--version"))
+        tool_rows: list[tuple[str, str, str]] = []
+        for name, alias in DOCTOR_TOOLS:
+            version, resolved = _tool_version(name, alias)
+            tool_rows.append((name, version, resolved))
+        tools = tuple(tool_rows)
+        locations = {name: location for name, _, location in tools}
+        _run_checked(transport, (locations["nvcc"], "-ccbin", locations["g++"], "--version"))
         nix = _nix_identity(transport, source_root, tools)
-        result = DoctorResult("succeeded", None, facts[0], facts[1], facts[2], tools, _gpu(transport), facts[3], facts[4], facts[5], _weight_hash(inputs.model_path), _weight_hash(inputs.drafter_path), nix)
+        result = DoctorResult("succeeded", None, facts[0], facts[1], facts[2], tools, _gpu(transport, locations["nvidia-smi"]), facts[3], facts[4], facts[5], _weight_hash(inputs.model_path), _weight_hash(inputs.drafter_path), nix)
         try:
             after = verify_applied_tree(source_root, snapshot)
         except TargetError:
@@ -468,13 +707,78 @@ def doctor(
 run_doctor = doctor
 collect_doctor = doctor
 
-# The extension has no imports from the synchronized source tree.  It is kept
-# intentionally small: remote execution returns the same finite payload that
-# the controller validates above; no command output or paths leave the target.
+# The extension has no imports from the synchronized source tree.  It returns
+# the same finite payload validated above: no command output or private path
+# leaves the target.
 REMOTE_DOCTOR_EXTENSION = r'''
 import hashlib as _doctor_hashlib, json as _doctor_json, os as _doctor_os, re as _doctor_re, selectors as _doctor_selectors, signal as _doctor_signal, stat as _doctor_stat, subprocess as _doctor_subprocess, time as _doctor_time
+_DOCTOR_SAFE_TOOL_LOCATION=_doctor_re.compile(r'/(?:usr|nix/store)/(?:[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}/)*[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}\Z')
+_DOCTOR_MAX_TOOL_SYMLINKS=40
+def _doctor_tool_identity(item):
+    return (item.st_dev,item.st_ino,item.st_mode,item.st_uid,item.st_gid,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
+def _doctor_open_tool(alias):
+    if not isinstance(alias,str) or not alias.startswith('/') or not alias.isascii() or len(alias)>4096: _fail('doctor_tool_missing')
+    owners=(0,_doctor_os.geteuid()); pending=alias.split('/')[1:]; resolved=[]; chain=[]; links=0
+    while pending:
+        component=pending.pop(0)
+        if component in ('','.'): continue
+        if component=='..':
+            if not resolved: _fail('doctor_tool_missing')
+            resolved.pop(); continue
+        candidate='/'+'/'.join(resolved+[component])
+        if len(candidate)>4096 or not candidate.isascii(): _fail('doctor_tool_missing')
+        try: item=_doctor_os.lstat(candidate)
+        except OSError: _fail('doctor_tool_missing')
+        identity=_doctor_tool_identity(item)
+        if _doctor_stat.S_ISLNK(item.st_mode):
+            if item.st_uid not in owners: _fail('doctor_tool_missing')
+            links+=1
+            if links>_DOCTOR_MAX_TOOL_SYMLINKS: _fail('doctor_tool_missing')
+            try:
+                target=_doctor_os.readlink(candidate); after_link=_doctor_os.lstat(candidate)
+            except OSError: _fail('doctor_tool_missing')
+            if not target or not target.isascii() or len(target)>4096 or _doctor_tool_identity(after_link)!=identity: _fail('doctor_tool_missing')
+            chain.append((candidate,identity)); remainder=pending
+            if target.startswith('/'):
+                resolved=[]; pending=target.split('/')[1:]+remainder
+            else: pending=target.split('/')+remainder
+            continue
+        chain.append((candidate,identity))
+        if pending:
+            if not _doctor_stat.S_ISDIR(item.st_mode) or item.st_uid not in owners: _fail('doctor_tool_missing')
+            resolved.append(component); continue
+        if not _DOCTOR_SAFE_TOOL_LOCATION.fullmatch(candidate) or not _doctor_stat.S_ISREG(item.st_mode) or item.st_uid not in owners or not item.st_mode&0o111 or item.st_mode&0o022: _fail('doctor_tool_missing')
+        fd=None
+        try:
+            fd=_doctor_os.open(candidate,_doctor_os.O_RDONLY|_doctor_os.O_CLOEXEC|getattr(_doctor_os,'O_NOFOLLOW',0))
+            opened=_doctor_os.fstat(fd)
+            pinned_location=_doctor_os.readlink('/proc/self/fd/%d'%fd)
+        except OSError:
+            if fd is not None: _doctor_os.close(fd)
+            _fail('doctor_tool_missing')
+        if _doctor_tool_identity(opened)!=identity or pinned_location!=candidate:
+            _doctor_os.close(fd); _fail('doctor_tool_missing')
+        return candidate,fd,identity,tuple(chain)
+    _fail('doctor_tool_missing')
+def _doctor_tool(name,alias):
+    resolved,fd,identity,chain=_doctor_open_tool(alias)
+    try:
+        output=_doctor_cmd((resolved,'--version'),pass_fds=(fd,),executable='/proc/self/fd/%d'%fd)
+        try:
+            stable_identity=_doctor_tool_identity(_doctor_os.fstat(fd))
+            stable_location=_doctor_os.readlink('/proc/self/fd/%d'%fd)
+        except OSError: _fail('doctor_tool_missing')
+        if stable_identity!=identity or stable_location!=resolved: _fail('doctor_tool_missing')
+        check_resolved,check_fd,check_identity,check_chain=_doctor_open_tool(alias)
+        try:
+            if (check_resolved,check_identity,check_chain)!=(resolved,identity,chain): _fail('doctor_tool_missing')
+        finally: _doctor_os.close(check_fd)
+        version=_doctor_version(name,output)
+        if version is None: _fail('doctor_command_failed')
+        return {'name':name,'version':version,'location':resolved}
+    finally: _doctor_os.close(fd)
 _DOCTOR_TOOLS=(('nvidia-smi','/usr/bin/nvidia-smi'),('nvcc','/usr/local/cuda/bin/nvcc'),('gcc','/usr/bin/gcc'),('g++','/usr/bin/g++'),('make','/usr/bin/make'),('python3','/usr/bin/python3'),('git','/usr/bin/git'),('rsync','/usr/bin/rsync'),('cuobjdump','/usr/local/cuda/bin/cuobjdump'))
-_DOCTOR_NIX_TOOLS=(('nvcc','/usr/local/cuda/bin/nvcc'),('gcc','/usr/bin/gcc'),('g++','/usr/bin/g++'))
+_DOCTOR_NIX_TOOL_NAMES=('nvcc','gcc','g++')
 _DOCTOR_NIX_PROBE='p=$(command -v "$1") || exit 20; printf "TARGETCTL_PATH=%s\\n" "$p"; exec "$p" --version'
 _DOCTOR_VERSION=rb'(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])'
 _DOCTOR_CUDA_VERSION=rb'\brelease\s+([0-9]+(?:\.[0-9]+){1,3})(?:,|\s)'
@@ -509,12 +813,12 @@ def _doctor_close_registered(selector):
         except (KeyError,OSError,ValueError): pass
         try: key.fileobj.close()
         except OSError: pass
-def _doctor_cmd(argv,timeout=5,pass_fds=()):
+def _doctor_cmd(argv,timeout=5,pass_fds=(),executable=None):
     process=None; process_group=None; wait_attempted=False; cleanup_ok=True
     reason=None; streams={'stdout':bytearray(),'stderr':bytearray()}
     try:
         try:
-            process=_doctor_subprocess.Popen(argv,stdin=_doctor_subprocess.DEVNULL,stdout=_doctor_subprocess.PIPE,stderr=_doctor_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/local/cuda/bin:/usr/bin:/bin'},start_new_session=True,pass_fds=pass_fds)
+            process=_doctor_subprocess.Popen(argv,executable=executable,stdin=_doctor_subprocess.DEVNULL,stdout=_doctor_subprocess.PIPE,stderr=_doctor_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/local/cuda/bin:/usr/bin:/bin'},start_new_session=True,pass_fds=pass_fds)
         except OSError: _fail('doctor_command_failed')
         process_group=process.pid
         if not isinstance(process_group,int) or process_group<=1: _fail('doctor_command_failed')
@@ -584,8 +888,13 @@ def _doctor_nix(tools,work_fd):
     match=_doctor_re.search(_DOCTOR_VERSION,_doctor_cmd((nix,'--version')))
     if not match: _fail('doctor_nix_mismatch')
     descriptor='/proc/self/fd/%d'%work_fd
-    native={tool['name']:tool['version'] for tool in tools}
-    for name,expected in _DOCTOR_NIX_TOOLS:
+    native={}
+    for expected_name in _DOCTOR_NIX_TOOL_NAMES:
+        matches=[(tool['version'],tool['location']) for tool in tools if tool['name']==expected_name]
+        if len(matches)!=1: _fail('doctor_nix_mismatch')
+        native[expected_name]=matches[0]
+    for name in _DOCTOR_NIX_TOOL_NAMES:
+        expected_version,expected_location=native[name]
         out=_doctor_cmd((nix,'--extra-experimental-features','nix-command flakes','develop','--no-write-lock-file','path:'+descriptor,'--command','/bin/sh','-c',_DOCTOR_NIX_PROBE,'targetctl-nix-probe',name),120,(work_fd,))
         lines=out.splitlines(); markers=[(i,line[len(b'TARGETCTL_PATH='):]) for i,line in enumerate(lines) if line.startswith(b'TARGETCTL_PATH=')]
         if len(markers)!=1: _fail('doctor_nix_mismatch')
@@ -593,7 +902,7 @@ def _doctor_nix(tools,work_fd):
         try: resolved=resolved.decode('ascii')
         except UnicodeDecodeError: _fail('doctor_nix_mismatch')
         version=_doctor_version(name,b'\n'.join(lines[position+1:]))
-        if resolved!=expected or version!=native.get(name): _fail('doctor_nix_mismatch')
+        if resolved!=expected_location or version!=expected_version: _fail('doctor_nix_mismatch')
     return {'status':'matched','version':match.group(1).decode('ascii')}
 def _doctor_live_lock(run_fd,run_identity,run_token,token):
     if not isinstance(token,str) or len(token)!=64 or any(c not in '0123456789abcdef' for c in token): _fail('doctor_source_mismatch')
@@ -658,17 +967,11 @@ def target_doctor(payload):
         try: run_info=_doctor_os.fstat(run_fd); statvfs=_doctor_os.fstatvfs(run_fd); uname=_doctor_os.uname()
         except OSError: _fail('doctor_system_invalid')
         if not _doctor_stat.S_ISDIR(run_info.st_mode) or uname.sysname!='Linux' or not all(_DOCTOR_SAFE_SYSTEM.fullmatch(value) for value in (uname.sysname,uname.release,uname.machine)): _fail('doctor_system_invalid')
-        tools=[]
-        for name,path in _DOCTOR_TOOLS:
-            try: item=_doctor_os.stat(path,follow_symlinks=False)
-            except OSError: _fail('doctor_tool_missing')
-            if not _doctor_stat.S_ISREG(item.st_mode) or item.st_uid not in (0,_doctor_os.geteuid()) or not item.st_mode&0o100: _fail('doctor_tool_missing')
-            version=_doctor_version(name,_doctor_cmd((path,'--version')))
-            if version is None: _fail('doctor_command_failed')
-            tools.append({'name':name,'version':version,'location':path})
-        _doctor_cmd(('/usr/local/cuda/bin/nvcc','-ccbin','/usr/bin/g++','--version'))
+        tools=[_doctor_tool(name,path) for name,path in _DOCTOR_TOOLS]
+        locations={tool['name']:tool['location'] for tool in tools}
+        _doctor_cmd((locations['nvcc'],'-ccbin',locations['g++'],'--version'))
         nix=_doctor_nix(tools,work_fd)
-        rows=_doctor_cmd(('/usr/bin/nvidia-smi','--query-gpu=name,compute_cap','--format=csv,noheader')).decode('ascii','ignore').strip().splitlines()
+        rows=_doctor_cmd((locations['nvidia-smi'],'--query-gpu=name,compute_cap','--format=csv,noheader')).decode('ascii','ignore').strip().splitlines()
         if len(rows)!=1 or ',' not in rows[0]: _fail('doctor_gpu_invalid')
         name,cap=(value.strip().lower() for value in rows[0].split(',',1))
         if 'gb10' not in name or cap not in ('12.1','sm_121'): _fail('doctor_gpu_invalid')

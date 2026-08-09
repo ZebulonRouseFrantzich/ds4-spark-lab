@@ -315,6 +315,18 @@ class ArtifactBundleTests(unittest.TestCase):
             [item["name"] for item in payload["tools"]],
             ["nvidia-smi", "nvcc", "gcc", "g++", "make", "python3", "git", "rsync", "cuobjdump"],
         )
+        resolved = _payload("target-doctor")
+        resolved["tools"][2]["location"] = "/usr/bin/gcc-14"
+        resolved["tools"][3]["location"] = "/usr/bin/g++-14"
+        resolved["tools"][5]["location"] = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-python3/bin/python3.13"
+        validated = _validate_record_payload("target-doctor", resolved)
+        self.assertEqual(validated["tools"][2]["location"], "/usr/bin/gcc-14")
+        for unsafe in ("/tmp/gcc", "/home/target/gcc", "/usr/bin/../gcc", "/usr/bin/gcc name"):
+            with self.subTest(location=unsafe):
+                malformed = _payload("target-doctor")
+                malformed["tools"][2]["location"] = unsafe
+                with self.assertRaises(TargetError):
+                    _validate_record_payload("target-doctor", malformed)
         for field, value in (("memory_bytes", 0), ("disk_bytes", 0), ("time_sync", False)):
             with self.subTest(field=field):
                 malformed = _payload("target-doctor")

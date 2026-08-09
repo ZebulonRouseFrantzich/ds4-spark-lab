@@ -146,6 +146,108 @@ class WorkflowBundleEvidenceTests(unittest.TestCase):
             self.assertFalse((run_dir / "build.log").exists())
             self.assertFalse((run_dir / "server.log").exists())
 
+    def test_build_and_server_log_promotion_preserves_full_digest_at_finite_boundaries(self) -> None:
+        from scripts.targetctl.artifacts import ArtifactBundle, MAX_TEXT_BYTES
+        from scripts.targetctl.config import TargetConfig
+        from scripts.targetctl.workflow import _promote_build_log, _promote_server_log
+
+        def log_content(label: str, size: int) -> bytes:
+            line = f"{label} safe artifact output\n".encode("utf-8")
+            return line * (size // len(line)) + b"x" * (size % len(line))
+
+        for size in (65_537, MAX_TEXT_BYTES):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_dir = root / "runtime"
+                run_dir.mkdir(mode=0o700)
+                config = TargetConfig(name="local", mode="local", run_dir=str(run_dir), source_root=root)
+                bundle = ArtifactBundle(root, "local", f"log-boundary-{size}")
+                build_log = log_content("build", size)
+                server_log = log_content("server", size)
+                for name, content in (("build.log", build_log), ("server.log", server_log)):
+                    path = run_dir / name
+                    path.write_bytes(content)
+                    os.chmod(path, 0o600)
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "TARGETCTL_MODEL_PATH": "/private/model.gguf",
+                        "TARGETCTL_DRAFTER_PATH": "/private/drafter.gguf",
+                    },
+                    clear=False,
+                ):
+                    _promote_build_log(
+                        bundle,
+                        root,
+                        "local",
+                        hashlib.sha256(build_log).hexdigest(),
+                        config,
+                        None,
+                    )
+                    _promote_server_log(
+                        bundle,
+                        root,
+                        "local",
+                        hashlib.sha256(server_log).hexdigest(),
+                        config,
+                        None,
+                    )
+
+                promoted_build = (bundle._staging / "texts" / "build-log.txt").read_bytes()
+                promoted_server = (bundle._staging / "texts" / "server-log.txt").read_bytes()
+                self.assertEqual(promoted_build, build_log)
+                self.assertEqual(promoted_server, server_log)
+                self.assertEqual(hashlib.sha256(promoted_build).hexdigest(), hashlib.sha256(build_log).hexdigest())
+                self.assertEqual(hashlib.sha256(promoted_server).hexdigest(), hashlib.sha256(server_log).hexdigest())
+
+    def test_build_and_server_log_promotion_refuses_over_limit_inputs(self) -> None:
+        from scripts.targetctl.artifacts import ArtifactBundle, MAX_TEXT_BYTES
+        from scripts.targetctl.config import TargetConfig
+        from scripts.targetctl.workflow import _promote_build_log, _promote_server_log
+
+        for report_name in ("build", "server"):
+            with self.subTest(report=report_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_dir = root / "runtime"
+                run_dir.mkdir(mode=0o700)
+                content = b"x" * (MAX_TEXT_BYTES + 1)
+                source = run_dir / f"{report_name}.log"
+                source.write_bytes(content)
+                os.chmod(source, 0o600)
+                config = TargetConfig(name="local", mode="local", run_dir=str(run_dir), source_root=root)
+                bundle = ArtifactBundle(root, "local", f"over-limit-{report_name}")
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "TARGETCTL_MODEL_PATH": "/private/model.gguf",
+                        "TARGETCTL_DRAFTER_PATH": "/private/drafter.gguf",
+                    },
+                    clear=False,
+                ), self.assertRaises(TargetError) as raised:
+                    if report_name == "build":
+                        _promote_build_log(
+                            bundle,
+                            root,
+                            "local",
+                            hashlib.sha256(content).hexdigest(),
+                            config,
+                            None,
+                        )
+                    else:
+                        _promote_server_log(
+                            bundle,
+                            root,
+                            "local",
+                            hashlib.sha256(content).hexdigest(),
+                            config,
+                            None,
+                        )
+
+                self.assertEqual(raised.exception.code, "artifact_log_unavailable")
+                self.assertFalse((bundle._staging / "texts" / f"{report_name}-log.txt").exists())
+
 
 class _WorkflowFixture:
     """Small factory for independently valid public workflow evidence."""

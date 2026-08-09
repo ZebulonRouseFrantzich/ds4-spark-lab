@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from scripts.targetctl.common import TargetError
 from scripts.targetctl import remote
+from scripts.targetctl.redaction import redaction_canaries
 from scripts.targetctl.lifecycle import (
     CleanupResult, RuntimeInputs, RunResult, SmokeResult, cleanup, logs, serve,
     smoke, status, stop,
@@ -106,6 +107,13 @@ def _busy_port() -> int:
     port = s.getsockname()[1]
     # intentionally leaked to keep the port occupied
     return port
+
+
+def _maximum_remote_path(fill: str) -> str:
+    path = "/" + "/".join([fill * 128] * 31 + [fill * 96])
+    if len(path) != 4096:
+        raise AssertionError("maximum path fixture must be exactly 4096 bytes")
+    return path
 
 
 class LifecycleTests(unittest.TestCase):
@@ -214,6 +222,101 @@ class LifecycleTests(unittest.TestCase):
             RuntimeInputs(str(self.model), str(self.drafter), "x", "2" * 64, "3" * 64, "4" * 64, "5" * 64, 0)
         with self.assertRaises(TargetError):
             RuntimeInputs(str(self.model), str(self.drafter), "x", "2" * 64, "3" * 64, "4" * 64, "5" * 64, 99999)
+
+    def test_single_maximum_path_launch_state_stays_bounded(self) -> None:
+        self._setup_work()
+        maximum_model = _maximum_remote_path("m")
+        self.runtime = RuntimeInputs(
+            maximum_model, self.runtime.drafter_path,
+            self.runtime.source_snapshot_id, self.runtime.applied_tree_hash,
+            self.runtime.build_id, self.runtime.work_token, self.runtime.run_token,
+            self.runtime.port, binary_path=self.runtime.binary_path,
+        )
+        legacy_canaries = redaction_canaries(
+            (maximum_model, self.runtime.drafter_path),
+            additional=(str(self.work), str(self.run)),
+        )
+        self.assertGreater(sum(len(value.encode("ascii")) for value in legacy_canaries), 65_536)
+
+        result = serve(self.config, self.transport, self.runtime)
+        try:
+            launch_bytes = (self.run / "launch.json").read_bytes()
+            self.assertLessEqual(len(launch_bytes), 65_536)
+            launch = json.loads(launch_bytes)
+            self.assertEqual(
+                set(launch),
+                {
+                    "argv", "drafter", "redaction_paths", "fixed_canaries",
+                    "lease_seconds", "run_id", "launch_profile",
+                },
+            )
+            self.assertEqual(
+                launch["redaction_paths"],
+                [maximum_model, self.runtime.drafter_path],
+            )
+            self.assertEqual(
+                launch["fixed_canaries"],
+                [str(self.work), str(self.run)],
+            )
+            self.assertNotIn("secrets", launch)
+        finally:
+            stop(self.config, self.transport, self.runtime, run_id=result.run_id)
+
+    def test_two_maximum_paths_fit_and_embedded_canaries_match(self) -> None:
+        port = self._setup_work()
+        maximum_model = _maximum_remote_path("m")
+        maximum_drafter = _maximum_remote_path("d")
+        self.runtime = RuntimeInputs(
+            maximum_model, maximum_drafter,
+            self.runtime.source_snapshot_id, self.runtime.applied_tree_hash,
+            self.runtime.build_id, self.runtime.work_token, self.runtime.run_token,
+            self.runtime.port, binary_path=self.runtime.binary_path,
+        )
+
+        contract_canaries = {str(self.work), str(self.run)}
+        for private_path in (maximum_model, maximum_drafter):
+            components = private_path.split("/")[1:]
+            contract_canaries.add(private_path)
+            contract_canaries.add(components[-1])
+            contract_canaries.update(
+                "/" + "/".join(components[:depth])
+                for depth in range(len(components) - 1, 1, -1)
+            )
+        expected_canaries = redaction_canaries(
+            (maximum_model, maximum_drafter),
+            additional=(str(self.work), str(self.run)),
+        )
+        self.assertEqual(set(expected_canaries), contract_canaries)
+
+        server_path = self.work / "server.py"
+        emitted_canaries = "\n" + "\n".join(expected_canaries) + "\n"
+        _write_server_with_secret(server_path, port, emitted_canaries)
+        server_path.chmod(0o700)
+        _write_build_json(self.run, self.work, "server.py")
+
+        result = serve(self.config, self.transport, self.runtime)
+        try:
+            launch_bytes = (self.run / "launch.json").read_bytes()
+            self.assertLessEqual(len(launch_bytes), 65_536)
+            launch = json.loads(launch_bytes)
+            self.assertEqual(
+                launch["redaction_paths"],
+                [maximum_model, maximum_drafter],
+            )
+            self.assertEqual(
+                launch["fixed_canaries"],
+                [str(self.work), str(self.run)],
+            )
+            self.assertNotIn("secrets", launch)
+
+            log_content = logs(self.config, self.transport, self.runtime)
+            self.assertEqual(log_content.count(b"[REDACTED]"), len(expected_canaries))
+            self.assertIn(b"producer-prefix \n", log_content)
+            self.assertIn(b"\n producer-suffix", log_content)
+            for private in contract_canaries:
+                self.assertNotIn(private.encode("ascii"), log_content)
+        finally:
+            stop(self.config, self.transport, self.runtime, run_id=result.run_id)
 
     # ---- Stop / status without run (empty state) --------------------------
 

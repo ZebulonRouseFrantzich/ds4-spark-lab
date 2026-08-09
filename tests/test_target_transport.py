@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -17,7 +19,16 @@ from unittest import mock
 
 from scripts.targetctl import remote
 from scripts.targetctl.common import PROTOCOL_VERSION, TargetError
-from scripts.targetctl.transport import CommandResult, LocalTransport, SSHForward, SSHTransport, select_transport
+from scripts.targetctl.transport import (
+    CommandResult,
+    LocalTransport,
+    MAX_HELPER_RESPONSE_METADATA_BYTES,
+    MAX_HELPER_STDOUT_BYTES,
+    MAX_PROCESS_OUTPUT_BYTES,
+    SSHForward,
+    SSHTransport,
+    select_transport,
+)
 
 
 def roots(tmp_path: Path) -> dict[str, str]:
@@ -352,8 +363,119 @@ class TransportTests(unittest.TestCase):
             return CommandResult(0, False, 1, b"x" * (cap + 1), b"")
 
         with self.assertRaises(TargetError) as error:
-            LocalTransport(runner=mock.Mock(side_effect=oversized), max_output_bytes=16).run_helper("handshake", {})
-        self.assertEqual(error.exception.code, "invalid_helper_response")
+            LocalTransport(
+                runner=mock.Mock(side_effect=oversized),
+            ).run_helper("handshake", {})
+        self.assertEqual(error.exception.code, "helper_execution_failed")
+
+    def test_base64_log_envelope_crosses_prior_cap_locally_and_over_ssh(self) -> None:
+        report_envelope = {
+            "protocol_version": PROTOCOL_VERSION,
+            "helper_sha256": "0" * 64,
+            "ok": True,
+            "result": {"sha256": "0" * 64, "content_b64": ""},
+        }
+        report_metadata_bytes = len(json.dumps(
+            report_envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")) + 1
+        self.assertEqual(
+            report_metadata_bytes,
+            MAX_HELPER_RESPONSE_METADATA_BYTES,
+        )
+        payload, state = initialized(Path(self._temporary_directory.name) / "large-report")
+        run = Path(payload["run_dir"])
+        report = run / "server.log"
+        fake_ssh = Path(self._temporary_directory.name) / "ssh"
+        fake_ssh.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, sys\n"
+            "separator = sys.argv.index('--')\n"
+            "os.execv('/bin/sh', ['/bin/sh', '-c', sys.argv[separator + 2]])\n",
+            encoding="ascii",
+        )
+        fake_ssh.chmod(0o700)
+        transports = {
+            "local": LocalTransport(),
+            "ssh": SSHTransport(
+                "spark",
+                ssh_binary=str(fake_ssh),
+                ssh_config=self.ssh_config,
+            ),
+        }
+
+        for raw_size in (786_432, 1_048_576):
+            content = (b"x\n" * ((raw_size + 1) // 2))[:raw_size]
+            report.write_bytes(content)
+            report.chmod(0o600)
+            expected_envelope_size = (
+                4 * ((raw_size + 2) // 3)
+                + MAX_HELPER_RESPONSE_METADATA_BYTES
+            )
+            self.assertGreater(expected_envelope_size, MAX_PROCESS_OUTPUT_BYTES)
+            self.assertLessEqual(expected_envelope_size, MAX_HELPER_STDOUT_BYTES)
+            if raw_size == 1_048_576:
+                self.assertEqual(expected_envelope_size, MAX_HELPER_STDOUT_BYTES)
+            for mode, transport in transports.items():
+                with self.subTest(mode=mode, raw_size=raw_size):
+                    result = transport.run_helper(
+                        "read_report",
+                        {
+                            "run_dir": payload["run_dir"],
+                            "run_token": state["run"]["token"],
+                            "name": "server.log",
+                        },
+                    )
+                    decoded = base64.b64decode(result["content_b64"], validate=True)
+                    self.assertEqual(decoded, content)
+                    self.assertEqual(result["sha256"], hashlib.sha256(content).hexdigest())
+
+    def test_helper_envelope_one_byte_over_limit_terminates_and_fails_closed(self) -> None:
+        empty_envelope = {
+            "protocol_version": PROTOCOL_VERSION,
+            "helper_sha256": "0" * 64,
+            "ok": True,
+            "result": {"padding": ""},
+        }
+        envelope_metadata_bytes = len(json.dumps(
+            empty_envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")) + 1
+        padding_bytes = MAX_HELPER_STDOUT_BYTES + 1 - envelope_metadata_bytes
+        extension = (
+            '@register_action("oversized_envelope")\n'
+            "def oversized_envelope(payload):\n"
+            '    return {"padding": "x" * payload["padding_bytes"]}\n'
+        )
+        processes: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def record_process(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with mock.patch(
+            "scripts.targetctl.transport.subprocess.Popen",
+            side_effect=record_process,
+        ):
+            with self.assertRaises(TargetError) as error:
+                LocalTransport().run_helper(
+                    "oversized_envelope",
+                    {"padding_bytes": padding_bytes},
+                    extension_source=extension,
+                    timeout=5.0,
+                )
+
+        self.assertEqual(error.exception.code, "helper_execution_failed")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(all(
+            stream is None or stream.closed
+            for stream in (processes[0].stdin, processes[0].stdout, processes[0].stderr)
+        ))
 
     def test_helper_digest_protocol_and_output_fail_closed_without_command_text(self) -> None:
         captured: dict[str, object] = {}
