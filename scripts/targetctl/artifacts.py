@@ -482,36 +482,63 @@ def _validate_doctor(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_build(payload: Mapping[str, Any]) -> dict[str, Any]:
-    fields = ("status", "failure_class", "source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "command", "version", "binary_size", "sass", "build_log_sha256")
+    fields = ("status", "failure_class", "source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "command", "version", "binary_size", "sass", "build_log_sha256", "exit_code", "duration_ns")
     validate_object_keys(payload, allowed=fields, required=fields)
     status, failure_class = _status_fields(payload)
     succeeded = status == "succeeded"
     not_run = status == "not_run"
     command = payload["command"]
     sass = payload["sass"]
+    exit_code = payload["exit_code"]
+    duration_ns = _nullable_positive(payload["duration_ns"])
     if command is not None and command != "make-cuda-spark":
         raise _fail("artifact_value_invalid", "artifact value is invalid")
     if sass not in (None, "verified", "missing", "not_checked", "not_run"):
         raise _fail("artifact_value_invalid", "artifact value is invalid")
+    if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code < 0):
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
     version = payload["version"]
     if version is not None and (not isinstance(version, str) or not _VERSION_RE.fullmatch(version)):
         raise _fail("artifact_value_invalid", "artifact value is invalid")
+    attempted = command == "make-cuda-spark"
     if not_run and (
-        any(payload[key] is not None for key in ("source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "command", "version", "binary_size", "build_log_sha256"))
+        any(payload[key] is not None for key in ("source_snapshot_id", "source_applied_tree_hash", "build_id", "binary_sha256", "command", "version", "binary_size", "build_log_sha256", "exit_code", "duration_ns"))
         or sass not in (None, "not_run")
     ):
         raise _fail("artifact_value_invalid", "artifact value is invalid")
-    if succeeded and (command != "make-cuda-spark" or sass != "verified"):
+    if attempted:
+        if (
+            payload["source_snapshot_id"] is None or payload["source_applied_tree_hash"] is None
+            or payload["build_log_sha256"] is None or duration_ns is None
+        ):
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+    elif any(payload[key] is not None for key in ("build_log_sha256", "exit_code", "duration_ns")):
+        raise _fail("artifact_value_invalid", "artifact value is invalid")
+    if succeeded:
+        if command != "make-cuda-spark" or sass != "verified" or exit_code != 0:
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+    elif attempted:
+        if any(payload[key] is not None for key in ("build_id", "binary_sha256", "version", "binary_size")) or sass is not None:
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+        if failure_class == "timeout" and exit_code is not None:
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+        if failure_class == "command_failed" and exit_code == 0:
+            raise _fail("artifact_value_invalid", "artifact value is invalid")
+    elif not not_run and (
+        any(payload[key] is not None for key in ("build_id", "binary_sha256", "version", "binary_size"))
+        or sass is not None
+    ):
         raise _fail("artifact_value_invalid", "artifact value is invalid")
     return {
         "status": status, "failure_class": failure_class,
-        "source_snapshot_id": _known_or_none(payload["source_snapshot_id"], _hex_digest, required=succeeded),
-        "source_applied_tree_hash": _known_or_none(payload["source_applied_tree_hash"], _hex_digest, required=succeeded),
+        "source_snapshot_id": _known_or_none(payload["source_snapshot_id"], _hex_digest, required=succeeded or attempted),
+        "source_applied_tree_hash": _known_or_none(payload["source_applied_tree_hash"], _hex_digest, required=succeeded or attempted),
         "build_id": _known_or_none(payload["build_id"], _hex_digest, required=succeeded),
         "binary_sha256": _known_or_none(payload["binary_sha256"], _hex_digest, required=succeeded),
         "command": command, "version": version,
         "binary_size": _known_or_none(payload["binary_size"], _nullable_positive, required=succeeded), "sass": sass,
-        "build_log_sha256": _known_or_none(payload["build_log_sha256"], _nullable_digest, required=succeeded),
+        "build_log_sha256": _known_or_none(payload["build_log_sha256"], _nullable_digest, required=succeeded or attempted),
+        "exit_code": exit_code, "duration_ns": duration_ns,
     }
 
 

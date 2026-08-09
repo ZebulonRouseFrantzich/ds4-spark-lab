@@ -88,7 +88,7 @@ def _payload(name: str, *, build_log_sha256: str | None = None, server_log_sha25
         return {
             "status": "succeeded", "failure_class": None, "source_snapshot_id": snapshot_id, "source_applied_tree_hash": applied_hash,
             "build_id": build_id, "binary_sha256": binary_hash, "command": "make-cuda-spark", "version": "1.2.3",
-            "binary_size": 1024, "sass": "verified", "build_log_sha256": build_log_sha256,
+            "binary_size": 1024, "sass": "verified", "build_log_sha256": build_log_sha256, "exit_code": 0, "duration_ns": 1000,
         }
     if name == "run":
         return {
@@ -232,7 +232,7 @@ class ArtifactBundleTests(unittest.TestCase):
             with self.assertRaises(TargetError):
                 bundle.write_record("build", bad_build, created_at=STAMP)
             failed_build = _payload("build")
-            failed_build.update({"status": "failed", "failure_class": "command_failed", "source_snapshot_id": None, "source_applied_tree_hash": None, "build_id": None, "binary_sha256": None, "command": None, "version": None, "binary_size": None, "sass": None})
+            failed_build.update({"status": "failed", "failure_class": "command_failed", "source_snapshot_id": None, "source_applied_tree_hash": None, "build_id": None, "binary_sha256": None, "command": None, "version": None, "binary_size": None, "sass": None, "build_log_sha256": None, "exit_code": None, "duration_ns": None})
             bundle.write_record("build", failed_build, created_at=STAMP)
             bad_run = _payload("run")
             bad_run["state"] = "running"
@@ -254,6 +254,30 @@ class ArtifactBundleTests(unittest.TestCase):
             bad_cleanup["process"] = True
             with self.assertRaises(TargetError):
                 bundle.write_record("cleanup", bad_cleanup, created_at=STAMP)
+
+    def test_build_attempt_evidence_has_dependency_safe_status_rules(self) -> None:
+        command_failed = _payload("build", build_log_sha256="d" * 64)
+        command_failed.update({
+            "status": "failed", "failure_class": "command_failed", "build_id": None,
+            "binary_sha256": None, "version": None, "binary_size": None, "sass": None,
+            "exit_code": 2, "duration_ns": 42,
+        })
+        self.assertEqual(_validate_record_payload("build", command_failed)["exit_code"], 2)
+        timed_out = dict(command_failed)
+        timed_out.update({"failure_class": "timeout", "exit_code": None})
+        self.assertIsNone(_validate_record_payload("build", timed_out)["exit_code"])
+        preflight = dict(command_failed)
+        preflight.update({
+            "failure_class": "preflight", "command": None, "build_log_sha256": None,
+            "exit_code": None, "duration_ns": None,
+        })
+        self.assertIsNone(_validate_record_payload("build", preflight)["command"])
+        for key, value in (("duration_ns", None), ("build_log_sha256", None), ("exit_code", 0)):
+            malformed = dict(command_failed)
+            malformed[key] = value
+            with self.subTest(key=key):
+                with self.assertRaises(TargetError):
+                    _validate_record_payload("build", malformed)
 
     def test_doctor_facts_require_the_exact_finite_tools_and_healthy_values(self) -> None:
         payload = _payload("target-doctor")
@@ -295,7 +319,7 @@ class ArtifactBundleTests(unittest.TestCase):
             "build": {
                 "status": "not_run", "failure_class": None, "source_snapshot_id": None, "source_applied_tree_hash": None,
                 "build_id": None, "binary_sha256": None, "command": None, "version": None, "binary_size": None,
-                "sass": "not_run", "build_log_sha256": None,
+                "sass": "not_run", "build_log_sha256": None, "exit_code": None, "duration_ns": None,
             },
             "run": {
                 "status": "not_run", "failure_class": None, "state": None, "run_id": None, "source_snapshot_id": None,
@@ -313,7 +337,7 @@ class ArtifactBundleTests(unittest.TestCase):
         }
         failed_payloads = {
             "target-doctor": {**_payload("target-doctor"), "status": "failed", "failure_class": "preflight"},
-            "build": {**_payload("build"), "status": "failed", "failure_class": "command_failed"},
+            "build": {**_payload("build", build_log_sha256="d" * 64), "status": "failed", "failure_class": "command_failed", "build_id": None, "binary_sha256": None, "version": None, "binary_size": None, "sass": None, "exit_code": 2},
             "run": {**_payload("run"), "status": "failed", "failure_class": "command_failed", "state": "failed_startup", "run_id": None, "source_snapshot_id": None, "build_id": None, "binary_sha256": None, "supervisor_pid": None, "supervisor_start_ticks": None, "child_pid": None, "child_start_ticks": None, "port": None},
             "smoke": {**_payload("smoke"), "status": "failed", "failure_class": "contract_failed", "contract": "failed"},
             "cleanup": {**_payload("cleanup"), "status": "failed", "failure_class": "command_failed", "process": "unknown"},
@@ -351,7 +375,7 @@ class ArtifactBundleTests(unittest.TestCase):
         build_not_run = {
             "status": "not_run", "failure_class": None, "source_snapshot_id": None, "source_applied_tree_hash": None,
             "build_id": None, "binary_sha256": None, "command": None, "version": None, "binary_size": None,
-            "sass": "not_run", "build_log_sha256": None,
+            "sass": "not_run", "build_log_sha256": None, "exit_code": None, "duration_ns": None,
         }
         run_not_run = {
             "status": "not_run", "failure_class": None, "state": None, "run_id": None, "source_snapshot_id": None,
@@ -387,9 +411,10 @@ class ArtifactBundleTests(unittest.TestCase):
         }
         controller_mismatch = json.loads(json.dumps(_payload("controller")))
         controller_mismatch["provenance"]["repositories"][1]["commit"] = "f" * 40
+        attempted_failure = {"status": "failed", "failure_class": "command_failed", "build_id": None, "binary_sha256": None, "version": None, "binary_size": None, "sass": None, "exit_code": 2, "duration_ns": 1}
         cases = (
             ("doctor-failure", {"target-doctor": {"status": "failed", "failure_class": "preflight"}}),
-            ("build-failure", {"build": {"status": "failed", "failure_class": "command_failed"}}),
+            ("build-failure", {"build": attempted_failure}),
             ("build-not-run", {"build": build_not_run}),
             ("run-failure", {"run": {"status": "failed", "failure_class": "command_failed", "state": "failed_startup"}}),
             ("run-not-run", {"run": run_not_run}),
@@ -400,7 +425,7 @@ class ArtifactBundleTests(unittest.TestCase):
                 "doctor-not-run-build-attempted",
                 {
                     "target-doctor": doctor_not_run,
-                    "build": {"status": "failed", "failure_class": "command_failed"},
+                    "build": attempted_failure,
                     "run": run_not_run,
                     "smoke": smoke_not_run,
                 },
@@ -470,6 +495,12 @@ class ArtifactBundleTests(unittest.TestCase):
             self.assertNotIn("\x1b", content)
             self.assertNotIn("\x00", content)
             self.assertIn("[REDACTED]", content)
+
+    def test_streaming_redactor_enforces_utf8_byte_limits(self) -> None:
+        redactor = StreamingRedactor(max_output=10)
+        output = redactor.feed("ééééé\n") + redactor.finalize()
+        self.assertLessEqual(len(output.encode("utf-8")), 10)
+        self.assertTrue(output.encode("utf-8").decode("utf-8"))
 
     def test_oversized_text_is_rejected_without_retention(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

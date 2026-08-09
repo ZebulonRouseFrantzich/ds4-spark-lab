@@ -13,8 +13,10 @@ import re
 import stat
 import tempfile
 from typing import Any, Mapping
+
 from .common import TargetError, record_id_for, write_json_atomic
 from .lifecycle import local_operation_lock
+from .redaction import REMOTE_REDACTION_EXTENSION, StreamingRedactor
 from .source import (
     SourceSnapshot,
     _SOURCE_EXTENSION,
@@ -47,6 +49,8 @@ class BuildResult:
     binary_size: int | None
     sass: str | None
     build_log_sha256: str | None
+    exit_code: int | None
+    duration_ns: int | None
 
     def controller_payload(self) -> dict[str, Any]:
         return {
@@ -57,6 +61,7 @@ class BuildResult:
             "command": self.command, "version": self.version,
             "binary_size": self.binary_size, "sass": self.sass,
             "build_log_sha256": self.build_log_sha256,
+            "exit_code": self.exit_code, "duration_ns": self.duration_ns,
         }
 
     to_payload = controller_payload
@@ -80,7 +85,7 @@ def _failure_class(code: str) -> str:
 
 
 def _failed(code: str, snapshot: SourceSnapshot | None = None) -> BuildResult:
-    return BuildResult("failed", _failure_class(code), None if snapshot is None else snapshot.snapshot_id, None if snapshot is None else snapshot.applied_tree_hash, None, None, None, None, None, None, None)
+    return BuildResult("failed", _failure_class(code), None if snapshot is None else snapshot.snapshot_id, None if snapshot is None else snapshot.applied_tree_hash, None, None, None, None, None, None, None, None, None)
 
 
 def _sha256_regular(path: Path, *, executable: bool = False) -> tuple[str, int]:
@@ -143,12 +148,25 @@ def _read_lifecycle(run_dir: Path) -> None:
         raise _error("build_running")
 
 
+def _redaction_secrets(values: tuple[str | None, ...]) -> tuple[str, ...]:
+    """Return the controller-wide canary convention without short fragments."""
+
+    known: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        for candidate in (value, os.path.basename(value)):
+            size = len(candidate.encode("utf-8"))
+            if 4 <= size <= 512:
+                known.add(candidate)
+    return tuple(sorted(known, key=len, reverse=True))
+
+
 def _redacted_log(result: CommandResult, secrets: tuple[str, ...]) -> bytes:
-    if len(result.stdout) > MAX_BUILD_OUTPUT_BYTES or len(result.stderr) > MAX_BUILD_OUTPUT_BYTES:
-        raise _error("build_output_oversize")
-    # Diagnostics can contain private roots and compiler environment.  Retain a
-    # bounded producer-safe marker rather than a transformed raw fragment.
-    return b"[REDACTED]\n"
+    """Retain bounded producer output under the shared streaming policy."""
+
+    redactor = StreamingRedactor(secrets, max_output=MAX_BUILD_OUTPUT_BYTES)
+    return (redactor.feed(result.stdout) + redactor.feed(result.stderr) + redactor.finalize()).encode("utf-8")
 
 
 def _atomic_bytes(path: Path, value: bytes) -> None:
@@ -247,21 +265,36 @@ def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapsho
             raise _error("build_source_mismatch") from None
         count = _jobs(jobs)
         result = transport.run((MAKE, "-C", "engine/ds4", "cuda-spark", f"-j{count}"), timeout=BUILD_TIMEOUT_SECONDS, cwd=str(root), env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"})
-        log = _redacted_log(result, ())
+        secrets = _redaction_secrets((
+            str(root), str(run_dir), getattr(config, "model_path", None), getattr(config, "drafter_path", None),
+        ))
+        log = _redacted_log(result, secrets)
         _atomic_bytes(run_dir / "build.log", log)
         log_hash = hashlib.sha256(log).hexdigest()
+        exit_code = result.exit_code if not result.timed_out and result.exit_code >= 0 else None
+        attempted = dict(
+            source_snapshot_id=snapshot.snapshot_id,
+            source_applied_tree_hash=snapshot.applied_tree_hash,
+            command="make-cuda-spark",
+            build_log_sha256=log_hash,
+            exit_code=exit_code,
+            duration_ns=max(1, result.duration_ns),
+        )
         if result.timed_out:
-            raise _error("build_timeout")
+            return BuildResult("failed", "timeout", build_id=None, binary_sha256=None, **attempted, version=None, binary_size=None, sass=None)
         if result.exit_code != 0:
-            raise _error("build_command_failed")
-        binary = root / "engine" / "ds4" / "ds4-server"
-        binary_hash, size = _sha256_regular(binary, executable=True)
-        version = _version(transport, binary)
-        _sass(transport, binary)
-        build_id = _build_id(snapshot, binary_hash, version, size)
-        state = {"schema_version": 1, "record_type": "build", "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "build_id": build_id, "binary_sha256": binary_hash, "binary_size": size, "version": version, "sass": "verified", "build_log_sha256": log_hash}
-        write_json_atomic(run_dir / "build.json", state, mode=0o600)
-        return BuildResult("succeeded", None, snapshot.snapshot_id, snapshot.applied_tree_hash, build_id, binary_hash, "make-cuda-spark", version, size, "verified", log_hash)
+            return BuildResult("failed", "command_failed", build_id=None, binary_sha256=None, **attempted, version=None, binary_size=None, sass=None)
+        try:
+            binary = root / "engine" / "ds4" / "ds4-server"
+            binary_hash, size = _sha256_regular(binary, executable=True)
+            version = _version(transport, binary)
+            _sass(transport, binary)
+            build_id = _build_id(snapshot, binary_hash, version, size)
+            state = {"schema_version": 1, "record_type": "build", "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "build_id": build_id, "binary_sha256": binary_hash, "binary_size": size, "version": version, "sass": "verified", "build_log_sha256": log_hash, "exit_code": exit_code, "duration_ns": max(1, result.duration_ns)}
+            write_json_atomic(run_dir / "build.json", state, mode=0o600)
+        except TargetError as exc:
+            return BuildResult("failed", _failure_class(exc.code), build_id=None, binary_sha256=None, **attempted, version=None, binary_size=None, sass=None)
+        return BuildResult("succeeded", None, snapshot.snapshot_id, snapshot.applied_tree_hash, build_id, binary_hash, "make-cuda-spark", version, size, "verified", log_hash, exit_code, max(1, result.duration_ns))
 
 
 def _remote_result(result: Mapping[str, Any]) -> BuildResult:
@@ -280,6 +313,8 @@ def _remote_result(result: Mapping[str, Any]) -> BuildResult:
         binary_size=result.get("binary_size"),
         sass=result.get("sass"),
         build_log_sha256=result.get("build_log_sha256"),
+        exit_code=result.get("exit_code"),
+        duration_ns=result.get("duration_ns"),
     )
 
 
@@ -315,7 +350,7 @@ def build(config: Any, transport: LocalTransport | SSHTransport, *, snapshot: So
             result = transport.run_helper(
                 "target_build",
                 {**source_payload, "snapshot_id": checked.snapshot_id, "applied_tree_hash": checked.applied_tree_hash, "dirty": checked.dirty, "allow_dirty": allow_dirty, "jobs": _jobs(jobs)},
-                extension_source=_SOURCE_EXTENSION + REMOTE_BUILD_EXTENSION,
+                extension_source=_SOURCE_EXTENSION + REMOTE_REDACTION_EXTENSION + REMOTE_BUILD_EXTENSION,
                 allowed_error_codes={"source_lifecycle", "unexpected_entry", "unsafe_mount", "entry_changed", "marker_mismatch", "unsafe_entry", "unsafe_root", "unsafe_state", "missing_path", "path_overlap", "build_dirty_unacknowledged", "build_timeout", "build_command_failed", "build_output_oversize", "build_binary_invalid", "build_sass_invalid", "build_state_write_failed"},
                 timeout=BUILD_TIMEOUT_SECONDS + 30.0,
             )
@@ -339,7 +374,7 @@ build_target = build
 
 
 REMOTE_BUILD_EXTENSION = r'''
-import hashlib as _build_hashlib, json as _build_json, os as _build_os, re as _build_re, signal as _build_signal, stat as _build_stat, subprocess as _build_subprocess, secrets as _build_secrets
+import hashlib as _build_hashlib, json as _build_json, os as _build_os, re as _build_re, selectors as _build_selectors, signal as _build_signal, stat as _build_stat, subprocess as _build_subprocess, secrets as _build_secrets, time as _build_time
 def _build_file_hash(path, executable=False):
     try:
         st=_build_os.stat(path,follow_symlinks=False)
@@ -385,22 +420,37 @@ def _build_terminate_process(process):
         except OSError: _fail('build_command_failed')
         try: process.wait(timeout=5)
         except _build_subprocess.TimeoutExpired: _fail('build_command_failed')
-def _build_make(cwd, jobs, run_fd):
-    process = None
-    old_handlers = {}
-    def interrupted(signum, frame):
-        _build_terminate_process(process)
-        raise SystemExit(128 + signum)
+def _build_make(cwd,jobs,secrets):
+    process=None; old_handlers={}; old_mask=None; blocked=False; interrupted=[False]
+    redactor=_targetctl_redactor(secrets); started=_build_time.monotonic_ns(); watched=(_build_signal.SIGHUP,_build_signal.SIGINT,_build_signal.SIGTERM)
+    def interrupted_handler(signum,frame):
+        interrupted[0]=True; _build_terminate_process(process)
     try:
-        process = _build_subprocess.Popen(('/usr/bin/make','-C','engine/ds4','cuda-spark','-j%d'%jobs),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.DEVNULL,stderr=_build_subprocess.DEVNULL,cwd=cwd,env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},start_new_session=True)
-        for signum in (_build_signal.SIGHUP, _build_signal.SIGINT, _build_signal.SIGTERM):
-            old_handlers[signum] = _build_signal.signal(signum, interrupted)
-        try: return process.wait(timeout=3600)
-        except _build_subprocess.TimeoutExpired:
-            _build_terminate_process(process); _build_atomic(run_fd,'build.log',b'[REDACTED]\\n'); _fail('build_timeout')
+        for signum in watched: old_handlers[signum]=_build_signal.signal(signum,interrupted_handler)
+        old_mask=_build_signal.pthread_sigmask(_build_signal.SIG_BLOCK,watched); blocked=True
+        process=_build_subprocess.Popen(('/usr/bin/make','-C','engine/ds4','cuda-spark','-j%d'%jobs),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd=cwd,env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},start_new_session=True)
+        _build_signal.pthread_sigmask(_build_signal.SIG_SETMASK,old_mask); blocked=False
+        deadline=_build_time.monotonic()+3600; timed_out=False
+        with _build_selectors.DefaultSelector() as selector:
+            for stream in (process.stdout,process.stderr):
+                _build_os.set_blocking(stream.fileno(),False); selector.register(stream,_build_selectors.EVENT_READ)
+            while selector.get_map() or process.poll() is None:
+                if not timed_out and not interrupted[0] and _build_time.monotonic()>=deadline:
+                    timed_out=True; _build_terminate_process(process)
+                for key,_ in selector.select(0.1):
+                    try: chunk=_build_os.read(key.fileobj.fileno(),65536)
+                    except BlockingIOError: continue
+                    if chunk: _targetctl_redact_feed(redactor,chunk)
+                    else: selector.unregister(key.fileobj); key.fileobj.close()
+            process.wait()
+        _targetctl_redact_feed(redactor,b'',True)
+        return (None if timed_out or interrupted[0] else process.returncode,max(1,_build_time.monotonic_ns()-started),bytes(redactor['out']),timed_out,interrupted[0])
     finally:
         _build_terminate_process(process)
-        for signum, handler in old_handlers.items(): _build_signal.signal(signum, handler)
+        for signum,handler in old_handlers.items(): _build_signal.signal(signum,handler)
+        if blocked: _build_signal.pthread_sigmask(_build_signal.SIG_SETMASK,old_mask)
+def _build_failed(data,failure,log_hash,exit_code,duration_ns):
+    return {'status':'failed','failure_class':failure,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'build_id':None,'binary_sha256':None,'command':'make-cuda-spark','version':None,'binary_size':None,'sass':None,'build_log_sha256':log_hash,'exit_code':exit_code,'duration_ns':duration_ns}
 @register_action('target_build')
 def target_build(payload):
     keys={'workdir','run_dir','model_path','drafter_path','work_token','run_token','entries','snapshot_id','applied_tree_hash','dirty','allow_dirty','jobs'}
@@ -421,31 +471,34 @@ def target_build(payload):
                         if not b: break
                         h.update(b); size+=len(b)
                     after=_build_os.fstat(fd)
-                finally: _build_os.close(fd)
                 if (before.st_dev,before.st_ino,before.st_size)!=(after.st_dev,after.st_ino,after.st_size): _fail('entry_changed')
                 hashed.append((name,'file',int(bool(after.st_mode&0o100)),size,h.digest()))
             finally: _build_os.close(parent)
         if _frame_hash(hashed)!=data['applied_tree_hash']: _fail('entry_changed')
         cwd='/proc/self/fd/%d'%work_fd
-        made=_build_make(cwd,data['jobs'],run_fd)
-        # Raw producer output never reaches disk: this fixed log marker is safe and bounded.
-        log=b'[REDACTED]\n'; _build_atomic(run_fd,'build.log',log)
-        if made: _fail('build_command_failed')
-        binary=cwd+'/engine/ds4/ds4-server'; digest,size=_build_file_hash(binary,True)
-        try: version_run=_build_subprocess.run((binary,'--version'),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},timeout=10,check=False)
-        except _build_subprocess.TimeoutExpired: _fail('build_binary_invalid')
-        version_match=None if version_run.returncode or len(version_run.stdout)>16384 or len(version_run.stderr)>16384 else _build_re.search(rb'(?<![0-9])([0-9]+(?:\\.[0-9]+){0,3})(?![0-9])',version_run.stdout)
-        if not version_match: _fail('build_binary_invalid')
-        version=version_match.group(1).decode('ascii')
-        try: sass=_build_subprocess.run(('/usr/local/cuda/bin/cuobjdump','--dump-sass',binary),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},timeout=30,check=False)
-        except _build_subprocess.TimeoutExpired: _fail('build_sass_invalid')
-        if sass.returncode or len(sass.stdout)>1048576 or len(sass.stderr)>1048576 or not sass.stdout.strip() or not _build_re.search(rb'\\bsm_121a?\\b',sass.stdout): _fail('build_sass_invalid')
-        ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':size,'sass':'sm_121'}
-        build_id=_build_record_id(ident); log_hash=_build_hashlib.sha256(log).hexdigest()
-        state={'schema_version':1,'record_type':'build','source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'build_id':build_id,'binary_sha256':digest,'binary_size':size,'version':version,'sass':'verified','build_log_sha256':log_hash}
-        _build_atomic(run_fd,'build.json',_build_json.dumps(state,sort_keys=True,separators=(',',':')).encode('ascii'))
+        made,duration_ns,log,timed_out,interrupted=_build_make(cwd,data['jobs'],(data['workdir'],data['run_dir'],data['model_path'],data['drafter_path']))
+        _build_atomic(run_fd,'build.log',log); log_hash=_build_hashlib.sha256(log).hexdigest()
+        if timed_out: return _build_failed(data,'timeout',log_hash,None,duration_ns)
+        if interrupted: return _build_failed(data,'command_failed',log_hash,None,duration_ns)
+        if made: return _build_failed(data,'command_failed',log_hash,made if made>=0 else None,duration_ns)
+        try:
+            binary=cwd+'/engine/ds4/ds4-server'; digest,size=_build_file_hash(binary,True)
+            try: version_run=_build_subprocess.run((binary,'--version'),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},timeout=10,check=False)
+            except _build_subprocess.TimeoutExpired: _fail('build_binary_invalid')
+            version_match=None if version_run.returncode or len(version_run.stdout)>16384 or len(version_run.stderr)>16384 else _build_re.search(rb'(?<![0-9])([0-9]+(?:\\.[0-9]+){0,3})(?![0-9])',version_run.stdout)
+            if not version_match: _fail('build_binary_invalid')
+            version=version_match.group(1).decode('ascii')
+            try: sass=_build_subprocess.run(('/usr/local/cuda/bin/cuobjdump','--dump-sass',binary),stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},timeout=30,check=False)
+            except _build_subprocess.TimeoutExpired: _fail('build_sass_invalid')
+            if sass.returncode or len(sass.stdout)>1048576 or len(sass.stderr)>1048576 or not sass.stdout.strip() or not _build_re.search(rb'\bsm_121a?\b',sass.stdout): _fail('build_sass_invalid')
+            ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':size,'sass':'sm_121'}
+            build_id=_build_record_id(ident)
+            state={'schema_version':1,'record_type':'build','source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'build_id':build_id,'binary_sha256':digest,'binary_size':size,'version':version,'sass':'verified','build_log_sha256':log_hash,'exit_code':0,'duration_ns':duration_ns}
+            _build_atomic(run_fd,'build.json',_build_json.dumps(state,sort_keys=True,separators=(',',':')).encode('ascii'))
+        except HelperError:
+            return _build_failed(data,'contract_failed',log_hash,0,duration_ns)
         _assert_pinned_root(work_fd,work_identity); _assert_pinned_root(run_fd,run_identity); _read_marker(run_fd,'run',paths['run_token'])
-        return {'status':'succeeded','failure_class':None,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'build_id':build_id,'binary_sha256':digest,'command':'make-cuda-spark','version':version,'binary_size':size,'sass':'verified','build_log_sha256':log_hash}
+        return {'status':'succeeded','failure_class':None,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'build_id':build_id,'binary_sha256':digest,'command':'make-cuda-spark','version':version,'binary_size':size,'sass':'verified','build_log_sha256':log_hash,'exit_code':0,'duration_ns':duration_ns}
     finally:
         _build_os.close(work_fd); _build_os.close(run_fd)
 '''

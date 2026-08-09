@@ -145,22 +145,32 @@ class StreamingRedactor:
         raise TargetError("redaction_chunk_invalid", "redaction input is invalid")
 
     def _bounded(self, text: str) -> str:
-        """Return no more than the remaining output budget."""
+        """Return only whole UTF-8 code points within the output byte budget."""
 
         if not text or self._truncated:
             return ""
         remaining = self._max_output - self._emitted
-        if len(text) <= remaining:
-            self._emitted += len(text)
+        encoded = text.encode("utf-8")
+        if len(encoded) <= remaining:
+            self._emitted += len(encoded)
             return text
         self._truncated = True
-        if remaining >= len(_TRUNCATED):
-            result = text[: remaining - len(_TRUNCATED)] + _TRUNCATED
-        else:
-            # A marker is atomic: never emit a fragment that exceeds the
-            # remaining budget merely to identify truncation.
-            result = text[:remaining]
-        self._emitted += len(result)
+        marker_bytes = _TRUNCATED.encode("utf-8")
+        reserve = len(marker_bytes) if remaining >= len(marker_bytes) else 0
+        budget = remaining - reserve
+        prefix: list[str] = []
+        used = 0
+        for character in text:
+            size = len(character.encode("utf-8"))
+            if used + size > budget:
+                break
+            prefix.append(character)
+            used += size
+        result = "".join(prefix)
+        if reserve:
+            result += _TRUNCATED
+            used += reserve
+        self._emitted += used
         return result
 
     def _redact_line(self, text: str) -> str:
@@ -292,6 +302,8 @@ def redact_text(
     *,
     secrets: Iterable[str | bytes] = (),
     max_output: int = 65_536,
+
+
     max_pending: int = _MAX_PENDING_LINE,
 ) -> str:
     """Redact complete text using the same bounded line-record rules."""
@@ -302,3 +314,58 @@ def redact_text(
 
 # A concise spelling for producer code that only has one complete string.
 redact = redact_text
+REMOTE_REDACTION_EXTENSION = r'''
+import codecs as _targetctl_codecs, os as _targetctl_os, re as _targetctl_re
+_targetctl_ansi=_targetctl_re.compile(r'(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[PX^_][\s\S]*?\x1b\\|\x1b[^\[\]PX^_])')
+_targetctl_unterminated=_targetctl_re.compile(r'\x1b(?:\][\s\S]*|\[[\s\S]*|[PX^_][\s\S]*|[\s\S]?)$')
+_targetctl_url=_targetctl_re.compile(r'\b([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s@]+@')
+_targetctl_bearer=_targetctl_re.compile(r'(?i)\bbearer[ \t]+[^\s,;]+')
+_targetctl_credential=_targetctl_re.compile(r'(?i)\b(?:api_key|api-key|access_token|refresh_token|token|secret|password|passwd|authorization|bearer)\s*(?:=|:)\s*(?:bearer\s+)?[^\s,;]+')
+_targetctl_token=_targetctl_re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b')
+_targetctl_ipv6=_targetctl_re.compile(r'(?i)(?<![0-9a-f:])(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:[0-9a-f]{1,4}|::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?)(?![0-9a-f:])')
+_targetctl_ipv4=_targetctl_re.compile(r'(?<![0-9.])(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}(?![0-9.])')
+_targetctl_home=_targetctl_re.compile(r'(?:(?:/home|/Users)/[A-Za-z0-9._-]+(?:/[^\s\x00-\x1f\x7f]*)*|~[A-Za-z0-9._-]*(?:/[^\s\x00-\x1f\x7f]*)*)')
+def _targetctl_redactor(secrets):
+    values=set()
+    for item in secrets:
+        if isinstance(item,str):
+            for candidate in (item,_targetctl_os.path.basename(item)):
+                if 4<=len(candidate.encode('utf-8'))<=512: values.add(candidate)
+    return {'secrets':tuple(sorted(values,key=len,reverse=True)),'buffer':'','discard':False,'out':bytearray(),'full':False,'decoder':_targetctl_codecs.getincrementaldecoder('utf-8')('replace')}
+def _targetctl_append(state,text):
+    if state['full'] or not text: return
+    encoded=text.encode('utf-8'); remaining=1048576-len(state['out'])
+    if len(encoded)<=remaining: state['out'].extend(encoded); return
+    marker=b'[TRUNCATED]'; budget=remaining-len(marker) if remaining>=len(marker) else remaining; used=0; prefix=[]
+    for character in text:
+        size=len(character.encode('utf-8'))
+        if used+size>budget: break
+        prefix.append(character); used+=size
+    state['out'].extend(''.join(prefix).encode('utf-8'))
+    if remaining>=len(marker): state['out'].extend(marker)
+    state['full']=True
+def _targetctl_clean(state,text):
+    text=_targetctl_ansi.sub('',text); text=_targetctl_unterminated.sub('',text)
+    for secret in state['secrets']: text=text.replace(secret,'[REDACTED]')
+    text=_targetctl_url.sub(r'\1[REDACTED]@',text)
+    text=_targetctl_credential.sub('[REDACTED]',text)
+    text=_targetctl_bearer.sub('[REDACTED]',text)
+    text=_targetctl_token.sub('[REDACTED]',text)
+    text=_targetctl_home.sub('[REDACTED_HOME]',text)
+    text=_targetctl_ipv6.sub('[REDACTED_ADDRESS]',text)
+    text=_targetctl_ipv4.sub('[REDACTED_ADDRESS]',text)
+    return ''.join(character for character in text if character=='\n' or not (ord(character)<32 or 127<=ord(character)<160))
+def _targetctl_redact_feed(state,chunk,final=False):
+    text=state['decoder'].decode(chunk,final)
+    for character in text:
+        if state['discard']:
+            if character=='\n': state['discard']=False; _targetctl_append(state,'\n')
+            continue
+        if character=='\n':
+            _targetctl_append(state,_targetctl_clean(state,state['buffer'])+'\n'); state['buffer']=''; continue
+        state['buffer']+=character
+        if len(state['buffer'].encode('utf-8'))>4096:
+            state['buffer']=''; state['discard']=True; _targetctl_append(state,'[REDACTED_OVERSIZE]')
+    if final and not state['discard']:
+        _targetctl_append(state,_targetctl_clean(state,state['buffer'])); state['buffer']=''
+'''
