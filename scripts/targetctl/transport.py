@@ -1,0 +1,429 @@
+"""Process and SSH transport boundary for targetctl.
+
+The module has no target-specific shell interpolation.  Remote commands are a fixed
+argv, rendered once with :func:`shlex.join`; request data travels exclusively on
+standard input to the controller-owned helper.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import base64
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import selectors
+import signal
+import shlex
+import subprocess
+import sys
+import time
+from typing import Any, Callable, Collection, Mapping, Sequence
+
+from .common import PROTOCOL_VERSION, TargetError
+
+MAX_HELPER_INPUT_BYTES = 1024 * 1024
+MAX_HELPER_OUTPUT_BYTES = 1024 * 1024
+MAX_HELPER_ERROR_CODE_LENGTH = 64
+MAX_EXTENSION_ERROR_CODES = 16
+_BASE_HELPER_ERROR_CODES = frozenset({
+    "entry_changed",
+    "internal_error",
+    "invalid_entries",
+    "invalid_entry",
+    "invalid_path",
+    "invalid_payload",
+    "invalid_report",
+    "invalid_request",
+    "lock_busy",
+    "lock_failed",
+    "lock_release_failed",
+    "lock_token_mismatch",
+    "marker_exists",
+    "marker_mismatch",
+    "missing_path",
+    "path_overlap",
+    "protocol_mismatch",
+    "report_too_large",
+    "request_too_large",
+    "root_create_failed",
+    "symlink_path",
+    "unmarked_populated_root",
+    "unknown_action",
+    "unsafe_entry",
+    "unsafe_lock",
+    "unsafe_path",
+    "unsafe_root",
+    "unsafe_state",
+    "unsupported_entry",
+})
+_SAFE_ENV_KEYS = frozenset({"LANG", "LC_ALL", "PATH", "TMPDIR", "XDG_RUNTIME_DIR", "TARGETCTL_HELPER_DIGEST", "TARGETCTL_HELPER_DEFERRED"})
+_BASE_ENV = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+SSH_OPTIONS = (
+    "BatchMode=yes",
+    "ForwardAgent=no",
+    "IdentityAgent=none",
+    "ForwardX11=no",
+    "ForwardX11Trusted=no",
+    "RequestTTY=no",
+    "PermitLocalCommand=no",
+    "ClearAllForwardings=yes",
+    "ControlMaster=no",
+    "ControlPath=none",
+    "ControlPersist=no",
+)
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    exit_code: int
+    timed_out: bool
+    duration_ns: int
+    stdout: bytes
+    stderr: bytes
+
+
+Runner = Callable[[Sequence[str], bytes | None, float | None, str, Mapping[str, str], int], CommandResult]
+
+
+def _error(code: str, message: str = "target command failed") -> TargetError:
+    return TargetError(code, message)
+
+
+def _is_safe_helper_error_code(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MAX_HELPER_ERROR_CODE_LENGTH
+        and value.isascii()
+        and all(character.islower() or character.isdigit() or character == "_" for character in value)
+    )
+
+
+def _allowed_helper_error_codes(allowed_error_codes: Collection[str] | None) -> frozenset[str]:
+    """Return bounded controller-owned error codes for this helper invocation."""
+    if allowed_error_codes is None:
+        return _BASE_HELPER_ERROR_CODES
+    if (
+        isinstance(allowed_error_codes, (str, bytes, bytearray))
+        or not isinstance(allowed_error_codes, Collection)
+        or len(allowed_error_codes) > MAX_EXTENSION_ERROR_CODES
+        or not all(_is_safe_helper_error_code(code) for code in allowed_error_codes)
+    ):
+        raise _error("invalid_request", "invalid helper request")
+    return _BASE_HELPER_ERROR_CODES | frozenset(allowed_error_codes)
+
+
+def _validate_env(overrides: Mapping[str, str] | None = None, *, helper_digest: str | None = None, deferred: bool = False) -> dict[str, str]:
+    env = dict(_BASE_ENV)
+    if overrides is not None:
+        if not isinstance(overrides, Mapping):
+            raise _error("invalid_environment", "invalid command environment")
+        for key, value in overrides.items():
+            if key not in _SAFE_ENV_KEYS or not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value or "\n" in value or "\r" in value:
+                raise _error("invalid_environment", "invalid command environment")
+            env[key] = value
+    if helper_digest is not None:
+        env["TARGETCTL_HELPER_DIGEST"] = helper_digest
+    if deferred:
+        env["TARGETCTL_HELPER_DEFERRED"] = "1"
+    return env
+
+
+def _bounded_process(argv: Sequence[str], input_bytes: bytes | None, timeout: float | None, cwd: str, env: Mapping[str, str], max_output_bytes: int) -> CommandResult:
+    if not argv or any(not isinstance(argument, str) or "\x00" in argument for argument in argv):
+        raise _error("invalid_command", "invalid command")
+    if input_bytes is not None and len(input_bytes) > MAX_HELPER_INPUT_BYTES:
+        raise _error("request_too_large", "helper request is too large")
+
+    # Account for process creation and every pipe operation.  In particular,
+    # writing a request before draining output can deadlock when a helper fills
+    # stdout before it starts consuming stdin.
+    start = time.monotonic_ns()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env=dict(env),
+            shell=False,
+            start_new_session=True,
+        )
+    except OSError:
+        raise _error("command_start_failed", "target command could not start") from None
+
+    completed = False
+    try:
+        def terminate_process_tree() -> None:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    return
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    pass
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        with selectors.DefaultSelector() as selector:
+            assert process.stdout is not None and process.stderr is not None
+            for stream in (process.stdout, process.stderr):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, "stdout" if stream is process.stdout else "stderr")
+
+            input_view: memoryview | None = None
+            input_offset = 0
+            if process.stdin is not None:
+                os.set_blocking(process.stdin.fileno(), False)
+                if input_bytes:
+                    input_view = memoryview(input_bytes)
+                    selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+                else:
+                    process.stdin.close()
+
+            def unregister_and_close(stream: Any) -> None:
+                try:
+                    selector.unregister(stream)
+                except (KeyError, OSError, ValueError):
+                    pass
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+            streams = {"stdout": bytearray(), "stderr": bytearray()}
+            timed_out = False
+            overflow = False
+            while selector.get_map() or process.poll() is None:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    timed_out = True
+                    break
+                if not selector.get_map():
+                    try:
+                        process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                    continue
+                for key, events in selector.select(remaining):
+                    stream = key.fileobj
+                    if events & selectors.EVENT_READ:
+                        output = streams[key.data]
+                        try:
+                            chunk = os.read(stream.fileno(), min(65536, max_output_bytes - len(output) + 1))
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            unregister_and_close(stream)
+                            continue
+                        if not chunk:
+                            unregister_and_close(stream)
+                            continue
+                        if len(output) + len(chunk) > max_output_bytes:
+                            overflow = True
+                            break
+                        output.extend(chunk)
+                    elif events & selectors.EVENT_WRITE:
+                        assert input_view is not None
+                        try:
+                            written = os.write(stream.fileno(), input_view[input_offset:input_offset + 65536])
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError:
+                            unregister_and_close(stream)
+                            continue
+                        except OSError:
+                            unregister_and_close(stream)
+                            continue
+                        if written:
+                            input_offset += written
+                        if written == 0 or input_offset == len(input_view):
+                            unregister_and_close(stream)
+                if overflow:
+                    break
+
+            if timed_out or overflow:
+                terminate_process_tree()
+                process.wait()
+                completed = True
+                return CommandResult(-1, timed_out, time.monotonic_ns() - start, b"", b"")
+
+        process.wait()
+        completed = True
+        return CommandResult(process.returncode, False, time.monotonic_ns() - start, bytes(streams["stdout"]), bytes(streams["stderr"]))
+    finally:
+        if not completed:
+            terminate_process_tree()
+            process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def _strict_json(data: bytes) -> Any:
+    def duplicate_free(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=duplicate_free)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise _error("invalid_helper_response", "helper returned an invalid response") from None
+
+
+def helper_source(extension_source: str | bytes | None = None) -> bytes:
+    """Return complete isolated-helper source, with optional controller-owned actions."""
+    try:
+        base = Path(__file__).with_name("remote.py").read_bytes()
+    except OSError:
+        raise _error("helper_unavailable", "helper source is unavailable") from None
+    if extension_source is None:
+        extension = b""
+    elif isinstance(extension_source, str):
+        extension = extension_source.encode("utf-8")
+    elif isinstance(extension_source, bytes):
+        extension = extension_source
+    else:
+        raise _error("invalid_extension", "invalid helper extension")
+    if b"\x00" in extension or len(base) + len(extension) > MAX_HELPER_INPUT_BYTES:
+        raise _error("invalid_extension", "invalid helper extension")
+    # remote.py defers main while this source is installed, allowing an extension
+    # to call register_action before the controller appends its encoded request.
+    return base + b"\n" + extension + b"\n"
+
+
+def _helper_digest(source: bytes) -> str:
+    """Return the versioned identity of controller-owned helper code."""
+    return hashlib.sha256(b"targetctl-helper-source-v1\x00" + source).hexdigest()
+
+
+class _HelperTransport:
+    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+        raise NotImplementedError
+
+    def run_helper(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        *,
+        extension_source: str | bytes | None = None,
+        allowed_error_codes: Collection[str] | None = None,
+        timeout: float | None = 30.0,
+    ) -> Any:
+        if not isinstance(action, str) or not action or not isinstance(payload, Mapping):
+            raise _error("invalid_request", "invalid helper request")
+        allowed_codes = _allowed_helper_error_codes(allowed_error_codes)
+        request = {"protocol_version": PROTOCOL_VERSION, "action": action, "payload": dict(payload)}
+        try:
+            request_bytes = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        except (TypeError, ValueError):
+            raise _error("invalid_request", "invalid helper request") from None
+        source = helper_source(extension_source)
+        program = source + b"run(base64.b64decode(" + repr(base64.b64encode(request_bytes)).encode("ascii") + b"))\n"
+        digest = _helper_digest(source)
+        result = self._execute_helper(program, digest, timeout)
+        if result.timed_out:
+            raise _error("helper_timeout", "target helper timed out")
+        if result.exit_code != 0 or len(result.stdout) > MAX_HELPER_OUTPUT_BYTES or len(result.stderr) > MAX_HELPER_OUTPUT_BYTES:
+            raise _error("helper_execution_failed", "target helper failed")
+        response = _strict_json(result.stdout)
+        if not isinstance(response, dict) or set(response) not in ({"protocol_version", "helper_sha256", "ok", "result"}, {"protocol_version", "helper_sha256", "ok", "error"}):
+            raise _error("invalid_helper_response", "helper returned an invalid response")
+        if response.get("protocol_version") != PROTOCOL_VERSION or not isinstance(response.get("helper_sha256"), str) or not hmac.compare_digest(response["helper_sha256"], digest):
+            raise _error("helper_integrity_failed", "helper protocol verification failed")
+        if response.get("ok") is True:
+            return response["result"]
+        error = response.get("error")
+        if (
+            response.get("ok") is not False
+            or not isinstance(error, dict)
+            or set(error) != {"code", "message"}
+            or not isinstance(error["code"], str)
+            or not isinstance(error["message"], str)
+            or error["code"] not in allowed_codes
+        ):
+            raise _error("invalid_helper_response", "helper returned an invalid response")
+        raise _error(error["code"], "target helper rejected the request")
+
+    def _execute_helper(self, program: bytes, digest: str, timeout: float | None) -> CommandResult:
+        raise NotImplementedError
+
+
+class LocalTransport(_HelperTransport):
+    """Local process boundary used by local target operations."""
+    def __init__(self, *, runner: Runner | None = None, max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES) -> None:
+        self._runner = runner
+        self._max_output_bytes = max_output_bytes
+
+    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+        if self._runner is not None:
+            return self._runner(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
+        return _bounded_process(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
+
+    def run(self, argv: Sequence[str], *, input_bytes: bytes | None = None, timeout: float | None = None, cwd: str = "/", env: Mapping[str, str] | None = None) -> CommandResult:
+        return self._execute(argv, input_bytes or b"", timeout=timeout, cwd=cwd, env=_validate_env(env))
+
+    def _execute_helper(self, program: bytes, digest: str, timeout: float | None) -> CommandResult:
+        return self._execute((sys.executable, "-I", "-S", "-"), program, timeout=timeout, cwd="/", env=_validate_env(helper_digest=digest, deferred=True))
+
+
+class SSHTransport(_HelperTransport):
+    """SSH transport with forwarding, agent, X11, tty, and control sharing disabled."""
+    def __init__(self, ssh_host: str, *, runner: Runner | None = None, ssh_binary: str = "ssh", max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES) -> None:
+        if not _valid_ssh_alias(ssh_host):
+            raise _error("invalid_ssh_host", "invalid SSH host alias")
+        self.ssh_host = ssh_host
+        self._runner = runner
+        self._ssh_binary = ssh_binary
+        self._max_output_bytes = max_output_bytes
+
+    def _execute(self, argv: Sequence[str], input_bytes: bytes, *, timeout: float | None, cwd: str, env: Mapping[str, str]) -> CommandResult:
+        if self._runner is not None:
+            return self._runner(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
+        return _bounded_process(argv, input_bytes, timeout, cwd, env, self._max_output_bytes)
+
+    def _execute_helper(self, program: bytes, digest: str, timeout: float | None) -> CommandResult:
+        remote_env = _validate_env(helper_digest=digest, deferred=True)
+        remote_argv = ("/usr/bin/env", "-i", *(f"{key}={value}" for key, value in remote_env.items()), "/usr/bin/python3", "-I", "-S", "-")
+        # OpenSSH concatenates every operand after the host into one remote-shell
+        # command.  Send exactly one quoted operand so `-c` receives the complete
+        # fixed wrapper, including the cwd invariant, as its script.
+        inner_command = f"cd -- / && exec {shlex.join(remote_argv)}"
+        remote_command = shlex.join(("/bin/sh", "-c", inner_command))
+        argv = (self._ssh_binary, *(part for option in SSH_OPTIONS for part in ("-o", option)), "--", self.ssh_host, remote_command)
+        return self._execute(argv, program, timeout=timeout, cwd="/", env=_validate_env())
+
+
+def _valid_ssh_alias(value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 253 or not value[0].isalnum():
+        return False
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return all(character.isalnum() or character in "._-" for character in value)
+
+
+def select_transport(config: Any, *, repo_root: Path | None = None, runner: Runner | None = None) -> LocalTransport | SSHTransport:
+    """Select the concrete transport from a validated TargetConfig-like object."""
+    mode = getattr(config, "mode", None)
+    if mode == "local":
+        return LocalTransport(runner=runner)
+    if mode == "ssh":
+        return SSHTransport(getattr(config, "ssh_host", None), runner=runner)
+    raise _error("invalid_target_mode", "invalid target mode")
+
+
+transport_for = select_transport
