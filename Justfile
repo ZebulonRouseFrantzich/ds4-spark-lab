@@ -235,59 +235,23 @@ flake-check:
     nix flake check
 
 # Target operations — Phase 01
-
-# Run the target doctor against the named target.
 target-doctor target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.doctor import run_doctor; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); print(run_doctor(config, transport))'
-
-# Synchronize source to the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl doctor --target {{ quote(target) }}
 target-sync target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.source import sync_source; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); print(sync_source(config, transport))'
-
-# Build the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl sync --target {{ quote(target) }}
 target-build target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.build import build; from scripts.targetctl.source import build_snapshot; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); snapshot = build_snapshot(config.source_root); print(build(config, transport, snapshot=snapshot))'
-
-# Start the server on the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl build --target {{ quote(target) }}
 target-serve target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.lifecycle import serve, RuntimeInputs; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); runtime = RuntimeInputs(config.model_path, config.drafter_path, "0"*64, "0"*64, "0"*64, "", "", 8000); print(serve(config, transport, runtime))'
-
-# Check server status on the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl serve --target {{ quote(target) }}
 target-status target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.lifecycle import status, RuntimeInputs; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); runtime = RuntimeInputs(config.model_path, config.drafter_path, "0"*64, "0"*64, "0"*64, "", "", 8000); print(status(config, transport, runtime))'
-
-# Get server logs from the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl status --target {{ quote(target) }}
 target-logs target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.lifecycle import logs, RuntimeInputs; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); runtime = RuntimeInputs(config.model_path, config.drafter_path, "0"*64, "0"*64, "0"*64, "", "", 8000); print(logs(config, transport, runtime).decode(errors="replace"))'
-
-# Stop the server on the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl logs --target {{ quote(target) }}
 target-stop target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.lifecycle import stop, RuntimeInputs; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); runtime = RuntimeInputs(config.model_path, config.drafter_path, "0"*64, "0"*64, "0"*64, "", "", 8000); print(stop(config, transport, runtime))'
-
-# Run smoke test on the named target.
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl stop --target {{ quote(target) }}
 target-smoke target="spark":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd '{{ ROOT }}'
-    python3 -c 'from scripts.targetctl.config import load_target; from scripts.targetctl.lifecycle import smoke, RuntimeInputs; from scripts.targetctl.transport import LocalTransport, SSHTransport; config = load_target(".", "{{ target }}", "configs/targets.toml"); transport = SSHTransport(config.ssh_host) if config.mode == "ssh" else LocalTransport(); runtime = RuntimeInputs(config.model_path, config.drafter_path, "0"*64, "0"*64, "0"*64, "", "", 8000); print(smoke(config, transport, runtime))'
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl smoke --target {{ quote(target) }}
+target-cleanup target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl cleanup --target {{ quote(target) }}
+target-bundle target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl bundle --target {{ quote(target) }}

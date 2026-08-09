@@ -1,5 +1,5 @@
-# Documentation-only target configuration schema.  Copy this file outside the
-# repository and replace every spark placeholder with operator-managed values.
+# Documentation-only schema. Copy to `targets/targets.toml`, replace placeholders,
+# and set that private file to mode 0600; it is never committed or snapshotted.
 schema_version = 1
 
 [spark]
@@ -15,3 +15,7 @@ drafter_path = "<target-local-drafter-path>"
 [local]
 name = "local"
 mode = "local"
+
+# Local runtime paths are invocation-only, never TOML or CLI values:
+# TARGETCTL_MODEL_PATH=/absolute/model TARGETCTL_DRAFTER_PATH=/absolute/drafter
+# Local lifecycle uses the documented fixed loopback port 8000.
