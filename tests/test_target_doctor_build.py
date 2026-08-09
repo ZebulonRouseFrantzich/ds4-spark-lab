@@ -289,6 +289,258 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         self.assertEqual(doctor_module._version("nvcc", output), "12.8")
         self.assertEqual(doctor_module._version("cuobjdump", output), "12.8")
 
+    def test_time_sync_file_success_skips_timedatectl_local_and_embedded(self) -> None:
+        local_capture = mock.Mock()
+        with (
+            mock.patch.object(Path, "read_bytes", return_value=b"yes\n"),
+            mock.patch.object(doctor_module, "_pinned_tool_capture", local_capture),
+        ):
+            self.assertTrue(doctor_module._time_synchronized())
+        local_capture.assert_not_called()
+
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        embedded_capture = mock.Mock()
+        namespace["open"] = mock.mock_open(read_data=b"yes\n")
+        namespace["_doctor_pinned"] = embedded_capture
+        self.assertTrue(namespace["_doctor_time_synchronized"]())  # type: ignore[index,operator]
+        embedded_capture.assert_not_called()
+
+    def test_time_sync_uses_exact_pinned_timedatectl_fallback_local_and_embedded(self) -> None:
+        local_capture = mock.Mock(return_value=(b"yes\n", "/usr/bin/timedatectl"))
+        with (
+            mock.patch.object(Path, "read_bytes", return_value=b"no\n"),
+            mock.patch.object(doctor_module, "_pinned_tool_capture", local_capture),
+        ):
+            self.assertTrue(doctor_module._time_synchronized())
+        local_capture.assert_called_once_with(
+            "/usr/bin/timedatectl",
+            ("show", "--property=NTPSynchronized", "--value"),
+        )
+
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        embedded_capture = mock.Mock(return_value=(b"yes\n", "/usr/bin/timedatectl"))
+        namespace["open"] = mock.mock_open(read_data=b"no\n")
+        namespace["_doctor_pinned"] = embedded_capture
+        self.assertTrue(namespace["_doctor_time_synchronized"]())  # type: ignore[index,operator]
+        embedded_capture.assert_called_once_with(
+            "/usr/bin/timedatectl",
+            ("show", "--property=NTPSynchronized", "--value"),
+        )
+
+    def test_time_sync_rejects_no_or_ambiguous_records_local_and_embedded(self) -> None:
+        for output in (b"", b"no\n", b"yes \n", b"yes\r\n", b"yes\nno\n", b"\xff\n"):
+            with self.subTest(output=output):
+                with (
+                    mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
+                    mock.patch.object(
+                        doctor_module,
+                        "_pinned_tool_capture",
+                        return_value=(output, "/usr/bin/timedatectl"),
+                    ),
+                    self.assertRaises(TargetError) as local,
+                ):
+                    doctor_module._time_synchronized()
+                self.assertEqual(local.exception.code, "doctor_time_unsynchronized")
+
+                namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+                exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+                namespace["open"] = mock.Mock(side_effect=FileNotFoundError)
+                namespace["_doctor_pinned"] = mock.Mock(
+                    return_value=(output, "/usr/bin/timedatectl"),
+                )
+                with self.assertRaises(namespace["HelperError"]) as embedded:  # type: ignore[arg-type,index]
+                    namespace["_doctor_time_synchronized"]()  # type: ignore[index,operator]
+                self.assertEqual(embedded.exception.code, "doctor_time_unsynchronized")
+
+    def test_time_sync_preserves_safe_tool_timeout_and_missing_failures(self) -> None:
+        for code in ("doctor_command_timeout", "doctor_tool_missing"):
+            with self.subTest(code=code):
+                with (
+                    mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
+                    mock.patch.object(
+                        doctor_module,
+                        "_pinned_tool_capture",
+                        side_effect=TargetError(code, "target doctor failed"),
+                    ),
+                    self.assertRaises(TargetError) as local,
+                ):
+                    doctor_module._time_synchronized()
+                self.assertEqual(local.exception.code, code)
+
+                namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+                exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+                namespace["open"] = mock.Mock(side_effect=FileNotFoundError)
+                namespace["_doctor_pinned"] = mock.Mock(
+                    side_effect=lambda *_: namespace["_fail"](code),  # type: ignore[index,operator]
+                )
+                with self.assertRaises(namespace["HelperError"]) as embedded:  # type: ignore[arg-type,index]
+                    namespace["_doctor_time_synchronized"]()  # type: ignore[index,operator]
+                self.assertEqual(embedded.exception.code, code)
+
+    def test_time_sync_rejects_timedatectl_symlink_chain_swap_local_and_embedded(self) -> None:
+        resolved = os.path.realpath("/usr/bin/python3")
+        identity = doctor_module._tool_identity(os.stat(resolved, follow_symlinks=False))
+        original_chain = (("/usr/bin/timedatectl", identity),)
+        replaced_chain = (("/usr/bin/timedatectl", (*identity[:-1], identity[-1] + 1)),)
+
+        local_first_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        local_second_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        with (
+            mock.patch.object(Path, "read_bytes", return_value=b"no\n"),
+            mock.patch.object(
+                doctor_module,
+                "_open_tool_alias",
+                side_effect=(
+                    (resolved, local_first_fd, identity, original_chain),
+                    (resolved, local_second_fd, identity, replaced_chain),
+                ),
+            ),
+            mock.patch.object(doctor_module, "_pinned_tool_output", return_value=b"yes\n"),
+            self.assertRaises(TargetError) as local,
+        ):
+            doctor_module._time_synchronized()
+        self.assertEqual(local.exception.code, "doctor_tool_missing")
+
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
+        embedded_first_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        embedded_second_fd = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
+        embedded_identity = namespace["_doctor_tool_identity"](os.fstat(embedded_first_fd))  # type: ignore[index,operator]
+        namespace["open"] = mock.mock_open(read_data=b"no\n")
+        namespace["_doctor_open_tool"] = mock.Mock(side_effect=(
+            (resolved, embedded_first_fd, embedded_identity, original_chain),
+            (resolved, embedded_second_fd, embedded_identity, replaced_chain),
+        ))
+        namespace["_doctor_cmd"] = mock.Mock(return_value=b"yes\n")
+        with self.assertRaises(namespace["HelperError"]) as embedded:  # type: ignore[arg-type,index]
+            namespace["_doctor_time_synchronized"]()  # type: ignore[index,operator]
+        self.assertEqual(embedded.exception.code, "doctor_tool_missing")
+
+    def test_embedded_doctor_action_gates_time_sync_before_weight_hashing(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(
+            helper_source(
+                doctor_module._SOURCE_EXTENSION + doctor_module.REMOTE_DOCTOR_EXTENSION
+            ),
+            namespace,
+        )
+        payload = {
+            "model_path": "/target/models/model.gguf",
+            "drafter_path": "/target/models/drafter.gguf",
+            "run_dir": "/target/run",
+            "workdir": "/target/work",
+            "work_token": "a" * 64,
+            "run_token": "b" * 64,
+            "entries": [],
+            "snapshot_id": "c" * 64,
+            "applied_tree_hash": "d" * 64,
+            "dirty": False,
+            "allow_dirty": None,
+            "lock_token": "e" * 64,
+        }
+
+        def command(argv: tuple[str, ...], *_: object, **__: object) -> bytes:
+            if "--query-gpu=name,compute_cap" in argv:
+                return b"NVIDIA GB10, 12.1\n"
+            return b""
+
+        namespace["_source_roots"] = mock.Mock(return_value=(None, {"root": "pinned"}))
+        namespace["_doctor_bound_source"] = mock.Mock()
+        namespace["_doctor_tool"] = mock.Mock(
+            side_effect=lambda name, location: {
+                "name": name,
+                "version": "1.0",
+                "location": location,
+            },
+        )
+        namespace["_doctor_cmd"] = mock.Mock(side_effect=command)
+        namespace["_doctor_nix"] = mock.Mock(
+            return_value={"status": "absent", "version": None},
+        )
+
+        cases = (
+            ("false", False, False),
+            ("truthy_non_boolean", 1, False),
+            ("true", True, True),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for label, synchronized, succeeds in cases:
+                with self.subTest(label=label):
+                    work_fd = os.open(
+                        temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                    )
+                    run_fd = os.open(
+                        temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                    )
+                    namespace["_source_open"] = mock.Mock(
+                        return_value=(work_fd, run_fd, {"work": 1}, {"run": 1}),
+                    )
+                    sync = mock.Mock(return_value=synchronized)
+                    hashes = mock.Mock(side_effect=("f" * 64, "0" * 64))
+                    output = mock.Mock()
+                    namespace["_doctor_time_synchronized"] = sync
+                    namespace["_doctor_hash"] = hashes
+                    namespace["sys"] = SimpleNamespace(
+                        stdout=SimpleNamespace(buffer=output),
+                    )
+                    request = json.dumps(
+                        {
+                            "protocol_version": namespace["PROTOCOL_VERSION"],
+                            "action": "target_doctor",
+                            "payload": payload,
+                        },
+                    ).encode("utf-8")
+
+                    namespace["run"](request)  # type: ignore[index,operator]
+
+                    output.write.assert_called_once()
+                    response = json.loads(output.write.call_args.args[0])
+                    sync.assert_called_once_with()
+                    self.assertIs(response["ok"], succeeds)
+                    if succeeds:
+                        self.assertEqual(response["result"]["status"], "succeeded")
+                        self.assertIs(response["result"]["time_sync"], True)
+                        self.assertEqual(
+                            hashes.call_args_list,
+                            [
+                                mock.call(payload["model_path"]),
+                                mock.call(payload["drafter_path"]),
+                            ],
+                        )
+                    else:
+                        self.assertEqual(
+                            response["error"]["code"],
+                            "doctor_time_unsynchronized",
+                        )
+                        self.assertNotIn("result", response)
+                        hashes.assert_not_called()
+
+    def test_local_pinned_capture_bounds_arbitrary_fixed_argv(self) -> None:
+        python = dict(DOCTOR_TOOLS)["python3"]
+        with (
+            mock.patch.object(doctor_module, "MAX_COMMAND_OUTPUT_BYTES", 32),
+            self.assertRaises(TargetError) as oversized,
+        ):
+            doctor_module._pinned_tool_capture(
+                python,
+                ("-c", "import sys;sys.stdout.write('x'*128)"),
+            )
+        self.assertEqual(oversized.exception.code, "doctor_command_failed")
+
+        started = time.monotonic()
+        with (
+            mock.patch.object(doctor_module, "COMMAND_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(TargetError) as timed_out,
+        ):
+            doctor_module._pinned_tool_capture(
+                python,
+                ("-c", "import time;time.sleep(60)"),
+            )
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(timed_out.exception.code, "doctor_command_timeout")
+
     def test_remote_doctor_extension_registers_with_complete_helper_source(self) -> None:
         namespace: dict[str, object] = {"__name__": "targetctl_helper"}
         exec(helper_source(doctor_module._SOURCE_EXTENSION + doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
@@ -1370,11 +1622,13 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         namespace: dict[str, object] = {"__name__": "targetctl_helper"}
         exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
         error = namespace["HelperError"]  # type: ignore[index]
-        with self.assertRaises(error):  # type: ignore[arg-type]
+        with self.assertRaises(error) as oversized:  # type: ignore[arg-type]
             namespace["_doctor_cmd"]((sys.executable, "-c", "import sys;sys.stdout.write('x'*20000)"), 5)  # type: ignore[index,operator]
+        self.assertEqual(oversized.exception.code, "doctor_command_failed")
         started = time.monotonic()
-        with self.assertRaises(error):  # type: ignore[arg-type]
+        with self.assertRaises(error) as timed_out:  # type: ignore[arg-type]
             namespace["_doctor_cmd"]((sys.executable, "-c", "import time;time.sleep(60)"), 0.05)  # type: ignore[index,operator]
+        self.assertEqual(timed_out.exception.code, "doctor_command_timeout")
         self.assertLess(time.monotonic() - started, 3)
         with tempfile.TemporaryDirectory() as temporary:
             pid_path = Path(temporary) / "descendant.pid"

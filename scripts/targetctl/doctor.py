@@ -36,6 +36,10 @@ _SAFE_TOOL_LOCATION = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}\Z"
 )
 _MAX_TOOL_SYMLINKS = 40
+_TIME_SYNC_FILE = Path("/run/systemd/timesync/synchronized")
+_TIMEDATECTL_PATH = "/usr/bin/timedatectl"
+_TIMEDATECTL_ARGUMENTS = ("show", "--property=NTPSynchronized", "--value")
+
 
 # Order is artifact order.  These are not searched through PATH and are part of
 _CUDA_VERSION = re.compile(
@@ -321,13 +325,13 @@ def _kill_tool_process(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _pinned_tool_output(fd: int, resolved: str) -> bytes:
-    """Capture a version from the already-open executable, with bounded pipes."""
+def _pinned_tool_output(fd: int, resolved: str, arguments: tuple[str, ...]) -> bytes:
+    """Capture fixed arguments from an already-open executable, with bounded pipes."""
 
     descriptor = f"/proc/self/fd/{fd}"
     try:
         process = subprocess.Popen(
-            (resolved, "--version"),
+            (resolved, *arguments),
             executable=descriptor,
             pass_fds=(fd,),
             stdin=subprocess.DEVNULL,
@@ -403,10 +407,12 @@ def _pinned_tool_output(fd: int, resolved: str) -> bytes:
                 stream.close()
 
 
-def _tool_version(name: str, path: str) -> tuple[str, str]:
+def _pinned_tool_capture(path: str, arguments: tuple[str, ...]) -> tuple[bytes, str]:
+    """Run fixed arguments through a pinned, revalidated system executable."""
+
     resolved, fd, identity, chain = _open_tool_alias(path)
     try:
-        output = _pinned_tool_output(fd, resolved)
+        output = _pinned_tool_output(fd, resolved, arguments)
         try:
             stable_identity = _tool_identity(os.fstat(fd))
             stable_location = os.readlink(f"/proc/self/fd/{fd}")
@@ -420,9 +426,14 @@ def _tool_version(name: str, path: str) -> tuple[str, str]:
                 raise _error("doctor_tool_missing")
         finally:
             os.close(check_fd)
-        return _version(name, output), resolved
+        return output, resolved
     finally:
         os.close(fd)
+
+
+def _tool_version(name: str, path: str) -> tuple[str, str]:
+    output, resolved = _pinned_tool_capture(path, ("--version",))
+    return _version(name, output), resolved
 
 def _find_nix() -> str | None:
     candidates = list(_NIX_CANDIDATES)
@@ -534,6 +545,20 @@ def _weight_hash(path_value: str) -> str:
         os.close(fd)
 
 
+def _time_synchronized() -> bool:
+    """Return a positive synchronization fact from either trusted systemd source."""
+
+    try:
+        if _TIME_SYNC_FILE.read_bytes()[:8].strip() == b"yes":
+            return True
+    except OSError:
+        pass
+    output, _ = _pinned_tool_capture(_TIMEDATECTL_PATH, _TIMEDATECTL_ARGUMENTS)
+    if output not in {b"yes", b"yes\n"}:
+        raise _error("doctor_time_unsynchronized")
+    return True
+
+
 def _local_facts(run_dir: Path) -> tuple[str, str, str, int, int, bool]:
     info = os.uname()
     if info.sysname != "Linux" or not all(_SAFE_SYSTEM.fullmatch(value) for value in (info.sysname, info.release, info.machine)):
@@ -543,14 +568,9 @@ def _local_facts(run_dir: Path) -> tuple[str, str, str, int, int, bool]:
         disk = os.statvfs(run_dir).f_bavail * os.statvfs(run_dir).f_frsize
     except (OSError, ValueError):
         raise _error("doctor_system_invalid") from None
-    # This file is written by systemd-timesyncd; absence is deliberately a
-    # failed fact rather than an optimistic assumption.
-    try:
-        time_sync = Path("/run/systemd/timesync/synchronized").read_bytes()[:8].strip() == b"yes"
-    except OSError:
-        time_sync = False
-    if memory < 1 or disk < 1 or not time_sync:
-        raise _error("doctor_time_unsynchronized" if not time_sync else "doctor_system_invalid")
+    time_sync = _time_synchronized()
+    if memory < 1 or disk < 1:
+        raise _error("doctor_system_invalid")
     return info.sysname, info.release, info.machine, memory, disk, time_sync
 
 
@@ -760,10 +780,10 @@ def _doctor_open_tool(alias):
             _doctor_os.close(fd); _fail('doctor_tool_missing')
         return candidate,fd,identity,tuple(chain)
     _fail('doctor_tool_missing')
-def _doctor_tool(name,alias):
+def _doctor_pinned(alias,arguments):
     resolved,fd,identity,chain=_doctor_open_tool(alias)
     try:
-        output=_doctor_cmd((resolved,'--version'),pass_fds=(fd,),executable='/proc/self/fd/%d'%fd)
+        output=_doctor_cmd((resolved,)+tuple(arguments),pass_fds=(fd,),executable='/proc/self/fd/%d'%fd)
         try:
             stable_identity=_doctor_tool_identity(_doctor_os.fstat(fd))
             stable_location=_doctor_os.readlink('/proc/self/fd/%d'%fd)
@@ -773,10 +793,13 @@ def _doctor_tool(name,alias):
         try:
             if (check_resolved,check_identity,check_chain)!=(resolved,identity,chain): _fail('doctor_tool_missing')
         finally: _doctor_os.close(check_fd)
-        version=_doctor_version(name,output)
-        if version is None: _fail('doctor_command_failed')
-        return {'name':name,'version':version,'location':resolved}
+        return output,resolved
     finally: _doctor_os.close(fd)
+def _doctor_tool(name,alias):
+    output,resolved=_doctor_pinned(alias,('--version',))
+    version=_doctor_version(name,output)
+    if version is None: _fail('doctor_command_failed')
+    return {'name':name,'version':version,'location':resolved}
 _DOCTOR_TOOLS=(('nvidia-smi','/usr/bin/nvidia-smi'),('nvcc','/usr/local/cuda/bin/nvcc'),('gcc','/usr/bin/gcc'),('g++','/usr/bin/g++'),('make','/usr/bin/make'),('python3','/usr/bin/python3'),('git','/usr/bin/git'),('rsync','/usr/bin/rsync'),('cuobjdump','/usr/local/cuda/bin/cuobjdump'))
 _DOCTOR_NIX_TOOL_NAMES=('nvcc','gcc','g++')
 _DOCTOR_NIX_PROBE='p=$(command -v "$1") || exit 20; printf "TARGETCTL_PATH=%s\\n" "$p"; exec "$p" --version'
@@ -785,6 +808,17 @@ _DOCTOR_CUDA_VERSION=rb'\brelease\s+([0-9]+(?:\.[0-9]+){1,3})(?:,|\s)'
 _DOCTOR_MAX_WEIGHT_BYTES=1<<40
 _DOCTOR_MAX_OUTPUT_BYTES=16384
 _DOCTOR_SAFE_SYSTEM=_doctor_re.compile(r'[A-Za-z0-9._+@=-]{1,160}\Z')
+_DOCTOR_TIME_SYNC_FILE='/run/systemd/timesync/synchronized'
+_DOCTOR_TIMEDATECTL_PATH='/usr/bin/timedatectl'
+_DOCTOR_TIMEDATECTL_ARGUMENTS=('show','--property=NTPSynchronized','--value')
+def _doctor_time_synchronized():
+    try:
+        with open(_DOCTOR_TIME_SYNC_FILE,'rb') as sync_file: sync=sync_file.read(8).strip()==b'yes'
+    except OSError: sync=False
+    if sync: return True
+    output,_=_doctor_pinned(_DOCTOR_TIMEDATECTL_PATH,_DOCTOR_TIMEDATECTL_ARGUMENTS)
+    if output not in (b'yes',b'yes\n'): _fail('doctor_time_unsynchronized')
+    return True
 def _doctor_hash(path):
     try:
         st=_doctor_os.stat(path,follow_symlinks=False)
@@ -975,14 +1009,13 @@ def target_doctor(payload):
         if len(rows)!=1 or ',' not in rows[0]: _fail('doctor_gpu_invalid')
         name,cap=(value.strip().lower() for value in rows[0].split(',',1))
         if 'gb10' not in name or cap not in ('12.1','sm_121'): _fail('doctor_gpu_invalid')
-        try: sync=open('/run/systemd/timesync/synchronized','rb').read(8).strip()==b'yes'
-        except OSError: sync=False
-        if not sync: _fail('doctor_time_unsynchronized')
+        sync=_doctor_time_synchronized()
+        if sync is not True: _fail('doctor_time_unsynchronized')
         primary_weight_sha256=_doctor_hash(d['model_path']); draft_weight_sha256=_doctor_hash(d['drafter_path'])
         _doctor_bound_source(work_fd,run_fd,work_identity,run_identity,paths,d)
         memory=_doctor_os.sysconf('SC_PAGE_SIZE')*_doctor_os.sysconf('SC_PHYS_PAGES'); disk=statvfs.f_bavail*statvfs.f_frsize
         if memory<1 or disk<1: _fail('doctor_system_invalid')
-        return {'status':'succeeded','failure_class':None,'os':'Linux','kernel':uname.release,'arch':uname.machine,'tools':tools,'gpu':{'platform':'GB10','compute_capability':'sm_121'},'memory_bytes':memory,'disk_bytes':disk,'time_sync':True,'primary_weight_sha256':primary_weight_sha256,'draft_weight_sha256':draft_weight_sha256,'nix':nix}
+        return {'status':'succeeded','failure_class':None,'os':'Linux','kernel':uname.release,'arch':uname.machine,'tools':tools,'gpu':{'platform':'GB10','compute_capability':'sm_121'},'memory_bytes':memory,'disk_bytes':disk,'time_sync':sync,'primary_weight_sha256':primary_weight_sha256,'draft_weight_sha256':draft_weight_sha256,'nix':nix}
     finally:
         _doctor_os.close(work_fd); _doctor_os.close(run_fd)
 '''
