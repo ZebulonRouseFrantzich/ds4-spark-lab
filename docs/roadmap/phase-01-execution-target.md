@@ -2,7 +2,8 @@
 
 ## Status
 
-**Planned**
+**Active — 2026-08-08.** Phase 00 is qualified; implementation and target
+qualification are in progress on `phase/01_execution_target`.
 
 ## Depends on
 
