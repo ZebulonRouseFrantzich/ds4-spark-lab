@@ -16,6 +16,7 @@ from pathlib import Path
 import selectors
 import signal
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from .common import PROTOCOL_VERSION, TargetError
 MAX_HELPER_INPUT_BYTES = 1024 * 1024
 MAX_HELPER_OUTPUT_BYTES = 1024 * 1024
 MAX_HELPER_ERROR_CODE_LENGTH = 64
+MAX_RSYNC_FILTER_BYTES = 16 * 1024 * 1024
 MAX_EXTENSION_ERROR_CODES = 16
 _BASE_HELPER_ERROR_CODES = frozenset({
     "entry_changed",
@@ -72,6 +74,22 @@ SSH_OPTIONS = (
     "ControlMaster=no",
     "ControlPath=none",
     "ControlPersist=no",
+)
+
+# This is deliberately an argv fragment, not a user-configurable transport
+# setting.  Source synchronization needs rsync's receiver-side deletion, but
+# must not inherit an operator's SSH forwarding or multiplexing defaults.
+RSYNC_OPTIONS = (
+    "--archive",
+    "--no-owner",
+    "--no-group",
+    "--no-links",
+    "--no-devices",
+    "--no-specials",
+    "--one-file-system",
+    "--delete",
+    "--delete-excluded",
+    "--human-readable",
 )
 
 
@@ -404,6 +422,79 @@ class SSHTransport(_HelperTransport):
         remote_command = shlex.join(("/bin/sh", "-c", inner_command))
         argv = (self._ssh_binary, *(part for option in SSH_OPTIONS for part in ("-o", option)), "--", self.ssh_host, remote_command)
         return self._execute(argv, program, timeout=timeout, cwd="/", env=_validate_env())
+
+    def guarded_rsync(
+        self,
+        source_root: Path,
+        remote_workdir: str,
+        *,
+        receiver: str,
+        filters: Collection[str] = (),
+        filter_file: Path | None = None,
+        timeout: float | None = 300.0,
+    ) -> None:
+        """Mirror a staged inventory through a descriptor-validating receiver."""
+
+        try:
+            source = Path(source_root).resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise _error("source_root_invalid", "source root is unavailable") from None
+        if not source.is_dir() or not _valid_rsync_root(remote_workdir) or not _valid_rsync_root(receiver):
+            raise _error("invalid_rsync_request", "source synchronization request is invalid")
+        if not isinstance(filters, Collection) or len(filters) > 128:
+            raise _error("invalid_rsync_request", "source synchronization request is invalid")
+        checked_filters: list[str] = []
+        for item in filters:
+            if not isinstance(item, str) or not item.isascii() or not item or "\x00" in item or "\n" in item:
+                raise _error("invalid_rsync_request", "source synchronization request is invalid")
+            checked_filters.append(item)
+        merge_filter: tuple[str, ...] = ()
+        if filter_file is not None:
+            try:
+                item = Path(filter_file)
+                details = os.stat(item, follow_symlinks=False)
+                if not stat.S_ISREG(details.st_mode) or details.st_size > MAX_RSYNC_FILTER_BYTES:
+                    raise OSError
+                with open(item, "rb") as handle:
+                    content = handle.read(MAX_RSYNC_FILTER_BYTES + 1)
+                if len(content) != details.st_size or not content.isascii() or b"\x00" in content:
+                    raise OSError
+                merge_filter = (f"--filter=merge {item}",)
+            except (OSError, RuntimeError):
+                raise _error("invalid_rsync_request", "source synchronization request is invalid") from None
+        ssh_command = shlex.join((self._ssh_binary, *(part for option in SSH_OPTIONS for part in ("-o", option))))
+        argv = (
+            "/usr/bin/rsync",
+            *RSYNC_OPTIONS,
+            f"--rsync-path={receiver}",
+            "--filter=H /.targetctl-owner-v1-work.json",
+            "--filter=P /.targetctl-owner-v1-work.json",
+            *(f"--filter={item}" for item in checked_filters),
+            *merge_filter,
+            "-e",
+            ssh_command,
+            f"{source}/",
+            f"{self.ssh_host}:{remote_workdir}/",
+        )
+        result = self._execute(argv, b"", timeout=timeout, cwd="/", env=_validate_env())
+        if result.timed_out:
+            raise _error("rsync_timeout", "source synchronization timed out")
+        if result.exit_code != 0:
+            raise _error("rsync_failed", "source synchronization failed")
+
+
+def _valid_rsync_root(value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 4096 or not value.startswith("/") or value.endswith("/"):
+        return False
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    parts = value.split("/")[1:]
+    return bool(parts) and all(
+        part not in {"", ".", ".."} and all(character.isalnum() or character in "._+-@%=" for character in part)
+        for part in parts
+    )
 
 
 def _valid_ssh_alias(value: Any) -> bool:
