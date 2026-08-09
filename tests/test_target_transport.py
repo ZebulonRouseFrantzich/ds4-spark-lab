@@ -164,6 +164,7 @@ class TransportTests(unittest.TestCase):
                 "IdentityAgent=none",
                 "ForwardX11=no",
                 "RequestTTY=no",
+                "RemoteCommand=none",
                 "ClearAllForwardings=yes",
                 "ControlMaster=no",
             }.issubset(ssh_options)
@@ -389,11 +390,14 @@ class SSHForwardTests(unittest.TestCase):
         forward.local_port = 32123
         argv = forward.argv
         self.assertEqual(argv[0], "/usr/bin/ssh")
+        # The logical alias still resolves through operator-managed SSH config;
+        # safety-critical channel and command settings are overridden explicitly.
+        self.assertNotIn("-F", argv)
         self.assertEqual(argv[-2:], ("--", "spark_1.example"))
         self.assertEqual(argv[argv.index("-L") + 1], "127.0.0.1:32123:127.0.0.1:43123")
         self.assertEqual(argv.count("-L"), 1)
         options = {argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-o"}
-        self.assertTrue({"ForwardAgent=no", "ForwardX11=no", "RequestTTY=no", "ControlMaster=no", "ClearAllForwardings=no", "ExitOnForwardFailure=yes"}.issubset(options))
+        self.assertTrue({"ForwardAgent=no", "ForwardX11=no", "RequestTTY=no", "RemoteCommand=none", "ControlMaster=no", "ClearAllForwardings=no", "ExitOnForwardFailure=yes"}.issubset(options))
 
 
 if __name__ == "__main__":

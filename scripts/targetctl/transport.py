@@ -71,6 +71,7 @@ SSH_OPTIONS = (
     "ForwardX11Trusted=no",
     "RequestTTY=no",
     "PermitLocalCommand=no",
+    "RemoteCommand=none",
     "ClearAllForwardings=yes",
     "ControlMaster=no",
     "ControlPath=none",
@@ -429,8 +430,6 @@ class SSHForward:
         options = tuple(option for option in SSH_OPTIONS if option != "ClearAllForwardings=yes")
         return (
             self._transport._ssh_binary,
-            "-F",
-            "/dev/null",
             *(part for option in (*options, "ClearAllForwardings=no", "ExitOnForwardFailure=yes") for part in ("-o", option)),
             "-L",
             f"127.0.0.1:{self.local_port}:127.0.0.1:{self._target_port}",
