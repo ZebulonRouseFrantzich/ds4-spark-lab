@@ -1772,7 +1772,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         exec(extension, namespace)
         program = (
             "import os,time\n"
-            "parts=(b'noise\\n\\tco',b'de for sm_',b'121a\\t\\nFun',"
+            "parts=(b'noise\\n\\tco',b'de for sm_',b'121a\\t\\n\\tcode for sm_121a\\nFun',"
             "b'ction : _Zkernel\\n        /*00',b'00*/                   MOV R1, R2;\\n')\n"
             "for part in parts: os.write(1,part); time.sleep(0.01)\n"
             "remaining=246178960\n"

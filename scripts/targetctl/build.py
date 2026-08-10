@@ -270,6 +270,8 @@ def _sass_line(state: list[int | bool], line: bytes) -> None:
             state[1] = True
         return
     if stage == 1:
+        if header:
+            return
         if _SASS_FUNCTION.fullmatch(line) is not None:
             state[0] = 2
         elif _SASS_INSTRUCTION.fullmatch(line) is not None or any_header:
@@ -875,6 +877,7 @@ def _build_sass_line(state,line):
         if header: state[0]=1
         elif any_header: state[1]=True
     elif stage==1:
+        if header: return
         if function: state[0]=2
         elif instruction or any_header: state[1]=True
     elif stage==2:
