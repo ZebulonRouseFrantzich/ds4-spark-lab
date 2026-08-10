@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ds4bench"
+version = "0.1.0"
+description = "ds4 micro-benchmarks"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+  "httpx==0.28.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ds4bench"]
+
+[tool.uv]
+python-preference = "only-system"
