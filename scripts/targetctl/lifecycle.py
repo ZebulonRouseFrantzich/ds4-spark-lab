@@ -26,7 +26,7 @@ RUN_SCHEMA_VERSION = 1
 MAX_LOG_BYTES = 1_048_576
 MAX_HTTP_BODY_BYTES = 1_048_576
 MAX_RUN_ID_LENGTH = 64
-DEFAULT_LEASE_SECONDS = 120
+DEFAULT_LEASE_SECONDS = 300
 _HEX = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{7,63}\Z", re.ASCII)
 _STATES = frozenset(("starting", "running", "stopped", "stale_identity", "failed_startup"))
@@ -1250,7 +1250,7 @@ def _http_contract(port, timeout):
         if connection is not None: connection.close()
 
 def _weight_evidence(config, transport, runtime):
-    value = _call(transport, "lifecycle_weights", _roots(config, runtime))
+    value = _call(transport, "lifecycle_weights", _roots(config, runtime), timeout=180)
     if not isinstance(value, Mapping): return None, None
     primary, draft = value.get("primary_weight_sha256"), value.get("draft_weight_sha256")
     if not isinstance(primary, str) or not isinstance(draft, str) or _HEX.fullmatch(primary) is None or _HEX.fullmatch(draft) is None: return None, None
