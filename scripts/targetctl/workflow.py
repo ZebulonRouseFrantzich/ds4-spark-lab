@@ -669,7 +669,8 @@ def _private_canaries(config: TargetConfig) -> tuple[str, ...]:
     if config.mode == "local":
         additional = (str(config.source_root), str(config.local_run_dir))
     else:
-        additional = (config.ssh_host, config.workdir, config.run_dir)
+        # Target-produced reports never observe the controller-only SSH alias.
+        additional = (config.workdir, config.run_dir)
     try:
         return redaction_canaries((model, drafter), additional=additional)
     except TargetError:

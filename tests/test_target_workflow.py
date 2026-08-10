@@ -79,6 +79,30 @@ class StructuredWorkflowBoundaryTests(unittest.TestCase):
 
 
 class WorkflowBundleEvidenceTests(unittest.TestCase):
+    def test_remote_report_canaries_exclude_controller_only_ssh_alias(self) -> None:
+        from scripts.targetctl.config import TargetConfig
+        from scripts.targetctl.redaction import StreamingRedactor
+        from scripts.targetctl.workflow import _private_canaries
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = TargetConfig(
+                "spark",
+                "ssh",
+                ssh_host="spark",
+                workdir="/lab/targetctl/work",
+                run_dir="/lab/targetctl/run",
+                api_base_url="http://127.0.0.1:8010",
+                model_path="/models/releases/model.gguf",
+                drafter_path="/models/releases/drafter.gguf",
+                source_root=Path(temporary),
+            )
+            canaries = _private_canaries(config)
+            self.assertNotIn(config.ssh_host, canaries)
+            self.assertIn(config.workdir, canaries)
+            redactor = StreamingRedactor(canaries, max_output=1024)
+            text = (redactor.feed(b"make cuda-spark\n") + redactor.finalize()).encode("utf-8")
+            self.assertEqual(text, b"make cuda-spark\n")
+
     def test_local_bundle_promotes_and_validates_real_evidence(self) -> None:
         from scripts.targetctl.artifacts import validate_bundle_index
         from scripts.targetctl.build import BuildResult
