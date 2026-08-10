@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import io
 import hashlib
 import os
 import re
@@ -155,6 +156,7 @@ def build_runtime_bundle(
             project=project,
             environment=environment,
         )
+        _synchronize_project_package(project, site_packages)
         candidate = temporary_root / "candidate"
         candidate.mkdir(mode=0o700)
         payload = assemble_runtime_payload(site_packages, candidate / "payload", lock_path)
@@ -363,6 +365,169 @@ def _installed_distribution_names(site: Path) -> set[str]:
             raise RuntimeBundleError("duplicate_installed_distribution")
         names.add(name)
     return names
+
+def _synchronize_project_package(project: Path, site: Path) -> None:
+    """Replace any cached local wheel payload with the exact current sources."""
+
+    source = project / "src" / "ds4bench"
+    if not source.exists():
+        # Synthetic builder fixtures may provide only an already-installed
+        # distribution. A real ds4bench project always has this source tree.
+        return
+    source_files = _project_package_files(source)
+    for required in ("ds4bench/__init__.py", "ds4bench/__main__.py"):
+        if required not in source_files:
+            raise RuntimeBundleError("project_package_incomplete")
+
+    matches: list[Path] = []
+    for dist_info in sorted(
+        entry for entry in site.iterdir() if entry.name.endswith(".dist-info")
+    ):
+        _validate_directory(dist_info, "dist_info")
+        metadata = _read_site_file(site, f"{dist_info.name}/METADATA")
+        if (
+            _normalized_name(
+                BytesParser(policy=compat32).parsebytes(metadata).get("Name")
+            )
+            == "ds4bench"
+        ):
+            matches.append(dist_info)
+    if len(matches) != 1:
+        raise RuntimeBundleError("installed_project_distribution")
+
+    dist_info = matches[0]
+    record_path = f"{dist_info.name}/RECORD"
+    old_record = _read_site_file(site, record_path)
+    installed_records = _parse_and_verify_record(site, record_path, old_record)
+    retained_paths = tuple(
+        record.path
+        for record in installed_records
+        if record.path != record_path
+        and not record.path.startswith("ds4bench/")
+        and record.path != f"{dist_info.name}/direct_url.json"
+    )
+
+    package = site / "ds4bench"
+    _remove_owned_tree(package)
+    package.mkdir(mode=0o755)
+    for relative, payload in sorted(source_files.items()):
+        destination = site.joinpath(*PurePosixPath(relative).parts)
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        _write_new_file(destination, payload)
+
+    recorded_payloads = dict(source_files)
+    for relative in retained_paths:
+        recorded_payloads[relative] = _read_site_file(site, relative)
+    record_buffer = io.StringIO(newline="")
+    writer = csv.writer(record_buffer, lineterminator="\n")
+    for relative, payload in sorted(recorded_payloads.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
+        writer.writerow(
+            (
+                relative,
+                "sha256=" + digest.rstrip(b"=").decode("ascii"),
+                str(len(payload)),
+            )
+        )
+    writer.writerow((record_path, "", ""))
+    replacement = dist_info / "RECORD.ds4bench-new"
+    _write_new_file(replacement, record_buffer.getvalue().encode("utf-8"))
+    try:
+        os.replace(replacement, dist_info / "RECORD")
+    except OSError as error:
+        raise RuntimeBundleError("project_record_replace_failed") from error
+    _fsync_directory(package)
+    _fsync_directory(dist_info)
+    _fsync_directory(site)
+
+
+def _project_package_files(source: Path) -> dict[str, bytes]:
+    _validate_directory(source, "project_package")
+    payloads: dict[str, bytes] = {}
+    directory_count = [0]
+    total_size = [0]
+
+    def collect(directory: Path, relative: PurePosixPath) -> None:
+        before = directory.lstat()
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid():
+            raise RuntimeBundleError("invalid_project_package")
+        directory_count[0] += 1
+        if directory_count[0] > MAX_INSTALLED_FILES:
+            raise RuntimeBundleError("project_package_file_count_limit")
+        try:
+            entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        except OSError as error:
+            raise RuntimeBundleError("project_package_unreadable") from error
+        for entry in entries:
+            if entry.name == "__pycache__":
+                continue
+            candidate = relative / entry.name
+            installed_path = _safe_relative_path(
+                (PurePosixPath("ds4bench") / candidate).as_posix()
+            )
+            try:
+                metadata = entry.lstat()
+            except OSError as error:
+                raise RuntimeBundleError("project_package_unreadable") from error
+            if stat.S_ISDIR(metadata.st_mode):
+                collect(entry, candidate)
+            elif stat.S_ISREG(metadata.st_mode):
+                if entry.name.endswith((".pyc", ".pyo")):
+                    continue
+                if entry.suffix != ".py":
+                    raise RuntimeBundleError("unsupported_project_package_file")
+                payload = _read_regular_path(
+                    entry, MAX_INSTALLED_FILE_BYTES, "project_package_file"
+                )
+                payloads[installed_path] = payload
+                total_size[0] += len(payload)
+                if len(payloads) > MAX_INSTALLED_FILES:
+                    raise RuntimeBundleError("project_package_file_count_limit")
+                if total_size[0] > MAX_INSTALLED_BYTES:
+                    raise RuntimeBundleError("project_package_size_limit")
+            else:
+                raise RuntimeBundleError("invalid_project_package_file")
+        after = directory.lstat()
+        if _mutable_identity(before) != _mutable_identity(after):
+            raise RuntimeBundleError("project_package_changed")
+
+    collect(source, PurePosixPath())
+    return payloads
+
+
+def _remove_owned_tree(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise RuntimeBundleError("installed_project_package_missing") from error
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise RuntimeBundleError("invalid_installed_project_package")
+    try:
+        entries = list(path.iterdir())
+    except OSError as error:
+        raise RuntimeBundleError("installed_project_package_unreadable") from error
+    for entry in entries:
+        try:
+            child = entry.lstat()
+        except OSError as error:
+            raise RuntimeBundleError("installed_project_package_unreadable") from error
+        if stat.S_ISDIR(child.st_mode):
+            _remove_owned_tree(entry)
+        elif (
+            stat.S_ISREG(child.st_mode)
+            and child.st_uid == os.getuid()
+            and child.st_nlink == 1
+        ):
+            try:
+                entry.unlink()
+            except OSError as error:
+                raise RuntimeBundleError("installed_project_package_remove_failed") from error
+        else:
+            raise RuntimeBundleError("invalid_installed_project_package_file")
+    try:
+        path.rmdir()
+    except OSError as error:
+        raise RuntimeBundleError("installed_project_package_remove_failed") from error
 
 
 def _locked_runtime_packages(lock_bytes: bytes) -> dict[str, _LockedPackage]:

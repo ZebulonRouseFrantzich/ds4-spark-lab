@@ -255,3 +255,21 @@ target-cleanup target="spark":
     cd '{{ ROOT }}' && python3 -m scripts.targetctl cleanup --target {{ quote(target) }}
 target-bundle target="spark":
     cd '{{ ROOT }}' && python3 -m scripts.targetctl bundle --target {{ quote(target) }}
+
+# Benchmark operations — Phase 02
+bench-smoke target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-smoke --target {{ quote(target) }}
+bench-s1 target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s1 --target {{ quote(target) }}
+bench-s2 target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s2 --target {{ quote(target) }}
+bench-s3 target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s3 --target {{ quote(target) }}
+bench-s5a target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s5a --target {{ quote(target) }}
+bench-s5b target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s5b --target {{ quote(target) }}
+bench-v1-baseline target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-v1-baseline --target {{ quote(target) }}
+compare baseline candidate:
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl compare --baseline {{ quote(baseline) }} --candidate {{ quote(candidate) }}

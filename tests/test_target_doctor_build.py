@@ -15,6 +15,7 @@ from scripts.targetctl import build as build_module
 from scripts.targetctl import doctor as doctor_module
 from scripts.targetctl.build import BuildResult
 from scripts.targetctl.common import TargetError, record_id_for
+from scripts.targetctl.remote import LAUNCH_PROFILE
 from scripts.targetctl.transport import CommandResult, helper_source
 from scripts.targetctl.doctor import DOCTOR_TOOLS, DoctorResult, RuntimeInput
 from scripts.targetctl.source import SourceSnapshot
@@ -1807,7 +1808,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             self.assertFalse((run_dir / "build.json").exists())
             self.assertFalse(any(run_dir.glob(".targetctl-build-attempt-v1-*")))
 
-    def test_local_build_refuses_uncompleted_lifecycle_before_make(self) -> None:
+    def test_local_build_refuses_uncompleted_or_legacy_lifecycle_before_make(self) -> None:
         snapshot = SimpleNamespace(snapshot_id="a" * 64, applied_tree_hash="b" * 64)
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "run"
@@ -1816,7 +1817,12 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 "schema_version": 1, "run_id": "run-aaaaaaaaaaaaaaaaaaaaaaaa", "state": "failed_startup",
                 "source_snapshot_id": "1" * 64, "applied_tree_hash": "2" * 64,
                 "build_id": "3" * 64, "binary_sha256": "4" * 64, "port": 8000,
-                "launch_profile": {"schema_version": 1, "accelerator": "cuda", "context_tokens": 32768, "bind": "loopback", "continuation_mtp_mode": 2, "dspark_enabled": True, "drafter_enabled": True},
+                "launch_profile": {
+                    **LAUNCH_PROFILE,
+                    "speculative_overrides": dict(
+                        LAUNCH_PROFILE["speculative_overrides"]
+                    ),
+                },
                 "supervisor_pid": None, "supervisor_start_ticks": None, "supervisor_cmdline_sha256": None,
                 "child_pid": None, "child_start_ticks": None, "child_pgid": None, "child_cmdline_sha256": None,
                 "listener_inode": None, "cleanup_complete": False, "cleanup": None,
@@ -1825,6 +1831,31 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             os.chmod(run_dir / "run.json", 0o600)
             transport = mock.Mock()
             config = SimpleNamespace(source_root=temporary, local_run_dir=run_dir)
+            with self.assertRaisesRegex(TargetError, "build_running"):
+                build_module._build_local(config, transport, snapshot, jobs=1)
+            transport.run.assert_not_called()
+            self.assertFalse((run_dir / "build.log").exists())
+            state["cleanup_complete"] = True
+            state["cleanup"] = {
+                "process": "not_found",
+                "socket": "not_found",
+                "lock": "not_found",
+                "temp": "not_found",
+                "server_log_sha256": None,
+            }
+            state["launch_profile"] = {
+                "schema_version": 1,
+                "accelerator": "cuda",
+                "context_tokens": 32768,
+                "bind": "loopback",
+                "continuation_mtp_mode": 2,
+                "dspark_enabled": True,
+                "drafter_enabled": True,
+            }
+            (run_dir / "run.json").write_text(
+                json.dumps(state),
+                encoding="ascii",
+            )
             with self.assertRaisesRegex(TargetError, "build_running"):
                 build_module._build_local(config, transport, snapshot, jobs=1)
             transport.run.assert_not_called()

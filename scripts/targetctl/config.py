@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ipaddress
 import os
 from pathlib import Path
 import re
@@ -10,7 +11,7 @@ import tomllib
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from .common import SCHEMA_VERSION, TargetError, validate_object_keys
+from .common import TargetError, validate_object_keys
 
 
 _TARGET_NAMES = frozenset({"spark", "local"})
@@ -22,12 +23,14 @@ _SSH_FIELDS = frozenset(
         "workdir",
         "run_dir",
         "api_base_url",
+        "lan_api_base_url",
         "model_path",
         "drafter_path",
     }
 )
 _LOCAL_FIELDS = frozenset({"name", "mode"})
-_OPERATIONS = frozenset({"doctor", "sync", "build", "serve", "status", "logs", "stop", "smoke"})
+_OPERATIONS = frozenset({"doctor", "sync", "build", "serve", "status", "logs", "stop", "smoke", "benchmark"})
+_CONFIG_SCHEMA_VERSION = 2
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", re.ASCII)
 _PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", re.ASCII)
 _MIN_REMOTE_PATH_DEPTH = 4
@@ -125,6 +128,36 @@ def _validate_api_base_url(value: Any) -> str:
         raise _config_error()
     return url
 
+def _validate_lan_api_base_url(value: Any, api_base_url: str) -> tuple[str, str]:
+    url = _require_string(value)
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        loopback_port = urlsplit(api_base_url).port
+        address = ipaddress.IPv4Address(parsed.hostname or "")
+    except (TypeError, ValueError):
+        raise _config_error() from None
+    private_ranges = (
+        ipaddress.IPv4Network("10.0.0.0/8"),
+        ipaddress.IPv4Network("172.16.0.0/12"),
+        ipaddress.IPv4Network("192.168.0.0/16"),
+    )
+    host = str(address)
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None
+        or port != loopback_port
+        or not any(address in network for network in private_ranges)
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or url != f"http://{host}:{port}"
+    ):
+        raise _config_error()
+    return url, host
+
 
 def _components(path: str) -> tuple[str, ...]:
     return tuple(path.split("/")[1:])
@@ -178,6 +211,7 @@ class TargetConfig:
     workdir: str | None = field(default=None, repr=False)
     run_dir: str | None = field(default=None, repr=False)
     api_base_url: str | None = field(default=None, repr=False)
+    lan_api_base_url: str | None = field(default=None, repr=False)
     model_path: str | None = field(default=None, repr=False)
     drafter_path: str | None = field(default=None, repr=False)
     source_root: Path = field(default=Path("."), repr=False)
@@ -189,6 +223,15 @@ class TargetConfig:
         if self.mode != "local" or self.run_dir is None:
             raise TargetError("config_mode_invalid", "target mode is invalid")
         return Path(self.run_dir)
+
+    @property
+    def lan_bind_host(self) -> str:
+        """Return the validated private bind address without exposing it in repr."""
+
+        if self.mode != "ssh" or self.lan_api_base_url is None or self.api_base_url is None:
+            raise TargetError("config_lan_unavailable", "private target endpoint is unavailable")
+        _, host = _validate_lan_api_base_url(self.lan_api_base_url, self.api_base_url)
+        return host
 
     def validate_for(self, operation: str) -> None:
         """Reject unknown operations before target-specific work begins."""
@@ -204,6 +247,7 @@ class TargetConfig:
                     self.api_base_url,
                     self.model_path,
                     self.drafter_path,
+                    self.lan_api_base_url,
                 )
             ) or self.run_dir is None:
                 raise _config_error()
@@ -226,6 +270,10 @@ class TargetConfig:
         )
         _validate_no_lexical_overlap(paths)
         _validate_api_base_url(self.api_base_url)
+        if self.lan_api_base_url is not None:
+            _validate_lan_api_base_url(self.lan_api_base_url, self.api_base_url)
+        if operation == "benchmark" and self.lan_api_base_url is None:
+            raise TargetError("config_lan_required", "private target endpoint is unavailable")
 
 
 def _read_toml(config_path: str | os.PathLike[str]) -> Mapping[str, Any]:
@@ -250,7 +298,7 @@ def load_target(
     document = _read_toml(config_path)
     validate_object_keys(document, allowed={"schema_version", "spark", "local"}, required={"schema_version"})
     schema = document["schema_version"]
-    if isinstance(schema, bool) or not isinstance(schema, int) or schema != SCHEMA_VERSION:
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema != _CONFIG_SCHEMA_VERSION:
         raise TargetError("config_schema_invalid", "target configuration schema is invalid")
     section = document.get(name)
     if not isinstance(section, dict):
@@ -262,7 +310,11 @@ def load_target(
             raise _config_error()
         return TargetConfig(name="local", mode="local", run_dir=_local_run_dir(), source_root=source_root)
     if mode == "ssh":
-        validate_object_keys(section, allowed=_SSH_FIELDS, required=_SSH_FIELDS)
+        validate_object_keys(
+            section,
+            allowed=_SSH_FIELDS,
+            required=_SSH_FIELDS - {"lan_api_base_url"},
+        )
         if section["name"] != "spark" or name != "spark":
             raise _config_error()
         ssh_host = _validate_alias(section["ssh_host"])
@@ -270,6 +322,10 @@ def load_target(
         run_dir = _validate_mutable_remote_path(section["run_dir"])
         model_path = _validate_artifact_remote_path(section["model_path"])
         drafter_path = _validate_artifact_remote_path(section["drafter_path"])
+        api_base_url = _validate_api_base_url(section["api_base_url"])
+        lan_api_base_url = section.get("lan_api_base_url")
+        if lan_api_base_url is not None:
+            lan_api_base_url, _ = _validate_lan_api_base_url(lan_api_base_url, api_base_url)
         _validate_no_lexical_overlap((workdir, run_dir, model_path, drafter_path))
         return TargetConfig(
             name="spark",
@@ -277,7 +333,8 @@ def load_target(
             ssh_host=ssh_host,
             workdir=workdir,
             run_dir=run_dir,
-            api_base_url=_validate_api_base_url(section["api_base_url"]),
+            api_base_url=api_base_url,
+            lan_api_base_url=lan_api_base_url,
             model_path=model_path,
             drafter_path=drafter_path,
             source_root=source_root,

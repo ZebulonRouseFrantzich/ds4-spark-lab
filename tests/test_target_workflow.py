@@ -22,7 +22,7 @@ class TargetWorkflowContracts(unittest.TestCase):
     def _config(self, root: Path, mode: int = 0o600) -> Path:
         path = root / "targets" / "targets.toml"
         path.parent.mkdir(mode=0o700)
-        path.write_text('schema_version = 1\n[local]\nname = "local"\nmode = "local"\n', encoding="utf-8")
+        path.write_text('schema_version = 2\n[local]\nname = "local"\nmode = "local"\n', encoding="utf-8")
         os.chmod(path, mode)
         return path
 

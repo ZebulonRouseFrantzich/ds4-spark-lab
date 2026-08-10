@@ -39,14 +39,33 @@ RUN_STATE_STATES = frozenset({
 RUN_STATE_TERMINAL_STATES = frozenset({
     "stopped", "stale_identity", "failed_startup",
 })
+LAUNCH_PROFILE_FIELDS = frozenset({
+    "schema_version", "accelerator", "context_tokens",
+    "default_output_tokens", "bind", "continuation_mtp_mode",
+    "decode_policy", "dspark_max_nlive", "terminal_yield_quench",
+    "speculative_overrides",
+})
+SPECULATIVE_OVERRIDE_FIELDS = frozenset({
+    "shadow_guard", "shadow_alpha", "shadow_min_evidence",
+    "shadow_budget", "shadow_credit_cap",
+})
 LAUNCH_PROFILE = {
-    "schema_version": 1,
+    "schema_version": 2,
     "accelerator": "cuda",
     "context_tokens": 32768,
+    "default_output_tokens": 393216,
     "bind": "loopback",
     "continuation_mtp_mode": 2,
-    "dspark_enabled": True,
-    "drafter_enabled": True,
+    "decode_policy": "shipped",
+    "dspark_max_nlive": 1,
+    "terminal_yield_quench": True,
+    "speculative_overrides": {
+        "shadow_guard": None,
+        "shadow_alpha": None,
+        "shadow_min_evidence": None,
+        "shadow_budget": None,
+        "shadow_credit_cap": None,
+    },
 }
 
 
@@ -55,6 +74,36 @@ def _is_hex_digest(value: Any) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _valid_launch_profile(value: Any) -> bool:
+    """Validate exact bounded schema-v2 launch evidence."""
+
+    if type(value) is not dict or set(value) != LAUNCH_PROFILE_FIELDS:
+        return False
+    overrides = value["speculative_overrides"]
+    return (
+        type(value["schema_version"]) is int
+        and value["schema_version"] == 2
+        and type(value["accelerator"]) is str
+        and value["accelerator"] == "cuda"
+        and type(value["context_tokens"]) is int
+        and value["context_tokens"] in {32768, 262144}
+        and type(value["default_output_tokens"]) is int
+        and value["default_output_tokens"] == 393216
+        and type(value["bind"]) is str
+        and value["bind"] in {"loopback", "private_lan"}
+        and type(value["continuation_mtp_mode"]) is int
+        and value["continuation_mtp_mode"] == 2
+        and type(value["decode_policy"]) is str
+        and value["decode_policy"] in {"shipped", "plain"}
+        and type(value["dspark_max_nlive"]) is int
+        and value["dspark_max_nlive"] == 1
+        and value["terminal_yield_quench"] is True
+        and type(overrides) is dict
+        and set(overrides) == SPECULATIVE_OVERRIDE_FIELDS
+        and all(overrides[key] is None for key in SPECULATIVE_OVERRIDE_FIELDS)
     )
 
 
@@ -79,7 +128,7 @@ def _valid_run_state(value: Any, *, terminal: bool = False) -> bool:
         or not isinstance(value["port"], int)
         or isinstance(value["port"], bool)
         or not 1 <= value["port"] <= 65535
-        or value["launch_profile"] != LAUNCH_PROFILE
+        or not _valid_launch_profile(value["launch_profile"])
         or not isinstance(value["cleanup_complete"], bool)
     ):
         return False

@@ -36,9 +36,10 @@ class TargetConfigTests(unittest.TestCase):
             "run_dir": "/mnt/ds4-data/spark/run",
             "model_path": "/mnt/ds4-models/primary/release",
             "drafter_path": "/mnt/ds4-models/drafter/release",
+            "lan_url": "http://192.168.20.30:8080",
         }
         values.update(paths)
-        return """schema_version = 1
+        return """schema_version = 2
 [spark]
 name = "spark"
 mode = "ssh"
@@ -46,6 +47,7 @@ ssh_host = "alias"
 workdir = "{workdir}"
 run_dir = "{run_dir}"
 api_base_url = "http://127.0.0.1:8080"
+lan_api_base_url = "{lan_url}"
 model_path = "{model_path}"
 drafter_path = "{drafter_path}"
 """.format(**values)
@@ -59,7 +61,7 @@ drafter_path = "{drafter_path}"
     def test_minimal_local_target_uses_xdg_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = self._config(root, 'schema_version = 1\n[local]\nname = "local"\nmode = "local"\n')
+            config = self._config(root, 'schema_version = 2\n[local]\nname = "local"\nmode = "local"\n')
             old_state = os.environ.get("XDG_STATE_HOME")
             try:
                 os.environ["XDG_STATE_HOME"] = str(root / "state")
@@ -74,6 +76,7 @@ drafter_path = "{drafter_path}"
             self.assertEqual(target.source_root, root.resolve())
             self.assertEqual(target.local_run_dir, root / "state" / "ds4-spark-lab" / "targetctl" / "local")
             target.validate_for("doctor")
+            target.validate_for("benchmark")
 
     def test_private_ssh_values_are_fields_but_never_repr(self) -> None:
         secret = "private-model-value"
@@ -81,7 +84,7 @@ drafter_path = "{drafter_path}"
             root = Path(temporary)
             config = self._config(
                 root,
-                """schema_version = 1
+                """schema_version = 2
 [spark]
 name = "spark"
 mode = "ssh"
@@ -102,7 +105,7 @@ drafter_path = "/mnt/ds4-models/drafter/main"
     def test_config_rejects_missing_unknown_placeholder_and_unsafe_values_without_values(self) -> None:
         secret = "do-not-print-this"
         cases = (
-            """schema_version = 1
+            """schema_version = 2
 [spark]
 name = "spark"
 mode = "ssh"
@@ -112,13 +115,13 @@ run_dir = "/mnt/ds4-data/spark/run"
 api_base_url = "http://127.0.0.1:8080"
 model_path = "/mnt/ds4-models/primary/release"
 """,
-            """schema_version = 1
+            """schema_version = 2
 [local]
 name = "local"
 mode = "local"
 unknown = "do-not-print-this"
 """,
-            """schema_version = 1
+            """schema_version = 2
 [spark]
 name = "spark"
 mode = "ssh"
@@ -129,7 +132,7 @@ api_base_url = "http://127.0.0.1:8080"
 model_path = "/mnt/ds4-models/primary/release"
 drafter_path = "/mnt/ds4-models/drafter/release"
 """,
-            """schema_version = 1
+            """schema_version = 2
 [spark]
 name = "spark"
 mode = "ssh"
@@ -192,6 +195,62 @@ drafter_path = "/mnt/ds4-models/drafter/release"
                 (workdir, run_dir, model_path, drafter_path),
             )
             target.validate_for("doctor")
+
+    def test_benchmark_requires_canonical_private_lan_url_on_same_port(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = load_target(root, "spark", self._config(root, self._ssh_body()))
+            private_host = ".".join(("192", "168", "20", "30"))
+            self.assertEqual(target.lan_api_base_url, f"http://{private_host}:8080")
+            self.assertEqual(target.lan_bind_host, private_host)
+            target.validate_for("benchmark")
+            self.assertNotIn(private_host, repr(target))
+
+            no_lan = self._ssh_body().replace(
+                f'lan_api_base_url = "http://{private_host}:8080"\n', ""
+            )
+            target_without_lan = load_target(
+                root, "spark", self._config(root, no_lan)
+            )
+            target_without_lan.validate_for("doctor")
+            with self.assertRaises(TargetError) as missing:
+                target_without_lan.validate_for("benchmark")
+            self.assertEqual(missing.exception.code, "config_lan_required")
+
+    def test_private_lan_url_rejects_noncanonical_or_unsafe_endpoints(self) -> None:
+        invalid_urls = (
+            "http://" + ".".join(("203", "0", "113", "8")) + ":8080",
+            "http://" + ".".join(("127", "0", "0", "1")) + ":8080",
+            "http://" + ".".join(("192", "168", "20", "30")) + ":8081",
+            "https://" + ".".join(("192", "168", "20", "30")) + ":8080",
+            "http://" + ".".join(("192", "168", "020", "30")) + ":8080",
+            "http://" + ".".join(("192", "168", "20", "30")) + ":8080/",
+            "http://user@" + ".".join(("192", "168", "20", "30")) + ":8080",
+            "http://" + ".".join(("192", "168", "20", "30")) + ":8080?x=1",
+            "http://private-host:8080",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for url in invalid_urls:
+                with self.subTest(url=url):
+                    config = self._config(
+                        root, self._ssh_body(lan_url=url)
+                    )
+                    self._assert_value_free(
+                        lambda config=config: load_target(root, "spark", config),
+                        url,
+                    )
+
+    def test_config_schema_v1_is_rejected_after_clean_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(
+                root,
+                'schema_version = 1\n[local]\nname = "local"\nmode = "local"\n',
+            )
+            with self.assertRaises(TargetError) as raised:
+                load_target(root, "local", config)
+            self.assertEqual(raised.exception.code, "config_schema_invalid")
 
     def test_shallow_and_high_blast_radius_mutable_paths_fail_at_load(self) -> None:
         unsafe_paths = (
@@ -537,7 +596,7 @@ class RedactionTests(unittest.TestCase):
             root = Path(temporary)
             config = root / "targets.toml"
             config.write_text(
-                """schema_version = 1
+                """schema_version = 2
 [spark]
 name = "spark"
 mode = "ssh"

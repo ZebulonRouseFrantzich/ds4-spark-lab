@@ -1,8 +1,8 @@
-"""Safe loopback lifecycle operations for the targetctl Phase 01 target."""
+"""Safe bounded lifecycle operations for targetctl execution targets."""
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import base64
 import fcntl
 import hashlib
@@ -13,16 +13,18 @@ from pathlib import Path
 import re
 import secrets
 import stat
+from types import MappingProxyType
 from typing import Any, Iterator, Mapping
 
 from .common import TargetError
 from .redaction import REMOTE_REDACTION_EXTENSION
-# These names are also present when the embedded extension executes in the
-# standalone remote-helper namespace; importing them documents that contract.
-from .remote import LAUNCH_PROFILE, RUN_STATE_SCHEMA_VERSION, _is_hex_digest, _valid_run_state
+# The digest validator is also present when the embedded extension executes in
+# the standalone remote-helper namespace; importing it documents that contract.
+from .remote import _is_hex_digest
 from .transport import LocalTransport, SSHForward, SSHTransport
 
 RUN_SCHEMA_VERSION = 1
+RUN_STATE_SCHEMA_VERSION = 1
 MAX_LOG_BYTES = 1_048_576
 MAX_HTTP_BODY_BYTES = 1_048_576
 MAX_RUN_ID_LENGTH = 64
@@ -57,6 +59,29 @@ def _hex(value: Any) -> str:
 def _path(value: Any) -> str:
     if not isinstance(value, str) or not value or len(value) > 4096 or not value.isascii() or "\x00" in value or not value.startswith("/"):
         _fail("invalid_runtime_inputs", "runtime inputs are invalid")
+    return value
+
+def _private_bind_host(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 15:
+        _fail("invalid_bind", "target bind is invalid")
+    components = value.split(".")
+    if (
+        len(components) != 4
+        or any(
+            not component.isdigit()
+            or str(int(component)) != component
+            or not 0 <= int(component) <= 255
+            for component in components
+        )
+    ):
+        _fail("invalid_bind", "target bind is invalid")
+    first, second = (int(component) for component in components[:2])
+    if not (
+        first == 10
+        or (first == 172 and 16 <= second <= 31)
+        or (first == 192 and second == 168)
+    ):
+        _fail("invalid_bind", "target bind is invalid")
     return value
 
 
@@ -97,29 +122,118 @@ class RuntimeInputs:
             _fail("invalid_runtime_inputs", "runtime inputs are invalid")
 
 
+_PROFILE_FIELDS = (
+    "schema_version",
+    "accelerator",
+    "context_tokens",
+    "default_output_tokens",
+    "bind",
+    "continuation_mtp_mode",
+    "decode_policy",
+    "dspark_max_nlive",
+    "terminal_yield_quench",
+    "speculative_overrides",
+)
+_OVERRIDE_FIELDS = (
+    "shadow_guard",
+    "shadow_alpha",
+    "shadow_min_evidence",
+    "shadow_budget",
+    "shadow_credit_cap",
+)
+_NULL_SPECULATIVE_OVERRIDES = MappingProxyType(
+    {key: None for key in _OVERRIDE_FIELDS}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class LaunchProfile:
-    """Bounded non-private evidence for the one supported Phase 01 launch."""
+    """Exact bounded, non-private server launch evidence."""
 
-    schema_version: int = 1
+    schema_version: int = 2
     accelerator: str = "cuda"
     context_tokens: int = 32768
+    default_output_tokens: int = 393216
     bind: str = "loopback"
     continuation_mtp_mode: int = 2
-    dspark_enabled: bool = True
-    drafter_enabled: bool = True
+    decode_policy: str = "shipped"
+    dspark_max_nlive: int = 1
+    terminal_yield_quench: bool = True
+    speculative_overrides: Mapping[str, None] = field(
+        default_factory=lambda: _NULL_SPECULATIVE_OVERRIDES
+    )
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 2
+            or self.accelerator != "cuda"
+            or type(self.context_tokens) is not int
+            or self.context_tokens not in {32768, 262144}
+            or type(self.default_output_tokens) is not int
+            or self.default_output_tokens != 393216
+            or self.bind not in ("loopback", "private_lan")
+            or type(self.continuation_mtp_mode) is not int
+            or self.continuation_mtp_mode != 2
+            or self.decode_policy not in ("shipped", "plain")
+            or type(self.dspark_max_nlive) is not int
+            or self.dspark_max_nlive != 1
+            or self.terminal_yield_quench is not True
+            or not isinstance(self.speculative_overrides, Mapping)
+            or set(self.speculative_overrides) != set(_OVERRIDE_FIELDS)
+            or any(self.speculative_overrides[key] is not None for key in _OVERRIDE_FIELDS)
+        ):
+            _fail("invalid_launch_profile", "target launch profile is invalid")
+        object.__setattr__(
+            self,
+            "speculative_overrides",
+            MappingProxyType(
+                {key: self.speculative_overrides[key] for key in _OVERRIDE_FIELDS}
+            ),
+        )
 
     def controller_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             key: getattr(self, key)
-            for key in (
-                "schema_version", "accelerator", "context_tokens", "bind",
-                "continuation_mtp_mode", "dspark_enabled", "drafter_enabled",
-            )
+            for key in _PROFILE_FIELDS
+            if key != "speculative_overrides"
         }
+        payload["speculative_overrides"] = dict(self.speculative_overrides)
+        return payload
 
 
-FIXED_LAUNCH_PROFILE = LaunchProfile(**LAUNCH_PROFILE)
+FIXED_LAUNCH_PROFILE = LaunchProfile()
+
+
+def launch_profile_from_scenario(
+    server_mapping: Mapping[str, Any], vantage: str
+) -> LaunchProfile:
+    """Construct exact launch evidence from a normalized scenario server object."""
+
+    expected = {
+        "context_tokens",
+        "default_output_tokens",
+        "decode_policy",
+        "dspark_max_nlive",
+        "terminal_yield_quench",
+        "speculative_overrides",
+    }
+    if (
+        not isinstance(server_mapping, Mapping)
+        or set(server_mapping) != expected
+        or not isinstance(vantage, str)
+        or vantage not in ("controller_lan", "target_local")
+    ):
+        _fail("invalid_launch_profile", "target launch profile is invalid")
+    return LaunchProfile(
+        context_tokens=server_mapping["context_tokens"],
+        default_output_tokens=server_mapping["default_output_tokens"],
+        bind="private_lan" if vantage == "controller_lan" else "loopback",
+        decode_policy=server_mapping["decode_policy"],
+        dspark_max_nlive=server_mapping["dspark_max_nlive"],
+        terminal_yield_quench=server_mapping["terminal_yield_quench"],
+        speculative_overrides=server_mapping["speculative_overrides"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,30 +583,73 @@ try:
   log_identity = _log_descriptor_identity(require_named=True)
   failure_stage = 'spec'
   spec = _read_json(sys.argv[1])
-  profile = {
-    'schema_version': 1, 'accelerator': 'cuda', 'context_tokens': 32768,
-    'bind': 'loopback', 'continuation_mtp_mode': 2,
-    'dspark_enabled': True, 'drafter_enabled': True,
+  profile = spec.get('launch_profile')
+  overrides = profile.get('speculative_overrides') if isinstance(profile, dict) else None
+  profile_valid = (
+    isinstance(profile, dict)
+    and set(profile) == {
+      'schema_version', 'accelerator', 'context_tokens', 'default_output_tokens',
+      'bind', 'continuation_mtp_mode', 'decode_policy', 'dspark_max_nlive',
+      'terminal_yield_quench', 'speculative_overrides',
+    }
+    and profile['schema_version'] == 2
+    and profile['accelerator'] == 'cuda'
+    and type(profile['context_tokens']) is int
+    and profile['context_tokens'] in (32768, 262144)
+    and type(profile['default_output_tokens']) is int
+    and profile['default_output_tokens'] == 393216
+    and profile['bind'] in ('loopback', 'private_lan')
+    and type(profile['continuation_mtp_mode']) is int
+    and profile['continuation_mtp_mode'] == 2
+    and profile['decode_policy'] in ('shipped', 'plain')
+    and type(profile['dspark_max_nlive']) is int
+    and profile['dspark_max_nlive'] == 1
+    and profile['terminal_yield_quench'] is True
+    and isinstance(overrides, dict)
+    and set(overrides) == {
+      'shadow_guard', 'shadow_alpha', 'shadow_min_evidence',
+      'shadow_budget', 'shadow_credit_cap',
+    }
+    and all(value is None for value in overrides.values())
+  )
+  expected_env = {
+    'LANG': 'C', 'LC_ALL': 'C', 'PATH': '/usr/bin:/bin',
+    'DS4_CONT_MTP_MODE': '2', 'DS4_CONT_DSPARK': '1',
+    'DS4_DSPARK_MODEL': spec.get('drafter', ''),
+    'DS4_DSPARK_MAX_NLIVE': '1', 'DS4_DSPARK_QUENCH': '1',
   }
+  argv = spec.get('argv', []) if isinstance(spec, dict) else []
+  redaction_paths = spec.get('redaction_paths', []) if isinstance(spec, dict) else []
+  fixed_canaries = spec.get('fixed_canaries', []) if isinstance(spec, dict) else []
+  plain = profile_valid and profile['decode_policy'] == 'plain'
+  tail_offset = 10 if plain else 9
+  port_argument = argv[-2 if plain else -1] if len(argv) >= tail_offset else ''
+  expected_suffix = [
+    '--cuda', '-m', redaction_paths[0] if len(redaction_paths) == 2 else None,
+    '-c', str(profile.get('context_tokens')) if isinstance(profile, dict) else '',
+    '--host', fixed_canaries[2] if len(fixed_canaries) == 3 else None,
+    '--port', port_argument,
+  ] + (['--no-spec'] if plain else [])
   if (
     not isinstance(spec, dict)
-    or set(spec) != {'argv', 'drafter', 'redaction_paths', 'fixed_canaries', 'lease_seconds', 'run_id', 'launch_profile'}
+    or set(spec) != {'argv', 'env', 'drafter', 'redaction_paths', 'fixed_canaries', 'lease_seconds', 'run_id', 'launch_profile'}
     or not isinstance(spec['argv'], list)
     or not all(isinstance(argument, str) for argument in spec['argv'])
+    or not isinstance(spec['env'], dict)
+    or spec['env'] != expected_env
     or not isinstance(spec['redaction_paths'], list)
     or len(spec['redaction_paths']) != 2
     or not isinstance(spec['fixed_canaries'], list)
-    or len(spec['fixed_canaries']) != 2
+    or len(spec['fixed_canaries']) != 3
     or not isinstance(spec['drafter'], str)
-    or len(spec['argv']) < 9
-    or spec['argv'][-9:-7] != ['--cuda', '-m']
-    or spec['argv'][-7] != spec['redaction_paths'][0]
-    or spec['argv'][-6:-2] != ['-c', '32768', '--host', '127.0.0.1']
-    or spec['argv'][-2] != '--port'
+    or len(spec['argv']) < tail_offset
+    or spec['argv'][-tail_offset:] != expected_suffix
+    or not port_argument.isdigit()
+    or not 1 <= int(port_argument) <= 65535
     or spec['drafter'] != spec['redaction_paths'][1]
     or not isinstance(spec['lease_seconds'], int)
     or not isinstance(spec['run_id'], str)
-    or spec['launch_profile'] != profile
+    or not profile_valid
     or spec['lease_seconds'] < 1
   ):
     raise ValueError('invalid_spec')
@@ -521,8 +678,7 @@ try:
   failure_stage = 'log_setup'
   redactor = _targetctl_redactor(redaction_secrets)
   failure_stage = 'child_spawn'
-  env = {'LANG': 'C', 'LC_ALL': 'C', 'PATH': '/usr/bin:/bin', 'DS4_CONT_MTP_MODE':'2', 'DS4_CONT_DSPARK':'1', 'DS4_DSPARK_MODEL': spec.get('drafter', '')}
-  child = subprocess.Popen(spec['argv'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(int(os.environ['TARGETCTL_SV_DIR_FD']),), env=env)
+  child = subprocess.Popen(spec['argv'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(int(os.environ['TARGETCTL_SV_DIR_FD']),), env=spec['env'])
   failure_stage = 'child_identity'
   child_pgid = child.pid
   child_ticks = None
@@ -648,6 +804,77 @@ def _lc_hex(value):
   return isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
 def _lc_id(value):
   return isinstance(value,str) and 8<=len(value)<=64 and all(c.islower() or c.isdigit() or c=='-' for c in value) and value[0].isalnum()
+def _lc_profile(value):
+  fields={'schema_version','accelerator','context_tokens','default_output_tokens','bind','continuation_mtp_mode','decode_policy','dspark_max_nlive','terminal_yield_quench','speculative_overrides'}
+  overrides=value.get('speculative_overrides')if isinstance(value,dict)else None
+  return(
+    isinstance(value,dict)and set(value)==fields
+    and type(value['schema_version'])is int and value['schema_version']==2
+    and value['accelerator']=='cuda'
+    and type(value['context_tokens'])is int and value['context_tokens']in(32768,262144)
+    and type(value['default_output_tokens'])is int and value['default_output_tokens']==393216
+    and value['bind']in('loopback','private_lan')
+    and type(value['continuation_mtp_mode'])is int and value['continuation_mtp_mode']==2
+    and value['decode_policy']in('shipped','plain')
+    and type(value['dspark_max_nlive'])is int and value['dspark_max_nlive']==1
+    and value['terminal_yield_quench']is True
+    and isinstance(overrides,dict)
+    and set(overrides)=={'shadow_guard','shadow_alpha','shadow_min_evidence','shadow_budget','shadow_credit_cap'}
+    and all(item is None for item in overrides.values())
+  )
+def _valid_run_state(value,terminal=False):
+  fields={
+    'schema_version','run_id','state','source_snapshot_id','applied_tree_hash',
+    'build_id','binary_sha256','port','launch_profile','supervisor_pid',
+    'supervisor_start_ticks','supervisor_cmdline_sha256','child_pid',
+    'child_start_ticks','child_pgid','child_cmdline_sha256','listener_inode',
+    'cleanup_complete','cleanup',
+  }
+  if not isinstance(value,dict)or set(value)!=fields:return False
+  if(
+    value['schema_version']!=1 or value['state']not in _LC_STATES
+    or(terminal and value['state']not in('stopped','stale_identity','failed_startup'))
+    or not _lc_id(value['run_id'])
+    or not all(_lc_hex(value[key])for key in('source_snapshot_id','applied_tree_hash','build_id','binary_sha256'))
+    or type(value['port'])is not int or not 1<=value['port']<=65535
+    or not _lc_profile(value['launch_profile'])
+    or type(value['cleanup_complete'])is not bool
+  ):return False
+  cleanup=value['cleanup']
+  if value['cleanup_complete']:
+    if(
+      value['state']not in('stopped','stale_identity','failed_startup')
+      or not isinstance(cleanup,dict)
+      or set(cleanup)!={'process','socket','lock','temp','server_log_sha256'}
+      or any(cleanup[key]not in('cleared','not_found')for key in('process','socket','lock','temp'))
+      or(cleanup['server_log_sha256']is not None and not _lc_hex(cleanup['server_log_sha256']))
+    ):return False
+  elif cleanup is not None:return False
+  supervisor=(value['supervisor_pid'],value['supervisor_start_ticks'],value['supervisor_cmdline_sha256'])
+  child=(value['child_pid'],value['child_start_ticks'],value['child_pgid'],value['child_cmdline_sha256'])
+  if not(
+    all(item is None for item in supervisor)
+    or(type(supervisor[0])is int and supervisor[0]>1 and type(supervisor[1])is int and supervisor[1]>1 and _lc_hex(supervisor[2]))
+  ):return False
+  if not(
+    all(item is None for item in child)
+    or(type(child[0])is int and child[0]>1 and type(child[1])is int and child[1]>1 and type(child[2])is int and child[2]==child[0]and _lc_hex(child[3]))
+  ):return False
+  listener=value['listener_inode']
+  if listener is not None and(
+    child[0]is None or not isinstance(listener,str)or not 1<=len(listener)<=32
+    or not listener.isascii()or not listener.isdigit()
+  ):return False
+  return value['state']!='running'or(supervisor[0]is not None and child[0]is not None and listener is not None)
+def _lc_private_bind_host(value):
+  if not isinstance(value,str)or len(value)>15:return False
+  parts=value.split('.')
+  if len(parts)!=4 or any(not part.isdigit()or str(int(part))!=part or not 0<=int(part)<=255 for part in parts):return False
+  first,second=map(int,parts[:2])
+  return first==10 or(first==172 and 16<=second<=31)or(first==192 and second==168)
+def _lc_proc_ipv4(value):
+  if not isinstance(value,str)or len(value)!=8 or any(character not in'0123456789ABCDEF'for character in value):return None
+  return'.'.join(str(int(value[index:index+2],16))for index in(6,4,2,0))
 def _lc_active_build(build,data,binary_hash):
   keys={'schema_version','record_type','source_snapshot_id','source_applied_tree_hash','build_id','binary_sha256','binary_size','version','sass','build_log_sha256','exit_code','duration_ns'}
   if not isinstance(build,dict)or set(build)!=keys or build['schema_version']!=1 or build['record_type']!='build':return False
@@ -745,15 +972,24 @@ def _lc_child_identity(state):
     return os.stat('/proc/%d'%pid).st_uid==os.geteuid() and bool(cmdline) and hmac.compare_digest(hashlib.sha256(b' '.join(cmdline.split(b'\0'))).hexdigest(),expected)
   except OSError:return False
 def _lc_live(state):
-  return _lc_supervisor_identity(state) and _lc_child_identity(state) and _lc_listener(state.get('port'),state.get('child_pid',0),state.get('listener_inode')) is not None
+  return _lc_supervisor_identity(state) and _lc_child_identity(state) and _lc_listener(
+    state.get('port'),state.get('child_pid',0),state.get('listener_inode'),
+    state.get('launch_profile',{}).get('bind'),
+  ) is not None
 
-def _lc_listener(port,pid,expected=None):
+def _lc_listener(port,pid,expected=None,bind='loopback',bind_host=None):
   wanted='%04X'%port;inodes=set()
+  if bind=='private_lan'and bind_host is not None and not _lc_private_bind_host(bind_host):return None
   for name in('/proc/net/tcp','/proc/net/tcp6'):
     try:
       for line in open(name,encoding='ascii').read().splitlines()[1:]:
         fields=line.split();host,number=fields[1].rsplit(':',1)
-        if len(fields)>9 and fields[3]=='0A' and number==wanted and host in('0100007F','00000000000000000000000000000001') and fields[7]==str(os.geteuid()):inodes.add(fields[9])
+        loopback=host in('0100007F','00000000000000000000000000000001')
+        observed=_lc_proc_ipv4(host)
+        private=observed is not None and _lc_private_bind_host(observed)
+        exact=bind_host is None or observed==bind_host
+        host_matches=(bind=='loopback'and loopback)or(bind=='private_lan'and private and exact)
+        if len(fields)>9 and fields[3]=='0A' and number==wanted and host_matches and fields[7]==str(os.geteuid()):inodes.add(fields[9])
     except OSError:pass
   try:owned=set(os.listdir('/proc/%d/fd'%pid))
   except OSError:return None
@@ -909,7 +1145,7 @@ def _lc_stop_stale_owned(state):
     except OSError:return'unknown','unknown'
   started=time.monotonic();deadline=started+15;kill_after=started+3;killed=False;socket_seen=False
   while time.monotonic()<deadline:
-    listener=_lc_listener(state['port'],state['child_pid']or 0)
+    listener=_lc_listener(state['port'],state['child_pid']or 0,None,state['launch_profile']['bind'])
     socket_seen=socket_seen or listener is not None
     process=_lc_stale_process_outcome(state,groups)
     if process=='unknown':return 'unknown','unknown'if listener is not None else'not_found'
@@ -928,8 +1164,9 @@ def _lc_stop_stale_owned(state):
   return 'unknown','unknown'if socket_seen else'not_found'
 @register_action('lifecycle_serve')
 def lifecycle_serve(payload):
-  data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id','source_snapshot_id','applied_tree_hash','build_id','binary_path','port','startup_timeout_ms','lease_seconds'})
-  if not _lc_id(data['run_id']) or not all(_lc_hex(data[k]) for k in('source_snapshot_id','applied_tree_hash','build_id')) or not isinstance(data['binary_path'],str) or not isinstance(data['port'],int) or not 1<=data['port']<=65535 or not isinstance(data['startup_timeout_ms'],int) or not 1<=data['startup_timeout_ms']<=600000 or not isinstance(data['lease_seconds'],int) or not 1<=data['lease_seconds']<=7200:_fail('invalid_runtime_inputs')
+  data=_require_object(payload,{'workdir','run_dir','model_path','drafter_path','work_token','run_token','local_mode','run_id','source_snapshot_id','applied_tree_hash','build_id','binary_path','port','startup_timeout_ms','lease_seconds','launch_profile','bind_host'})
+  profile=data['launch_profile'];bind_host=data['bind_host']
+  if not _lc_id(data['run_id']) or not all(_lc_hex(data[k]) for k in('source_snapshot_id','applied_tree_hash','build_id')) or not isinstance(data['binary_path'],str) or type(data['port'])is not int or not 1<=data['port']<=65535 or type(data['startup_timeout_ms'])is not int or not 1<=data['startup_timeout_ms']<=600000 or type(data['lease_seconds'])is not int or not 1<=data['lease_seconds']<=7200 or not _lc_profile(profile) or(profile['bind']=='loopback'and bind_host!='127.0.0.1')or(profile['bind']=='private_lan'and not _lc_private_bind_host(bind_host))or(data['local_mode']and profile['bind']!='loopback'):_fail('invalid_runtime_inputs')
   paths=None
   root_fd=None
   sv_dir_fd=None
@@ -960,11 +1197,18 @@ def lifecycle_serve(payload):
     except HelperError:_fail('startup_failed')
     if not _lc_active_build(build,data,binary_hash):_fail('startup_failed')
     binary_exec='/proc/self/fd/%d/%s'%(sv_dir_fd,data['binary_path'])
-    argv=(['/usr/bin/python3',binary_exec]if data['binary_path'].endswith('.py')else[binary_exec])+['--cuda','-m',paths['model_path'],'-c','32768','--host','127.0.0.1','--port',str(data['port'])]
+    argv=(['/usr/bin/python3',binary_exec]if data['binary_path'].endswith('.py')else[binary_exec])+['--cuda','-m',paths['model_path'],'-c',str(profile['context_tokens']),'--host',bind_host,'--port',str(data['port'])]
+    if profile['decode_policy']=='plain':argv.append('--no-spec')
+    launch_env={
+      'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin',
+      'DS4_CONT_MTP_MODE':'2','DS4_CONT_DSPARK':'1',
+      'DS4_DSPARK_MODEL':paths['drafter_path'],
+      'DS4_DSPARK_MAX_NLIVE':'1','DS4_DSPARK_QUENCH':'1',
+    }
     log_fd=_lc_install_log(root_fd)
-    profile=dict(LAUNCH_PROFILE)
+    profile=json.loads(json.dumps(profile,sort_keys=True,separators=(',',':')))
     state={
-      'schema_version':RUN_STATE_SCHEMA_VERSION,'run_id':data['run_id'],'state':'starting',
+      'schema_version':1,'run_id':data['run_id'],'state':'starting',
       'source_snapshot_id':data['source_snapshot_id'],'applied_tree_hash':data['applied_tree_hash'],
       'build_id':data['build_id'],'binary_sha256':binary_hash,'port':data['port'],
       'launch_profile':profile,'supervisor_pid':None,'supervisor_start_ticks':None,
@@ -975,7 +1219,7 @@ def lifecycle_serve(payload):
     }
     _lc_write_state(root_fd,state)
     dispatch_recorded=True
-    spec={'argv':argv,'drafter':paths['drafter_path'],'redaction_paths':[paths['model_path'],paths['drafter_path']],'fixed_canaries':[paths['workdir'],paths['run_dir']],'lease_seconds':data['lease_seconds'],'run_id':data['run_id'],'launch_profile':profile}
+    spec={'argv':argv,'env':launch_env,'drafter':paths['drafter_path'],'redaction_paths':[paths['model_path'],paths['drafter_path']],'fixed_canaries':[paths['workdir'],paths['run_dir'],bind_host],'lease_seconds':data['lease_seconds'],'run_id':data['run_id'],'launch_profile':profile}
     _lc_atom(root_fd,'launch.json',spec)
     sv_script='supervisor.py'
     sv_temp='.'+sv_script+'.'+secrets.token_hex(12)
@@ -1005,7 +1249,7 @@ def lifecycle_serve(payload):
       if observed['run_id']!=data['run_id']:_fail('unsafe_state')
       if observed['supervisor_pid']is not None and observed['supervisor_pid']!=p.pid:_fail('unsafe_state')
       if observed['child_pid']is not None:
-        inode=_lc_listener(data['port'],observed['child_pid'])
+        inode=_lc_listener(data['port'],observed['child_pid'],None,profile['bind'],bind_host)
         if inode and _lc_supervisor_identity(observed) and _lc_child_identity(observed):
           observed['listener_inode']=inode;observed['state']='running';_lc_write_state(root_fd,observed)
           return{'run_id':data['run_id'],'state':'running','port':data['port'],'binary_sha256':binary_hash,'supervisor_pid':observed['supervisor_pid'],'supervisor_start_ticks':observed['supervisor_start_ticks'],'child_pid':observed['child_pid'],'child_start_ticks':observed['child_start_ticks'],'launch_profile':profile}
@@ -1092,7 +1336,7 @@ def lifecycle_stop(payload):
       return{'run_id':state['run_id'],'status':'stopped'if clean else'failed','process':process,'socket':socket,'lock':lock,'temp':temp,'server_log_sha256':digest,'failure_class':None if clean else'stop_failed'}
     try:os.killpg(sv_pgid,signal.SIGTERM);process='cleared'
     except OSError:process='unknown'
-    if _lc_listener(state['port'],state['child_pid'],state['listener_inode']):socket='unknown'
+    if _lc_listener(state['port'],state['child_pid'],state['listener_inode'],state['launch_profile']['bind']):socket='unknown'
     owned_groups=(sv_pgid,state['child_pgid'])
     started=time.monotonic();deadline=started+15;kill_after=started+4;killed=False
     stopped=False
@@ -1100,7 +1344,7 @@ def lifecycle_stop(payload):
       proc_alive=False
       try:os.kill(sv_pid,0);proc_alive=True
       except OSError:pass
-      sock_alive=bool(_lc_listener(state['port'],state['child_pid']))
+      sock_alive=bool(_lc_listener(state['port'],state['child_pid'],None,state['launch_profile']['bind']))
       group_states=tuple(_lc_group_present(pgid)for pgid in owned_groups)
       if any(item is None for item in group_states):process='unknown';break
       if not proc_alive and not sock_alive and not any(group_states):
@@ -1156,16 +1400,22 @@ _LIFECYCLE_EXTENSION = _LIFECYCLE_EXTENSION.replace('"""import hashlib', 'r"""' 
 
 
 def _launch_profile(value: Any) -> LaunchProfile:
-    if not isinstance(value, Mapping) or dict(value) != LAUNCH_PROFILE:
+    if not isinstance(value, Mapping) or set(value) != set(_PROFILE_FIELDS):
         _fail("unsafe_state", "target launch profile is invalid")
-    return FIXED_LAUNCH_PROFILE
+    try:
+        return LaunchProfile(**dict(value))
+    except TargetError:
+        _fail("unsafe_state", "target launch profile is invalid")
 
 
-def _serve_result(value, runtime, identifier):
+def _serve_result(value, runtime, identifier, expected_profile):
     keys = ("supervisor_pid", "supervisor_start_ticks", "child_pid", "child_start_ticks")
     if not isinstance(value, Mapping) or set(value) != {"run_id", "state", "port", "binary_sha256", *keys, "launch_profile"} or value.get("run_id") != identifier or value.get("state") != "running" or value.get("port") != runtime.port or not isinstance(value.get("binary_sha256"), str) or _HEX.fullmatch(value["binary_sha256"]) is None or any(not isinstance(value.get(key), int) or isinstance(value[key], bool) or value[key] <= 1 for key in keys):
         _fail("startup_failed", "target server identity is invalid")
-    return RunResult(identifier, "running", runtime.port, runtime.source_snapshot_id, runtime.build_id, value["binary_sha256"], value["supervisor_pid"], value["supervisor_start_ticks"], value["child_pid"], value["child_start_ticks"], _launch_profile(value["launch_profile"]))
+    observed_profile = _launch_profile(value["launch_profile"])
+    if observed_profile.controller_payload() != expected_profile.controller_payload():
+        _fail("startup_failed", "target server identity is invalid")
+    return RunResult(identifier, "running", runtime.port, runtime.source_snapshot_id, runtime.build_id, value["binary_sha256"], value["supervisor_pid"], value["supervisor_start_ticks"], value["child_pid"], value["child_start_ticks"], observed_profile)
 
 
 def _observed_run(value: Any, runtime: RuntimeInputs, identifier: str) -> RunResult:
@@ -1204,21 +1454,48 @@ def _serve_call(transport, payload, runtime):
         raise
 
 
-def serve(config, transport, runtime, *, run_id=None):
+def serve(
+    config,
+    transport,
+    runtime,
+    *,
+    run_id=None,
+    launch_profile: LaunchProfile = FIXED_LAUNCH_PROFILE,
+    bind_host: str | None = None,
+):
+    if type(launch_profile) is not LaunchProfile:
+        _fail("invalid_launch_profile", "target launch profile is invalid")
     if hasattr(config, "validate_for"):
         config.validate_for("serve")
-    identifier = _run_id(run_id)
     roots = _roots(config, runtime)
-    payload = {**roots, "run_id": identifier, "source_snapshot_id": runtime.source_snapshot_id, "applied_tree_hash": runtime.applied_tree_hash, "build_id": runtime.build_id, "binary_path": runtime.binary_path, "port": runtime.port, "startup_timeout_ms": int(runtime.startup_timeout * 1000), "lease_seconds": runtime.lease_seconds}
+    if launch_profile.bind == "loopback":
+        if bind_host is not None and bind_host != "127.0.0.1":
+            _fail("invalid_bind", "target bind is invalid")
+        effective_bind_host = "127.0.0.1"
+    else:
+        if roots["local_mode"] or not isinstance(bind_host, str):
+            _fail("invalid_bind", "target bind is invalid")
+        _private_bind_host(bind_host)
+        if hasattr(config, "validate_for"):
+            config.validate_for("benchmark")
+        try:
+            configured_bind_host = config.lan_bind_host
+        except (AttributeError, TargetError):
+            _fail("invalid_bind", "target bind is invalid")
+        if bind_host != configured_bind_host:
+            _fail("invalid_bind", "target bind is invalid")
+        effective_bind_host = bind_host
+    identifier = _run_id(run_id)
+    payload = {**roots, "run_id": identifier, "source_snapshot_id": runtime.source_snapshot_id, "applied_tree_hash": runtime.applied_tree_hash, "build_id": runtime.build_id, "binary_path": runtime.binary_path, "port": runtime.port, "startup_timeout_ms": int(runtime.startup_timeout * 1000), "lease_seconds": runtime.lease_seconds, "launch_profile": launch_profile.controller_payload(), "bind_host": effective_bind_host}
     if roots["local_mode"]:
         try:
             with local_operation_lock(roots["run_dir"]):
-                return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier)
+                return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier, launch_profile)
         except TargetError as error:
             if error.code == "run_active":
                 _fail("serve_not_dispatched", "target server launch was refused")
             raise
-    return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier)
+    return _serve_result(_serve_call(transport, payload, runtime), runtime, identifier, launch_profile)
 
 def status(config, transport, runtime, *, run_id=None):
     if hasattr(config, "validate_for"): config.validate_for("status")

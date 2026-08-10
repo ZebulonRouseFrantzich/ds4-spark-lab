@@ -16,8 +16,133 @@ from unittest import mock
 from scripts.targetctl import source as source_module
 from scripts.targetctl.common import TargetError, record_id_for
 from scripts.targetctl.source import _SOURCE_EXTENSION, _stage_snapshot, build_snapshot, qualified_clean, sync_source, verify_applied_tree
-from scripts.targetctl.remote import LAUNCH_PROFILE
+from scripts.targetctl.remote import LAUNCH_PROFILE, _valid_launch_profile, _valid_run_state
 from scripts.targetctl.transport import CommandResult, LocalTransport, SSHTransport
+
+
+def _launch_profile(**changes: object) -> dict[str, object]:
+    profile = {
+        **LAUNCH_PROFILE,
+        "speculative_overrides": dict(LAUNCH_PROFILE["speculative_overrides"]),
+    }
+    profile.update(changes)
+    return profile
+
+
+def _run_state(
+    *,
+    state: str = "failed_startup",
+    cleanup_complete: bool = False,
+    launch_profile: dict[str, object] | None = None,
+) -> dict[str, object]:
+    active = state == "running"
+    return {
+        "schema_version": 1,
+        "run_id": "run-aaaaaaaaaaaaaaaaaaaaaaaa",
+        "state": state,
+        "source_snapshot_id": "1" * 64,
+        "applied_tree_hash": "2" * 64,
+        "build_id": "3" * 64,
+        "binary_sha256": "4" * 64,
+        "port": 8000,
+        "launch_profile": (
+            _launch_profile() if launch_profile is None else launch_profile
+        ),
+        "supervisor_pid": 101 if active else None,
+        "supervisor_start_ticks": 1001 if active else None,
+        "supervisor_cmdline_sha256": "5" * 64 if active else None,
+        "child_pid": 102 if active else None,
+        "child_start_ticks": 1002 if active else None,
+        "child_pgid": 102 if active else None,
+        "child_cmdline_sha256": "6" * 64 if active else None,
+        "listener_inode": "12345" if active else None,
+        "cleanup_complete": cleanup_complete,
+        "cleanup": (
+            {
+                "process": "not_found",
+                "socket": "not_found",
+                "lock": "not_found",
+                "temp": "not_found",
+                "server_log_sha256": None,
+            }
+            if cleanup_complete
+            else None
+        ),
+    }
+
+
+class RunStateLaunchProfileTests(unittest.TestCase):
+    def test_every_bounded_schema_v2_profile_is_valid(self) -> None:
+        for context_tokens in (32768, 262144):
+            for bind in ("loopback", "private_lan"):
+                for decode_policy in ("shipped", "plain"):
+                    profile = _launch_profile(
+                        context_tokens=context_tokens,
+                        bind=bind,
+                        decode_policy=decode_policy,
+                    )
+                    with self.subTest(
+                        context_tokens=context_tokens,
+                        bind=bind,
+                        decode_policy=decode_policy,
+                    ):
+                        self.assertTrue(_valid_launch_profile(profile))
+                        self.assertTrue(
+                            _valid_run_state(
+                                _run_state(
+                                    cleanup_complete=True,
+                                    launch_profile=profile,
+                                ),
+                                terminal=True,
+                            )
+                        )
+
+    def test_missing_extra_legacy_and_type_invalid_profiles_are_rejected(self) -> None:
+        missing = _launch_profile()
+        missing.pop("decode_policy")
+        nested_missing = _launch_profile()
+        nested_missing["speculative_overrides"].pop("shadow_budget")  # type: ignore[union-attr]
+        malformed = (
+            {
+                "schema_version": 1,
+                "accelerator": "cuda",
+                "context_tokens": 32768,
+                "bind": "loopback",
+                "continuation_mtp_mode": 2,
+                "dspark_enabled": True,
+                "drafter_enabled": True,
+            },
+            missing,
+            {**_launch_profile(), "unknown": None},
+            _launch_profile(dspark_max_nlive=True),
+            _launch_profile(context_tokens=65536),
+            _launch_profile(terminal_yield_quench=1),
+            nested_missing,
+            _launch_profile(
+                speculative_overrides={
+                    **LAUNCH_PROFILE["speculative_overrides"],
+                    "unknown": None,
+                }
+            ),
+            _launch_profile(
+                speculative_overrides={
+                    **LAUNCH_PROFILE["speculative_overrides"],
+                    "shadow_guard": False,
+                }
+            ),
+        )
+        for profile in malformed:
+            with self.subTest(profile=profile):
+                self.assertFalse(_valid_launch_profile(profile))
+                self.assertFalse(
+                    _valid_run_state(
+                        _run_state(
+                            cleanup_complete=True,
+                            launch_profile=profile,
+                        ),
+                        terminal=True,
+                    )
+                )
 
 
 def _active_build_manifest(
@@ -204,7 +329,10 @@ class TargetHelperSourceTests(unittest.TestCase):
 
     def test_running_or_unknown_lifecycle_refuses_before_transfer(self) -> None:
         run = Path(self.payload["run_dir"])
-        (run / "run.json").write_text('{"schema_version":1,"state":"running"}')
+        (run / "run.json").write_text(
+            json.dumps(_run_state(state="running")),
+            encoding="ascii",
+        )
         os.chmod(run / "run.json", 0o600)
         request = {**self.payload, **self.tokens, "entries": []}
         with self.assertRaises(TargetError) as error:
@@ -706,7 +834,10 @@ class LifecycleRefusalTests(unittest.TestCase):
         transport, payload, tokens = self._setUpHelper()
         run = Path(payload["run_dir"])
         try:
-            (run / "run.json").write_text('{"schema_version":1,"state":"running"}')
+            (run / "run.json").write_text(
+                json.dumps(_run_state(state="running")),
+                encoding="ascii",
+            )
             os.chmod(str(run / "run.json"), 0o600)
             request = {**payload, **tokens, "entries": []}
             with self.assertRaises(TargetError) as ctx:
@@ -732,30 +863,38 @@ class LifecycleRefusalTests(unittest.TestCase):
             import shutil
             shutil.rmtree(str(Path(payload["workdir"]).parent), ignore_errors=True)
 
+    def test_embedded_preflight_rejects_malformed_schema_v2_profile(self) -> None:
+        transport, payload, tokens = self._setUpHelper()
+        run = Path(payload["run_dir"])
+        state = _run_state(
+            cleanup_complete=True,
+            launch_profile=_launch_profile(context_tokens=65536),
+        )
+        encoded = json.dumps(state)
+        request = {**payload, **tokens, "entries": []}
+        try:
+            (run / "run.json").write_text(encoded, encoding="ascii")
+            os.chmod(run / "run.json", 0o600)
+            with self.assertRaises(TargetError) as raised:
+                transport.run_helper(
+                    "source_preflight",
+                    request,
+                    extension_source=_SOURCE_EXTENSION,
+                    allowed_error_codes={"source_lifecycle", "unexpected_entry"},
+                )
+            self.assertEqual(raised.exception.code, "source_lifecycle")
+            self.assertEqual(
+                (run / "run.json").read_text(encoding="ascii"),
+                encoded,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(str(Path(payload["workdir"]).parent), ignore_errors=True)
+
     def test_terminal_lifecycle_requires_completed_cleanup(self) -> None:
         transport, payload, tokens = self._setUpHelper()
         run = Path(payload["run_dir"])
-        state = {
-            "schema_version": 1,
-            "run_id": "run-aaaaaaaaaaaaaaaaaaaaaaaa",
-            "state": "failed_startup",
-            "source_snapshot_id": "1" * 64,
-            "applied_tree_hash": "2" * 64,
-            "build_id": "3" * 64,
-            "binary_sha256": "4" * 64,
-            "port": 8000,
-            "launch_profile": dict(LAUNCH_PROFILE),
-            "supervisor_pid": None,
-            "supervisor_start_ticks": None,
-            "supervisor_cmdline_sha256": None,
-            "child_pid": None,
-            "child_start_ticks": None,
-            "child_pgid": None,
-            "child_cmdline_sha256": None,
-            "listener_inode": None,
-            "cleanup_complete": False,
-            "cleanup": None,
-        }
+        state = _run_state()
         request = {**payload, **tokens, "entries": []}
         try:
             (run / "run.json").write_text(json.dumps(state), encoding="ascii")

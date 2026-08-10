@@ -19,8 +19,9 @@ from scripts.targetctl.common import TargetError
 from scripts.targetctl import remote
 from scripts.targetctl.redaction import redaction_canaries
 from scripts.targetctl.lifecycle import (
-    CleanupResult, RuntimeInputs, RunResult, SmokeResult, cleanup, logs, serve,
-    smoke, status, stop,
+    CleanupResult, FIXED_LAUNCH_PROFILE, LaunchProfile, RuntimeInputs, RunResult,
+    SmokeResult, cleanup, launch_profile_from_scenario, logs, serve, smoke,
+    status, stop,
 )
 from scripts.targetctl.transport import LocalTransport
 
@@ -226,6 +227,244 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(TargetError):
             RuntimeInputs(str(self.model), str(self.drafter), "x", "2" * 64, "3" * 64, "4" * 64, "5" * 64, 99999)
 
+    @staticmethod
+    def _server_mapping(**changes):
+        mapping = {
+            "context_tokens": 32768,
+            "default_output_tokens": 393216,
+            "decode_policy": "shipped",
+            "dspark_max_nlive": 1,
+            "terminal_yield_quench": True,
+            "speculative_overrides": {
+                "shadow_guard": None,
+                "shadow_alpha": None,
+                "shadow_min_evidence": None,
+                "shadow_budget": None,
+                "shadow_credit_cap": None,
+            },
+        }
+        mapping.update(changes)
+        return mapping
+
+    def test_launch_profile_from_scenario_is_exact_and_bounded(self) -> None:
+        target_local = launch_profile_from_scenario(
+            self._server_mapping(), "target_local"
+        )
+        self.assertEqual(target_local, FIXED_LAUNCH_PROFILE)
+        controller = launch_profile_from_scenario(
+            self._server_mapping(context_tokens=262144, decode_policy="plain"),
+            "controller_lan",
+        )
+        self.assertEqual(
+            controller.controller_payload(),
+            {
+                "schema_version": 2,
+                "accelerator": "cuda",
+                "context_tokens": 262144,
+                "default_output_tokens": 393216,
+                "bind": "private_lan",
+                "continuation_mtp_mode": 2,
+                "decode_policy": "plain",
+                "dspark_max_nlive": 1,
+                "terminal_yield_quench": True,
+                "speculative_overrides": {
+                    "shadow_guard": None,
+                    "shadow_alpha": None,
+                    "shadow_min_evidence": None,
+                    "shadow_budget": None,
+                    "shadow_credit_cap": None,
+                },
+            },
+        )
+
+    def test_launch_profiles_reject_unknown_values_and_overrides(self) -> None:
+        invalid_mappings = (
+            {**self._server_mapping(), "unknown": None},
+            self._server_mapping(context_tokens=65536),
+            self._server_mapping(default_output_tokens=1),
+            self._server_mapping(decode_policy="automatic"),
+            self._server_mapping(dspark_max_nlive=2),
+            self._server_mapping(terminal_yield_quench=False),
+            self._server_mapping(
+                speculative_overrides={
+                    **self._server_mapping()["speculative_overrides"],
+                    "shadow_guard": 1,
+                }
+            ),
+            self._server_mapping(
+                speculative_overrides={
+                    **self._server_mapping()["speculative_overrides"],
+                    "unknown": None,
+                }
+            ),
+        )
+        for mapping in invalid_mappings:
+            with self.subTest(mapping=mapping):
+                with self.assertRaises(TargetError) as raised:
+                    launch_profile_from_scenario(mapping, "target_local")
+                self.assertEqual(raised.exception.code, "invalid_launch_profile")
+        with self.assertRaises(TargetError):
+            launch_profile_from_scenario(self._server_mapping(), "remote")
+        with self.assertRaises(TargetError):
+            LaunchProfile(bind="public")
+
+    def test_shipped_and_plain_launch_evidence_is_exact(self) -> None:
+        self._setup_work()
+        expected_env = {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "DS4_CONT_MTP_MODE": "2",
+            "DS4_CONT_DSPARK": "1",
+            "DS4_DSPARK_MODEL": self.runtime.drafter_path,
+            "DS4_DSPARK_MAX_NLIVE": "1",
+            "DS4_DSPARK_QUENCH": "1",
+        }
+        shipped = serve(self.config, self.transport, self.runtime)
+        try:
+            launch = json.loads((self.run / "launch.json").read_bytes())
+            self.assertEqual(launch["env"], expected_env)
+            self.assertEqual(
+                launch["argv"][-9:],
+                [
+                    "--cuda", "-m", self.runtime.model_path,
+                    "-c", "32768", "--host", "127.0.0.1",
+                    "--port", str(self.runtime.port),
+                ],
+            )
+            self.assertEqual(
+                launch["launch_profile"],
+                FIXED_LAUNCH_PROFILE.controller_payload(),
+            )
+            self.assertEqual(shipped.launch_profile, FIXED_LAUNCH_PROFILE)
+        finally:
+            stop(self.config, self.transport, self.runtime, run_id=shipped.run_id)
+
+        plain_profile = LaunchProfile(context_tokens=262144, decode_policy="plain")
+        plain = serve(
+            self.config,
+            self.transport,
+            self.runtime,
+            launch_profile=plain_profile,
+        )
+        try:
+            launch = json.loads((self.run / "launch.json").read_bytes())
+            self.assertEqual(launch["env"], expected_env)
+            self.assertEqual(
+                launch["argv"][-10:],
+                [
+                    "--cuda", "-m", self.runtime.model_path,
+                    "-c", "262144", "--host", "127.0.0.1",
+                    "--port", str(self.runtime.port), "--no-spec",
+                ],
+            )
+            self.assertEqual(
+                launch["launch_profile"], plain_profile.controller_payload()
+            )
+            self.assertEqual(plain.launch_profile, plain_profile)
+        finally:
+            stop(self.config, self.transport, self.runtime, run_id=plain.run_id)
+
+    def test_private_bind_pairing_and_result_redaction(self) -> None:
+        self._setup_work()
+        private_host = ".".join(("192", "168", "20", "30"))
+        validations = []
+        config = SimpleNamespace(
+            mode="ssh",
+            workdir=str(self.work),
+            run_dir=str(self.run),
+            lan_bind_host=private_host,
+            validate_for=validations.append,
+        )
+        profile = launch_profile_from_scenario(
+            self._server_mapping(), "controller_lan"
+        )
+
+        class CaptureTransport:
+            def __init__(self):
+                self.payload = None
+
+            def run_helper(self, action, payload, **kwargs):
+                self.payload = payload
+                return {
+                    "run_id": payload["run_id"],
+                    "state": "running",
+                    "port": payload["port"],
+                    "binary_sha256": "a" * 64,
+                    "supervisor_pid": 101,
+                    "supervisor_start_ticks": 102,
+                    "child_pid": 103,
+                    "child_start_ticks": 104,
+                    "launch_profile": payload["launch_profile"],
+                }
+
+        capture = CaptureTransport()
+        result = serve(
+            config,
+            capture,
+            self.runtime,
+            launch_profile=profile,
+            bind_host=private_host,
+        )
+        self.assertEqual(validations, ["serve", "benchmark"])
+        self.assertEqual(capture.payload["bind_host"], private_host)
+        self.assertEqual(capture.payload["launch_profile"]["bind"], "private_lan")
+        self.assertNotIn(
+            private_host,
+            json.dumps(result.controller_payload(), sort_keys=True),
+        )
+
+        class UnknownProfileTransport(CaptureTransport):
+            def run_helper(self, action, payload, **kwargs):
+                value = super().run_helper(action, payload, **kwargs)
+                value["launch_profile"] = {
+                    **value["launch_profile"],
+                    "unknown_override": None,
+                }
+                return value
+
+        with self.assertRaises(TargetError):
+            serve(
+                config,
+                UnknownProfileTransport(),
+                self.runtime,
+                launch_profile=profile,
+                bind_host=private_host,
+            )
+
+        invalid_calls = (
+            {"launch_profile": profile},
+            {"launch_profile": profile, "bind_host": ".".join(("192", "168", "20", "31"))},
+            {"launch_profile": FIXED_LAUNCH_PROFILE, "bind_host": private_host},
+        )
+        for arguments in invalid_calls:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(TargetError):
+                    serve(config, CaptureTransport(), self.runtime, **arguments)
+
+        local = SimpleNamespace(
+            mode="local",
+            source_root=self.work,
+            local_run_dir=self.run,
+            validate_for=lambda operation: None,
+        )
+        with self.assertRaises(TargetError):
+            serve(
+                local,
+                CaptureTransport(),
+                self.runtime,
+                launch_profile=profile,
+                bind_host=private_host,
+            )
+        with self.assertRaises(TargetError):
+            serve(
+                config,
+                CaptureTransport(),
+                self.runtime,
+                launch_profile={"bind": "private_lan"},
+                bind_host=private_host,
+            )
+
     def test_single_maximum_path_launch_state_stays_bounded(self) -> None:
         self._setup_work()
         maximum_model = _maximum_remote_path("m")
@@ -251,6 +490,7 @@ class LifecycleTests(unittest.TestCase):
                 {
                     "argv", "drafter", "redaction_paths", "fixed_canaries",
                     "lease_seconds", "run_id", "launch_profile",
+                    "env",
                 },
             )
             self.assertEqual(
@@ -259,7 +499,7 @@ class LifecycleTests(unittest.TestCase):
             )
             self.assertEqual(
                 launch["fixed_canaries"],
-                [str(self.work), str(self.run)],
+                [str(self.work), str(self.run), "127.0.0.1"],
             )
             self.assertNotIn("secrets", launch)
         finally:
@@ -276,7 +516,7 @@ class LifecycleTests(unittest.TestCase):
             self.runtime.port, binary_path=self.runtime.binary_path,
         )
 
-        contract_canaries = {str(self.work), str(self.run)}
+        contract_canaries = {str(self.work), str(self.run), "127.0.0.1"}
         for private_path in (maximum_model, maximum_drafter):
             components = private_path.split("/")[1:]
             contract_canaries.add(private_path)
@@ -287,7 +527,7 @@ class LifecycleTests(unittest.TestCase):
             )
         expected_canaries = redaction_canaries(
             (maximum_model, maximum_drafter),
-            additional=(str(self.work), str(self.run)),
+            additional=(str(self.work), str(self.run), "127.0.0.1"),
         )
         self.assertEqual(set(expected_canaries), contract_canaries)
 
@@ -308,7 +548,7 @@ class LifecycleTests(unittest.TestCase):
             )
             self.assertEqual(
                 launch["fixed_canaries"],
-                [str(self.work), str(self.run)],
+                [str(self.work), str(self.run), "127.0.0.1"],
             )
             self.assertNotIn("secrets", launch)
 
@@ -724,7 +964,7 @@ class LifecycleTests(unittest.TestCase):
             "schema_version": 1, "run_id": "run-starting-0001", "state": "starting",
             "source_snapshot_id": "1" * 64, "applied_tree_hash": "2" * 64,
             "build_id": "3" * 64, "binary_sha256": binary_hash,
-            "port": self.runtime.port, "launch_profile": dict(remote.LAUNCH_PROFILE),
+            "port": self.runtime.port, "launch_profile": FIXED_LAUNCH_PROFILE.controller_payload(),
             "supervisor_pid": None, "supervisor_start_ticks": None,
             "supervisor_cmdline_sha256": None, "child_pid": None,
             "child_start_ticks": None, "child_pgid": None,
