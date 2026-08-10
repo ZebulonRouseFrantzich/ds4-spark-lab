@@ -72,7 +72,7 @@ class RuntimeInputs:
     run_token: str = ""
     port: int = 0
     binary_path: str = "engine/ds4/ds4-server"
-    startup_timeout: float = 45.0
+    startup_timeout: float = 120.0
     smoke_timeout: float = 45.0
     lease_seconds: int = DEFAULT_LEASE_SECONDS
 
