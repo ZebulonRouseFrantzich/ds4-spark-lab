@@ -1613,7 +1613,7 @@ def _source_active_build(value):
         "binary_sha256": value["binary_sha256"],
         "version": version,
         "binary_size": value["binary_size"],
-        "sass": "sm_121",
+        "sass": "sm_121a",
     }
     if not hmac.compare_digest(_source_record_id(identity), value["build_id"]):
         _fail("unsafe_state")

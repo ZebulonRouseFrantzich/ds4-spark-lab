@@ -20,7 +20,13 @@ from scripts.targetctl.remote import LAUNCH_PROFILE
 from scripts.targetctl.transport import CommandResult, LocalTransport, SSHTransport
 
 
-def _active_build_manifest(snapshot_id: str, applied_tree_hash: str, binary: bytes) -> dict[str, object]:
+def _active_build_manifest(
+    snapshot_id: str,
+    applied_tree_hash: str,
+    binary: bytes,
+    *,
+    sass_identity: str = "sm_121a",
+) -> dict[str, object]:
     binary_hash = hashlib.sha256(binary).hexdigest()
     version = "1.2.3"
     identity = {
@@ -30,7 +36,7 @@ def _active_build_manifest(snapshot_id: str, applied_tree_hash: str, binary: byt
         "binary_sha256": binary_hash,
         "version": version,
         "binary_size": len(binary),
-        "sass": "sm_121",
+        "sass": sass_identity,
     }
     return {
         "schema_version": 1,
@@ -235,6 +241,25 @@ class TargetHelperSourceTests(unittest.TestCase):
             self.assertEqual(build_path.read_bytes(), malformed)
             self.assertFalse((run / "source.json").exists())
 
+            build_path.unlink()
+            legacy = _active_build_manifest(
+                "1" * 64, "2" * 64, b"binary", sass_identity="sm_121",
+            )
+            legacy_raw = json.dumps(
+                legacy, sort_keys=True, separators=(",", ":"),
+            ).encode("ascii")
+            build_path.write_bytes(legacy_raw)
+            os.chmod(build_path, 0o600)
+            with self.assertRaises(TargetError) as legacy_error:
+                self.transport.run_helper(
+                    "source_write_state",
+                    request,
+                    extension_source=_SOURCE_EXTENSION,
+                    allowed_error_codes={"unsafe_state", "unsafe_lock"},
+                )
+            self.assertEqual(legacy_error.exception.code, "unsafe_state")
+            self.assertEqual(build_path.read_bytes(), legacy_raw)
+            self.assertFalse((run / "source.json").exists())
             build_path.unlink()
             active = _active_build_manifest("1" * 64, "2" * 64, b"binary")
             active_raw = json.dumps(active, sort_keys=True, separators=(",", ":")).encode("ascii")

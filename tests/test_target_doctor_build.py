@@ -14,7 +14,7 @@ from unittest import mock
 from scripts.targetctl import build as build_module
 from scripts.targetctl import doctor as doctor_module
 from scripts.targetctl.build import BuildResult
-from scripts.targetctl.common import TargetError
+from scripts.targetctl.common import TargetError, record_id_for
 from scripts.targetctl.transport import CommandResult, helper_source
 from scripts.targetctl.doctor import DOCTOR_TOOLS, DoctorResult, RuntimeInput
 from scripts.targetctl.source import SourceSnapshot
@@ -1206,7 +1206,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             namespace["_build_file_hash"] = mock.Mock(return_value=(binary_hash, 10))
             namespace["_build_capture"] = mock.Mock(side_effect=[
                 (0, b"ds4-server v1.2.3\n", b"", False, False),
-                (0, b"ELF file sm_121\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
             ])
             first_result = namespace["target_build"](first_payload)  # type: ignore[index,operator]
             run_dir = Path(roots["run_dir"])
@@ -1289,7 +1289,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
 
             namespace["_build_capture"] = mock.Mock(side_effect=[
                 (0, b"ds4-server v1.2.3\n", b"", False, False),
-                (0, b"ELF file sm_121\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
             ])
             second_result = namespace["target_build"](second_payload)  # type: ignore[index,operator]
             self.assertFalse(lock_path.exists())
@@ -1358,9 +1358,17 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             namespace["_build_file_hash"] = mock.Mock(return_value=(binary_hash, 10))
             namespace["_build_capture"] = mock.Mock(side_effect=[
                 (0, b"ds4-server v1.2.3\n", b"", False, False),
-                (0, b"ELF file sm_121\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
             ])
             direct = namespace["target_build"](payload)  # type: ignore[index,operator]
+            expected_snapshot = SourceSnapshot(
+                (), (), False, payload["applied_tree_hash"], payload["snapshot_id"],
+            )
+            self.assertEqual(
+                direct["build_id"],
+                build_module._build_id(expected_snapshot, binary_hash, "1.2.3", 10),
+            )
+            self.assertEqual(direct["sass"], "verified")
             capture_calls = namespace["_build_capture"].call_args_list  # type: ignore[attr-defined,index]
             self.assertEqual(len(capture_calls), 2)
             version_call, sass_call = (call.args for call in capture_calls)
@@ -1418,7 +1426,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             commit_path = run_dir / commit_name
             namespace["_build_capture"] = mock.Mock(side_effect=[
                 (0, b"ds4-server v1.2.3\n", b"", False, False),
-                (0, b"ELF file sm_121\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
             ])
             release = namespace["_release_lock_at_root"]
             release_observation: list[tuple[bool, bool, bool]] = []
@@ -1503,7 +1511,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             namespace["_build_file_hash"] = mock.Mock(return_value=("c" * 64, 10))
             namespace["_build_capture"] = mock.Mock(side_effect=[
                 (0, b"ds4-server v1.2.3\n", b"", False, False),
-                (0, b"ELF file sm_121\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
             ])
             first = namespace["target_build"](first_payload)  # type: ignore[index,operator]
             run_dir = Path(roots["run_dir"])
@@ -1632,6 +1640,29 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         with self.assertRaises(TargetError):
             build_module._version(transport, Path("/binary"))
 
+    def test_build_identity_names_actual_sass_without_changing_public_status(self) -> None:
+        snapshot = SourceSnapshot((), (), False, "a" * 64, "b" * 64)
+        binary_hash = "c" * 64
+        identity = {
+            "schema_version": 1,
+            "source_snapshot_id": snapshot.snapshot_id,
+            "source_applied_tree_hash": snapshot.applied_tree_hash,
+            "binary_sha256": binary_hash,
+            "version": "1.2.3",
+            "binary_size": 10,
+            "sass": "sm_121a",
+        }
+        self.assertEqual(
+            build_module._build_id(snapshot, binary_hash, "1.2.3", 10),
+            record_id_for(identity),
+        )
+        legacy_identity = {**identity, "sass": "sm_121"}
+        self.assertNotEqual(
+            build_module._build_id(snapshot, binary_hash, "1.2.3", 10),
+            record_id_for(legacy_identity),
+        )
+        self.assertEqual(self._successful_remote_payload(snapshot)["sass"], "verified")
+
     def test_list_elf_arch_gate_is_exact_complete_and_local_remote_equivalent(self) -> None:
         namespace: dict[str, object] = {
             "HelperError": TargetError,
@@ -1641,10 +1672,11 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         exec(extension, namespace)
         binary = Path("/work/engine/ds4/ds4-server")
         cases = (
-            (b"ELF file 1: kernel.sm_121.cubin\n", True),
-            (b"ELF file 1: kernel.sm_121a.cubin\n", False),
-            (b"ELF file 1: kernel.xsm_121.cubin\n", False),
-            (b"ELF file 1: kernel.sm_12.cubin\n", False),
+            (b".sm_121a.cubin\n", True),
+            (b".sm_121.cubin\n", False),
+            (b".sm_121aa.cubin\n", False),
+            (b".xsm_121a.cubin\n", False),
+            (b".sm_121ax.cubin\n", False),
         )
         for output, accepted in cases:
             with self.subTest(output=output):
@@ -1700,14 +1732,14 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 )
         transport = mock.Mock()
         transport.run.return_value = CommandResult(
-            0, False, 1, b"sm_121\n" + b"x" * 65_536, b"",
+            0, False, 1, b".sm_121a.cubin\n" + b"x" * 65_536, b"",
         )
         with mock.patch.object(build_module, "_stream_sass") as local_probe:
             with self.assertRaises(TargetError) as oversized_error:
                 build_module._sass(transport, binary)
             self.assertEqual(oversized_error.exception.code, "build_sass_invalid")
             local_probe.assert_not_called()
-        transport.run.return_value = CommandResult(0, False, 1, b"ELF sm_121\n", b"")
+        transport.run.return_value = CommandResult(0, False, 1, b".sm_121a.cubin\n", b"")
         with mock.patch.object(build_module, "_stream_sass", return_value=False):
             with self.assertRaises(TargetError) as local_error:
                 build_module._sass(transport, binary)
@@ -1740,8 +1772,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         exec(extension, namespace)
         program = (
             "import os,time\n"
-            "parts=(b'noise\\nco',b'de for sm_',b'121\\n  Fun',"
-            "b'ction : _Zkernel\\n  /*00',b'00*/ MOV R1, R2;\\n')\n"
+            "parts=(b'noise\\n\\tco',b'de for sm_',b'121a\\t\\nFun',"
+            "b'ction : _Zkernel\\n        /*00',b'00*/                   MOV R1, R2;\\n')\n"
             "for part in parts: os.write(1,part); time.sleep(0.01)\n"
             "remaining=246178960\n"
             "chunk=b'x'*4096\n"
@@ -1774,12 +1806,16 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
         exec(extension, namespace)
         malformed = (
-            b"code for sm_121\n  Function : _Zkernel\n",
-            b"code for sm_121a\n  Function : _Zkernel\n  /*0000*/ MOV R1, R2;\n",
-            b"prefix code for sm_121\n  Function : _Zkernel\n  /*0000*/ MOV R1, R2;\n",
-            b"code for sm_121\n  /*0000*/ MOV R1, R2;\n  Function : _Zkernel\n",
-            b"code for sm_121\n  Function : _Zkernel\n  /*zzzz*/ MOV R1, R2;\n",
-            b"code for sm_121\n  Function :\n  /*0000*/ MOV R1, R2;\n",
+            b"\tcode for sm_121a\nFunction : _Zkernel\n",
+            b"\tcode for sm_121\nFunction : _Zkernel\n        /*0000*/ MOV R1, R2;\n",
+            b"\tcode for sm_121aa\nFunction : _Zkernel\n        /*0000*/ MOV R1, R2;\n",
+            b"\tcode for xsm_121a\nFunction : _Zkernel\n        /*0000*/ MOV R1, R2;\n",
+            b"\tcode for sm_121ax\nFunction : _Zkernel\n        /*0000*/ MOV R1, R2;\n",
+            b"\tcode for sm_121\n\tcode for sm_121a\nFunction : _Zkernel\n        /*0000*/ MOV R1, R2;\n",
+            b"prefix code for sm_121a\nFunction : _Zkernel\n        /*0000*/ MOV R1, R2;\n",
+            b"\tcode for sm_121a\n        /*0000*/ MOV R1, R2;\nFunction : _Zkernel\n",
+            b"\tcode for sm_121a\nFunction : _Zkernel\n        /*zzzz*/ MOV R1, R2;\n",
+            b"\tcode for sm_121a\nFunction :\n        /*0000*/ MOV R1, R2;\n",
         )
         work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -1823,7 +1859,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             ),
             (
                 "window",
-                "import os; os.write(1,b'x'*9000+b'\\ncode for sm_121\\n  Function : f\\n  /*0000*/ NOP;\\n')",
+                "import os; os.write(1,b'x'*9000+b'\\n\\tcode for sm_121a\\nFunction : f\\n        /*0000*/ NOP;\\n')",
                 2,
                 20_000,
                 32,
@@ -1878,7 +1914,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                 "if child==0: time.sleep(60); os._exit(0)\n"
                 f"fd=os.open({str(pid_path)!r},os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)\n"
                 "os.write(fd,str(child).encode('ascii'));os.close(fd)\n"
-                "os.write(1,b'code for sm_121\\n  Function : kernel\\n  /*0000*/ NOP;\\n')\n"
+                "os.write(1,b'\\tcode for sm_121a\\nFunction : kernel\\n        /*0000*/ NOP;\\n')\n"
                 "time.sleep(60)\n"
             )
             args = (sys.executable, "-c", program)
@@ -1986,7 +2022,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                             (
                                 "import os,pathlib,sys,time;"
                                 "pathlib.Path(sys.argv[1]).read_bytes();"
-                                "os.write(1,b'code for sm_121\\n  Function : kernel\\n"
+                                "os.write(1,b'\\tcode for sm_121a\\n  Function : kernel\\n"
                                 "  /*0000*/ NOP;\\n');time.sleep(60)"
                             ),
                             pinned_binary,

@@ -46,7 +46,9 @@ BUILD_LOCK_LEASE_SECONDS = 7_200
 BUILD_RECONCILE_LEASE_SECONDS = 3_600
 BUILD_RECONCILE_TIMEOUT_SECONDS = 3_300.0
 _DS4_VERSION_OUTPUT = re.compile(rb"\Ads4-server v([0-9]+(?:\.[0-9]+)*)\n?\Z")
-_LIST_ELF_ARCH = re.compile(rb"(?<![A-Za-z0-9_])sm_121(?![A-Za-z0-9_])")
+_LIST_ELF_ARCH = re.compile(rb"(?<![A-Za-z0-9_])sm_121a(?![A-Za-z0-9_])")
+_SASS_HEADER = re.compile(rb"[ \t]*code for sm_121a[ \t]*\Z")
+_SASS_ANY_HEADER = re.compile(rb"[ \t]*code for[ \t]+.*\Z")
 _SASS_FUNCTION = re.compile(rb"[ \t]*Function[ \t]+:[ \t]+\S.*\Z")
 _SASS_INSTRUCTION = re.compile(rb"[ \t]*/\*[0-9A-Fa-f]{4,16}\*/[ \t]+\S.*\Z")
 _LIST_ELF_LIMIT_BYTES = 65_536
@@ -259,20 +261,24 @@ def _sass_line(state: list[int | bool], line: bytes) -> None:
     if line.endswith(b"\r"):
         line = line[:-1]
     stage = int(state[0])
+    header = _SASS_HEADER.fullmatch(line) is not None
+    any_header = _SASS_ANY_HEADER.fullmatch(line) is not None
     if stage == 0:
-        if line == b"code for sm_121":
+        if header:
             state[0] = 1
+        elif any_header:
+            state[1] = True
         return
     if stage == 1:
         if _SASS_FUNCTION.fullmatch(line) is not None:
             state[0] = 2
-        elif _SASS_INSTRUCTION.fullmatch(line) is not None or line.startswith(b"code for "):
+        elif _SASS_INSTRUCTION.fullmatch(line) is not None or any_header:
             state[1] = True
         return
     if stage == 2:
         if _SASS_INSTRUCTION.fullmatch(line) is not None:
             state[0] = 3
-        elif _SASS_FUNCTION.fullmatch(line) is not None or line.startswith(b"code for "):
+        elif _SASS_FUNCTION.fullmatch(line) is not None or any_header:
             state[1] = True
 
 
@@ -312,7 +318,7 @@ def _stream_sass(
     stderr_limit: int = _SASS_STDERR_LIMIT_BYTES,
     pass_fds: tuple[int, ...] = (),
 ) -> bool:
-    """Prove the first sm_121 instruction without retaining cuobjdump output."""
+    """Prove the first sm_121a instruction without retaining cuobjdump output."""
 
     process: subprocess.Popen[bytes] | None = None
     process_group: int | None = None
@@ -503,7 +509,7 @@ def _validate_snapshot(snapshot: Any, allow_dirty: str | None, root: Path) -> So
 
 
 def _build_id(snapshot: SourceSnapshot, binary_hash: str, version: str, size: int) -> str:
-    return record_id_for({"schema_version": 1, "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "binary_sha256": binary_hash, "version": version, "binary_size": size, "sass": "sm_121"})
+    return record_id_for({"schema_version": 1, "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "binary_sha256": binary_hash, "version": version, "binary_size": size, "sass": "sm_121a"})
 
 
 def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapshot, *, jobs: int) -> BuildResult:
@@ -861,16 +867,19 @@ def _build_ds4_version(value):
 def _build_sass_line(state,line):
     if line.endswith(b'\r'): line=line[:-1]
     stage=state[0]
+    header=_build_re.fullmatch(rb'[ \t]*code for sm_121a[ \t]*',line) is not None
+    any_header=_build_re.fullmatch(rb'[ \t]*code for[ \t]+.*',line) is not None
     function=_build_re.fullmatch(rb'[ \t]*Function[ \t]+:[ \t]+\S.*',line) is not None
     instruction=_build_re.fullmatch(rb'[ \t]*/\*[0-9A-Fa-f]{4,16}\*/[ \t]+\S.*',line) is not None
     if stage==0:
-        if line==b'code for sm_121': state[0]=1
+        if header: state[0]=1
+        elif any_header: state[1]=True
     elif stage==1:
         if function: state[0]=2
-        elif instruction or line.startswith(b'code for '): state[1]=True
+        elif instruction or any_header: state[1]=True
     elif stage==2:
         if instruction: state[0]=3
-        elif function or line.startswith(b'code for '): state[1]=True
+        elif function or any_header: state[1]=True
 def _build_stream_sass(args,timeout,scan_limit,stderr_limit,work_fd,activity):
     process=None; process_group=None; wait_attempted=False; cleanup_ok=True
     old_handlers={}; old_mask=None; blocked=False; interrupted=[False]
@@ -948,7 +957,7 @@ def _build_sass_probe(binary,work_fd,activity):
     if not _build_stream_sass(('/usr/local/cuda/bin/cuobjdump','--dump-sass',binary),30,268435456,16384,work_fd,activity): _fail('build_sass_invalid')
 def _build_sass(binary,work_fd,activity):
     code,stdout,stderr,timed_out,oversize=_build_capture(('/usr/local/cuda/bin/cuobjdump','--list-elf',binary),10,65536,work_fd,activity)
-    if timed_out or oversize or code or _build_re.search(rb'(?<![A-Za-z0-9_])sm_121(?![A-Za-z0-9_])',stdout) is None: _fail('build_sass_invalid')
+    if timed_out or oversize or code or _build_re.search(rb'(?<![A-Za-z0-9_])sm_121a(?![A-Za-z0-9_])',stdout) is None: _fail('build_sass_invalid')
     _build_sass_probe(binary,work_fd,activity)
 def _build_capture(args,timeout,limit,work_fd,activity):
     process=None; process_group=None; wait_attempted=False; cleanup_ok=True
@@ -1181,7 +1190,7 @@ def _build_validate_result(data,result,log_hash,work_fd):
         if result['failure_class'] is not None or not _build_hex(result['build_id']) or not _build_hex(result['binary_sha256']) or not isinstance(version,str) or not 1<=len(version)<=64 or _build_re.fullmatch(r'[0-9]+(?:\.[0-9]+)*',version) is None or not isinstance(size,int) or isinstance(size,bool) or not 1<=size<=(1<<63)-1 or result['sass']!='verified' or result['exit_code']!=0 or isinstance(result['exit_code'],bool): _fail('build_reconcile_invalid')
         binary='/proc/self/fd/%d/engine/ds4/ds4-server'%work_fd
         digest,actual_size=_build_file_hash(binary,True)
-        ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':actual_size,'sass':'sm_121'}
+        ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':actual_size,'sass':'sm_121a'}
         if not hmac.compare_digest(digest,result['binary_sha256']) or actual_size!=size or not hmac.compare_digest(_build_record_id(ident),result['build_id']): _fail('build_reconcile_invalid')
     elif result['status']=='failed':
         exit_code=result['exit_code']
@@ -1215,7 +1224,7 @@ def target_build(payload):
                 version=None if version_timed_out or version_oversize or version_code or version_stderr else _build_ds4_version(version_stdout)
                 if version is None: _fail('build_binary_invalid')
                 _build_sass(binary,work_fd,activity)
-                ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':size,'sass':'sm_121'}
+                ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':size,'sass':'sm_121a'}
                 build_id=_build_record_id(ident)
                 result=_build_success(data,log_hash,duration_ns,build_id,digest,version,size)
             except HelperError as error:
