@@ -29,7 +29,7 @@ _SSH_FIELDS = frozenset(
     }
 )
 _LOCAL_FIELDS = frozenset({"name", "mode"})
-_OPERATIONS = frozenset({"doctor", "sync", "build", "serve", "status", "logs", "stop", "smoke", "benchmark"})
+_OPERATIONS = frozenset({"doctor", "sync", "build", "serve", "status", "logs", "stop", "smoke", "benchmark", "migrate-state"})
 _CONFIG_SCHEMA_VERSION = 2
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", re.ASCII)
 _PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", re.ASCII)

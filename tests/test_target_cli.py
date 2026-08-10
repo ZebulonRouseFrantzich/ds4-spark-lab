@@ -60,6 +60,31 @@ class BenchmarkCliRoutingTests(unittest.TestCase):
         phase_one.assert_called_once_with(Path.cwd(), "spark", "doctor", allow_dirty=None, jobs=None)
         benchmark.assert_not_called()
 
+    def test_migration_routes_only_to_dedicated_dispatch(self) -> None:
+        response = {
+            "schema": 1,
+            "operation": "migrate-state",
+            "target": "spark",
+            "status": "succeeded",
+            "outcome": "not_found",
+        }
+        with patch(
+            "scripts.targetctl.__main__.structured_migration_result",
+            return_value=response,
+        ) as migration, patch(
+            "scripts.targetctl.__main__.structured_result"
+        ) as phase_one, patch(
+            "scripts.targetctl.__main__.structured_benchmark_result"
+        ) as benchmark:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(["migrate-state"])
+        self.assertEqual(status, 0)
+        migration.assert_called_once_with(Path.cwd(), "spark")
+        phase_one.assert_not_called()
+        benchmark.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), response)
+
 
 class BenchmarkRecipeContracts(unittest.TestCase):
     def test_only_implemented_phase_two_recipes_are_exposed(self) -> None:
@@ -78,6 +103,14 @@ class BenchmarkRecipeContracts(unittest.TestCase):
                 "bench-s5a": Path("benchmarks/scenarios/s5a.json"),
                 "bench-s5b": Path("benchmarks/scenarios/s5b.json"),
             },
+        )
+
+    def test_explicit_state_migration_recipe_is_exposed(self) -> None:
+        text = Path("Justfile").read_text(encoding="utf-8")
+        self.assertIn('target-migrate-state target="spark":', text)
+        self.assertIn(
+            "python3 -m scripts.targetctl migrate-state --target {{ quote(target) }}",
+            text,
         )
 
 

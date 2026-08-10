@@ -235,6 +235,9 @@ flake-check:
     nix flake check
 
 # Target operations — Phase 01
+# Explicit one-time migration for a qualified retired target lifecycle state.
+target-migrate-state target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl migrate-state --target {{ quote(target) }}
 target-doctor target="spark":
     cd '{{ ROOT }}' && python3 -m scripts.targetctl doctor --target {{ quote(target) }}
 target-sync target="spark":

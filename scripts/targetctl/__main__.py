@@ -7,12 +7,13 @@ from pathlib import Path
 import sys
 
 from .benchmark import BENCHMARK_OPERATIONS, structured_benchmark_result
+from .migration import MIGRATION_OPERATION, structured_migration_result
 from .workflow import structured_result
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="targetctl")
-    parser.add_argument("operation", choices=("doctor", "sync", "build", "serve", "status", "logs", "stop", "smoke", "cleanup", "bundle", *sorted(BENCHMARK_OPERATIONS)))
+    parser.add_argument("operation", choices=("doctor", "sync", "build", "serve", "status", "logs", "stop", "smoke", "cleanup", "bundle", MIGRATION_OPERATION, *sorted(BENCHMARK_OPERATIONS)))
     parser.add_argument("--target", choices=("local", "spark"), default="spark")
     parser.add_argument("--allow-dirty")
     parser.add_argument("--jobs", type=int)
@@ -28,7 +29,9 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("compare requires --baseline and --candidate")
     elif args.baseline is not None or args.candidate is not None:
         parser.error("--baseline and --candidate are only valid for compare")
-    if args.operation in BENCHMARK_OPERATIONS:
+    if args.operation == MIGRATION_OPERATION:
+        result = structured_migration_result(Path.cwd(), args.target)
+    elif args.operation in BENCHMARK_OPERATIONS:
         result = structured_benchmark_result(
             Path.cwd(),
             args.target,
