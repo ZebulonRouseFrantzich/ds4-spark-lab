@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
+from math import ceil
 import os
 from pathlib import Path, PurePosixPath
 import secrets
@@ -50,12 +51,27 @@ _RUNTIME_ROOT = Path("targets/.state/benchmark-runtime-v1")
 _PROMPT_MANIFEST = Path("benchmarks/prompts/manifest.json")
 SCENARIOS = {
     "bench-s1": Path("benchmarks/scenarios/s1.json"),
+    "bench-s1-local-shipped": Path("benchmarks/scenarios/s1-target-shipped.json"),
+    "bench-s1-local-plain": Path("benchmarks/scenarios/s1-target-plain.json"),
     "bench-s2": Path("benchmarks/scenarios/s2.json"),
     "bench-s3": Path("benchmarks/scenarios/s3.json"),
     "bench-s5a": Path("benchmarks/scenarios/s5a.json"),
     "bench-s5b": Path("benchmarks/scenarios/s5b.json"),
 }
-BENCHMARK_OPERATIONS = frozenset({"bench-smoke", *SCENARIOS, "bench-v1-baseline", "compare"})
+SMOKE_SCENARIOS = {
+    "bench-smoke": "bench-s1",
+    "bench-smoke-local": "bench-s1-local-shipped",
+}
+BASELINE_OPERATIONS = (
+    "bench-s1",
+    "bench-s2",
+    "bench-s3",
+    "bench-s5a",
+    "bench-s5b",
+    "bench-s1-local-shipped",
+    "bench-s1-local-plain",
+)
+BENCHMARK_OPERATIONS = frozenset({*SMOKE_SCENARIOS, *SCENARIOS, "bench-v1-baseline", "compare"})
 CHUNK_BYTES = 384 * 1024
 MAX_STAGE_FILE_BYTES = 8 * 1024 * 1024
 MAX_STAGE_BYTES = 80 * 1024 * 1024
@@ -378,6 +394,19 @@ def prepare_benchmark(repo_root: str | os.PathLike[str], target: str, scenario_p
         _fail("workflow_source_stale")
     workflow._verify_current_binary(config, build)
     runtime = workflow._runtime(config, source, build)
+    try:
+        runtime = replace(
+            runtime,
+            lease_seconds=ceil(
+                scenario.deadlines.server_seconds
+                + runtime.startup_timeout
+                + 30
+            ),
+        )
+    except TargetError as error:
+        if error.code == "invalid_runtime_inputs":
+            _fail("benchmark_scenario_invalid")
+        raise
     try:
         portable = build_runtime_bundle(root / "benchmarks", root / _RUNTIME_ROOT)
         verify_transfer(portable.payload_dir, portable.manifest_path, portable.manifest_sha256, expected_kind="runtime", expected_run_id=portable.aggregate_sha256, expected_lock_sha256=portable.lock_sha256)
@@ -718,7 +747,7 @@ def _plan(scenario: Scenario, smoke: bool) -> tuple[tuple[str, int, bool], ...]:
 
 
 def run_scenario(repo_root: str | os.PathLike[str], target: str, operation: str, *, smoke: bool = False) -> dict[str, object]:
-    selected = "bench-s1" if operation == "bench-smoke" else operation
+    selected = SMOKE_SCENARIOS.get(operation, operation)
     if selected not in SCENARIOS:
         _fail("benchmark_operation_invalid")
     prepared = prepare_benchmark(repo_root, target, SCENARIOS[selected])
@@ -734,7 +763,7 @@ def run_scenario(repo_root: str | os.PathLike[str], target: str, operation: str,
 
 
 def run_baseline(repo_root: str | os.PathLike[str], target: str) -> dict[str, object]:
-    return {"status": "succeeded", "scenarios": [run_scenario(repo_root, target, operation) for operation in ("bench-s1", "bench-s2", "bench-s3", "bench-s5a", "bench-s5b")]}
+    return {"status": "succeeded", "scenarios": [run_scenario(repo_root, target, operation) for operation in BASELINE_OPERATIONS]}
 
 
 def compare(repo_root: str | os.PathLike[str], baseline: str | os.PathLike[str], candidate: str | os.PathLike[str]) -> dict[str, object]:
@@ -768,7 +797,7 @@ def execute_benchmark(repo_root: str | os.PathLike[str], target: str, operation:
         _fail("benchmark_input_invalid")
     if operation == "bench-v1-baseline":
         return run_baseline(repo_root, target)
-    if operation == "bench-smoke":
+    if operation in SMOKE_SCENARIOS:
         return run_scenario(repo_root, target, operation, smoke=True)
     return run_scenario(repo_root, target, operation)
 
@@ -1220,4 +1249,4 @@ def benchmark_stage_remove(payload):
   finally: os.close(root)
 '''
 
-__all__ = ["BENCHMARK_HELPER_EXTENSION", "BENCHMARK_OPERATIONS", "MODEL_ID", "SCENARIOS", "compare", "execute_benchmark", "prepare_benchmark", "run_baseline", "run_repetition", "run_scenario", "structured_benchmark_result"]
+__all__ = ["BASELINE_OPERATIONS", "BENCHMARK_HELPER_EXTENSION", "BENCHMARK_OPERATIONS", "MODEL_ID", "SCENARIOS", "SMOKE_SCENARIOS", "compare", "execute_benchmark", "prepare_benchmark", "run_baseline", "run_repetition", "run_scenario", "structured_benchmark_result"]

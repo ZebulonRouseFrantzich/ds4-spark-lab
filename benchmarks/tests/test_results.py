@@ -130,33 +130,29 @@ def _policy_scenario(policy: str) -> dict[str, object]:
             "license": "CC0-1.0",
         },
     ]
-    requests: list[dict[str, object]] = []
-    cases: list[dict[str, object]] = []
-    serial = 1
-    for prompt_id in ("short", "long"):
-        for concurrency in (1, 2, 4, 8, 12, 16):
-            case_request_ids: list[str] = []
-            for _ in range(concurrency):
-                request_id = f"request-{serial}"
-                serial += 1
-                case_request_ids.append(request_id)
-                requests.append(
-                    {
-                        "id": request_id,
-                        "prompt_id": prompt_id,
-                        "start_offset_ms": 0,
-                        "trigger": None,
-                        "output_budget": {"kind": "explicit", "tokens": 512},
-                    }
-                )
-            cases.append(
-                {
-                    "id": f"{prompt_id}-c{concurrency}",
-                    "request_ids": case_request_ids,
-                }
-            )
-    scenario["requests"] = requests
-    scenario["schedule"] = {"kind": "offsets", "case_matrix": cases}
+    scenario["requests"] = [
+        {
+            "id": "request-1",
+            "prompt_id": "short",
+            "start_offset_ms": 0,
+            "trigger": None,
+            "output_budget": {"kind": "explicit", "tokens": 128},
+        },
+        {
+            "id": "request-2",
+            "prompt_id": "long",
+            "start_offset_ms": 0,
+            "trigger": None,
+            "output_budget": {"kind": "explicit", "tokens": 128},
+        },
+    ]
+    scenario["schedule"] = {
+        "kind": "offsets",
+        "case_matrix": [
+            {"id": "short-c1", "request_ids": ["request-1"]},
+            {"id": "long-c1", "request_ids": ["request-2"]},
+        ],
+    }
     return scenario
 
 
@@ -325,7 +321,15 @@ def _write_result(
     scenario = copy.deepcopy(scenario or _scenario())
     source = copy.deepcopy(source or _source())
     metadata = copy.deepcopy(metadata or _metadata(run_id, scenario))
-    samples = samples or [_sample(run_id)]
+    if samples is None:
+        sample = _sample(run_id)
+        request = next(
+            item for item in scenario["requests"] if item["id"] == sample["request_id"]
+        )
+        budget = request["output_budget"]
+        sample["output_budget_kind"] = budget["kind"]
+        sample["output_budget_value"] = budget.get("tokens")
+        samples = [sample]
     writer = ResultWriter(root, metadata, scenario, source, [item["request_id"] for item in samples])
     for sample in samples:
         writer.append_sample(sample)
@@ -413,6 +417,33 @@ class StatisticsTests(unittest.TestCase):
         invalid_plain = _scenario(policy="plain")
         with self.assertRaises(ArtifactError):
             validate_normalized_scenario(invalid_plain)
+
+    def test_normalized_s1_matrix_depends_on_measurement_vantage(self) -> None:
+        for policy in ("shipped", "plain"):
+            with self.subTest(policy=policy):
+                scenario = _policy_scenario(policy)
+                self.assertIs(validate_normalized_scenario(scenario), scenario)
+
+        extra_concurrency = _policy_scenario("shipped")
+        extra_concurrency["requests"].append(
+            {
+                "id": "request-3",
+                "prompt_id": "short",
+                "start_offset_ms": 0,
+                "trigger": None,
+                "output_budget": {"kind": "explicit", "tokens": 128},
+            }
+        )
+        extra_concurrency["schedule"]["case_matrix"].append(
+            {"id": "short-c2", "request_ids": ["request-1", "request-3"]}
+        )
+        with self.assertRaisesRegex(ArtifactError, "invalid_s1_matrix"):
+            validate_normalized_scenario(extra_concurrency)
+
+        controller_minimal = _policy_scenario("shipped")
+        controller_minimal["vantage"] = "controller_lan"
+        with self.assertRaisesRegex(ArtifactError, "invalid_s1_matrix"):
+            validate_normalized_scenario(controller_minimal)
 
     def test_all_scheduled_denominators_and_unavailable_values_survive(self) -> None:
         scenario = _scenario()

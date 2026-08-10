@@ -959,14 +959,18 @@ def validate_normalized_scenario(value: object) -> dict[str, object]:
                 raise ArtifactError("invalid_s1_matrix")
             matrix.add((prompt_id, concurrency))
             matrix_prompt_ids.add(prompt_id)
+        expected_concurrencies = (
+            (1,) if vantage == "target_local" else (1, 2, 4, 8, 12, 16)
+        )
         expected_matrix = {
             (prompt_id, concurrency)
             for prompt_id in matrix_prompt_ids
-            for concurrency in (1, 2, 4, 8, 12, 16)
+            for concurrency in expected_concurrencies
         }
+        expected_case_count = 2 if vantage == "target_local" else 12
         if (
             len(matrix_prompt_ids) != 2
-            or len(cases) != 12
+            or len(cases) != expected_case_count
             or matrix != expected_matrix
             or len({item["token_count"] for item in prompts}) != 2
         ):

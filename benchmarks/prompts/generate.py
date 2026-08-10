@@ -33,23 +33,31 @@ class ArtifactSpec:
     filename: str
     target_bytes: int
     kind: str
+    token_count: int
 
 
-# Filenames state byte-size classes, not unmeasured token counts.  Each target is
+# Filenames state byte-size classes, not token counts.  Each target is
 # reached with complete synthetic sections, so final sizes honestly overshoot by
 # a small, content-dependent amount rather than by repeated padding.
 ARTIFACT_SPECS: Final = (
-    ArtifactSpec("mixed_short", "mixed-short.txt", 4 * 1024, "short"),
-    ArtifactSpec("mixed_medium", "mixed-about-128kib.txt", 128 * 1024, "mixed"),
-    ArtifactSpec("repo_like_small", "repo-like-about-96kib.txt", 96 * 1024, "repo"),
-    ArtifactSpec("repo_like_medium", "repo-like-about-136kib.txt", 136 * 1024, "repo"),
-    ArtifactSpec("repo_like_large", "repo-like-about-312kib.txt", 312 * 1024, "repo"),
-    ArtifactSpec("repo_like_very_large", "repo-like-about-704kib.txt", 704 * 1024, "repo"),
+    ArtifactSpec("mixed_short", "mixed-short.txt", 4 * 1024, "short", 1_056),
+    ArtifactSpec("mixed_medium", "mixed-about-128kib.txt", 128 * 1024, "mixed", 26_145),
+    ArtifactSpec("repo_like_small", "repo-like-about-96kib.txt", 96 * 1024, "repo", 26_177),
+    ArtifactSpec("repo_like_medium", "repo-like-about-136kib.txt", 136 * 1024, "repo", 36_825),
+    ArtifactSpec("repo_like_large", "repo-like-about-312kib.txt", 312 * 1024, "repo", 84_349),
+    ArtifactSpec(
+        "repo_like_very_large",
+        "repo-like-about-704kib.txt",
+        704 * 1024,
+        "repo",
+        190_405,
+    ),
     ArtifactSpec(
         "cold_mixed_repo_like_long",
         "cold-mixed-repo-like-about-736kib.txt",
         736 * 1024,
         "cold",
+        168_444,
     ),
 )
 
@@ -966,10 +974,10 @@ def _build_outputs() -> tuple[dict[str, bytes], list[dict[str, object]]]:
                 "license": LICENSE_ID,
                 "path": record["path"],
                 "sha256": record["sha256"],
-                "status": "unmeasured",
-                "token_count": None,
+                "status": "measured",
+                "token_count": spec.token_count,
             }
-            for record in records
+            for record, spec in zip(records, ARTIFACT_SPECS, strict=True)
         ],
         "version": 1,
     }

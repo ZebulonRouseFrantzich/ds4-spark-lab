@@ -13,21 +13,28 @@ from unittest.mock import patch
 from benchmarks.src.ds4bench.schema import ScenarioError
 from benchmarks.src.ds4bench.stats import canonical_json_bytes
 from scripts.targetctl.benchmark import (
+    BASELINE_OPERATIONS,
     CHUNK_BYTES,
+    SCENARIOS,
     PreparedBenchmark,
     StageFile,
     _download_target,
     _inspect_file,
     _metadata,
+    _plan,
     _source_manifest,
     _stage,
     _stage_manifest,
+    execute_benchmark,
     prepare_benchmark,
+    run_baseline,
     run_repetition,
+    run_scenario,
     structured_benchmark_result,
 )
 from scripts.targetctl.common import TargetError
 from scripts.targetctl.doctor import DOCTOR_TOOLS, DoctorResult
+from scripts.targetctl.lifecycle import RuntimeInputs
 
 
 class _RecordingTransport:
@@ -205,6 +212,162 @@ class PreflightContracts(unittest.TestCase):
                 prepare_benchmark(".", "spark", Path("benchmarks/scenarios/s1.json"))
         config.assert_not_called()
         launched.assert_not_called()
+
+    def test_prepared_scenario_derives_lease_from_server_and_startup_horizons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scenario = _scenario()
+            scenario.deadlines = SimpleNamespace(server_seconds=7000.0)
+            config = SimpleNamespace(
+                name="spark",
+                mode="ssh",
+                source_root=root,
+                validate_for=lambda _operation: None,
+            )
+            source = SimpleNamespace(as_dict=lambda: {"snapshot_id": "source"})
+            build = {"build_id": "c" * 64}
+            runtime = RuntimeInputs(
+                model_path="/models/model",
+                drafter_path="/models/drafter",
+                source_snapshot_id="a" * 64,
+                applied_tree_hash="b" * 64,
+                build_id="c" * 64,
+                port=8000,
+                startup_timeout=120.0,
+            )
+            portable = SimpleNamespace(
+                payload_dir=root / "payload",
+                manifest_path=root / "runtime-manifest.json",
+                manifest_sha256="d" * 64,
+                aggregate_sha256="e" * 64,
+                lock_sha256="f" * 64,
+            )
+            with (
+                patch("scripts.targetctl.workflow._root", return_value=root),
+                patch("scripts.targetctl.benchmark.load_scenario", return_value=scenario),
+                patch("scripts.targetctl.benchmark.normalize_scenario", return_value={}),
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=config),
+                patch("scripts.targetctl.benchmark.select_transport", return_value=SimpleNamespace()),
+                patch("scripts.targetctl.workflow._ready", return_value=(source, build)),
+                patch("scripts.targetctl.workflow.build_snapshot", return_value=source),
+                patch("scripts.targetctl.workflow._verify_current_binary"),
+                patch("scripts.targetctl.workflow._runtime", return_value=runtime),
+                patch("scripts.targetctl.benchmark.build_runtime_bundle", return_value=portable),
+                patch("scripts.targetctl.benchmark.verify_transfer"),
+                patch(
+                    "scripts.targetctl.benchmark.doctor",
+                    return_value=SimpleNamespace(status="succeeded"),
+                ),
+                patch("scripts.targetctl.benchmark._source_manifest", return_value={}),
+                patch(
+                    "scripts.targetctl.benchmark._inspect_file",
+                    return_value=(2, "1" * 64, ()),
+                ),
+            ):
+                prepared = prepare_benchmark(
+                    root,
+                    "spark",
+                    Path("benchmarks/scenarios/s1.json"),
+                )
+
+            self.assertIsNot(prepared.runtime, runtime)
+            self.assertEqual(runtime.lease_seconds, 300)
+            self.assertEqual(prepared.runtime.lease_seconds, 7150)
+
+    def test_impossible_scenario_horizon_fails_before_doctor_or_serve(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scenario = _scenario()
+            scenario.deadlines = SimpleNamespace(server_seconds=7036.0)
+            config = SimpleNamespace(
+                name="spark",
+                mode="ssh",
+                source_root=root,
+                validate_for=lambda _operation: None,
+            )
+            source = SimpleNamespace(as_dict=lambda: {"snapshot_id": "source"})
+            build = {"build_id": "c" * 64}
+            runtime = RuntimeInputs(
+                model_path="/models/model",
+                drafter_path="/models/drafter",
+                source_snapshot_id="a" * 64,
+                applied_tree_hash="b" * 64,
+                build_id="c" * 64,
+                port=8000,
+                startup_timeout=120.0,
+            )
+            with (
+                patch("scripts.targetctl.workflow._root", return_value=root),
+                patch("scripts.targetctl.benchmark.load_scenario", return_value=scenario),
+                patch("scripts.targetctl.benchmark.normalize_scenario", return_value={}),
+                patch("scripts.targetctl.workflow.load_operational_target", return_value=config),
+                patch("scripts.targetctl.benchmark.select_transport", return_value=SimpleNamespace()),
+                patch("scripts.targetctl.workflow._ready", return_value=(source, build)),
+                patch("scripts.targetctl.workflow.build_snapshot", return_value=source),
+                patch("scripts.targetctl.workflow._verify_current_binary"),
+                patch("scripts.targetctl.workflow._runtime", return_value=runtime),
+                patch("scripts.targetctl.benchmark.build_runtime_bundle") as bundled,
+                patch("scripts.targetctl.benchmark.doctor") as checked,
+                patch("scripts.targetctl.benchmark.serve") as launched,
+            ):
+                with self.assertRaises(TargetError) as caught:
+                    prepare_benchmark(
+                        root,
+                        "spark",
+                        Path("benchmarks/scenarios/s1.json"),
+                    )
+
+            self.assertEqual(caught.exception.code, "benchmark_scenario_invalid")
+            bundled.assert_not_called()
+            checked.assert_not_called()
+            launched.assert_not_called()
+
+
+class OperationRoutingContracts(unittest.TestCase):
+    def test_local_smoke_uses_shipped_control_and_first_case_only(self) -> None:
+        with patch("scripts.targetctl.benchmark.run_scenario", return_value={"status": "succeeded"}) as dispatched:
+            execute_benchmark(".", "spark", "bench-smoke-local")
+        dispatched.assert_called_once_with(".", "spark", "bench-smoke-local", smoke=True)
+
+        scenario = _scenario("target_local")
+        scenario.schedule.case_matrix = (SimpleNamespace(id="first"), SimpleNamespace(id="second"))
+        self.assertEqual(_plan(scenario, True), (("first", 0, True),))
+
+    def test_target_local_controls_use_their_scenario_and_result_path(self) -> None:
+        for operation in ("bench-s1-local-shipped", "bench-s1-local-plain"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                prepared = _prepared(root, vantage="target_local")
+                promoted = prepared.result_root / f"{operation}-result"
+                with patch("scripts.targetctl.benchmark.prepare_benchmark", return_value=prepared) as preflight, patch(
+                    "scripts.targetctl.benchmark._plan",
+                    return_value=(("c1", 0, True),),
+                ), patch("scripts.targetctl.benchmark.run_repetition", return_value=promoted) as repeated:
+                    result = run_scenario(root, "spark", operation)
+                preflight.assert_called_once_with(root, "spark", SCENARIOS[operation])
+                repeated.assert_called_once_with(prepared, "c1", 0, retain=True)
+                self.assertEqual(result["vantage"], "target_local")
+                self.assertEqual(result["artifacts"], [promoted.relative_to(root).as_posix()])
+
+    def test_baseline_runs_primary_family_then_separate_local_controls(self) -> None:
+        expected = (
+            "bench-s1",
+            "bench-s2",
+            "bench-s3",
+            "bench-s5a",
+            "bench-s5b",
+            "bench-s1-local-shipped",
+            "bench-s1-local-plain",
+        )
+        self.assertEqual(BASELINE_OPERATIONS, expected)
+        with patch(
+            "scripts.targetctl.benchmark.run_scenario",
+            side_effect=lambda _root, _target, operation: {"operation": operation},
+        ) as dispatched:
+            result = run_baseline(".", "spark")
+        self.assertEqual([item.args[2] for item in dispatched.call_args_list], list(expected))
+        self.assertEqual(result["scenarios"], [{"operation": operation} for operation in expected])
+
 
 
 

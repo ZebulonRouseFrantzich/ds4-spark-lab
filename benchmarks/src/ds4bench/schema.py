@@ -686,9 +686,20 @@ def _validate_s1(scenario: Scenario) -> None:
         prompt_ids.add(prompt_id)
     if len(prompt_ids) != 2:
         _fail("invalid_s1_matrix", "S1 requires exactly the short and 32K prompt classes")
-    expected = {(prompt_id, concurrency) for prompt_id in prompt_ids for concurrency in _S1_CONCURRENCIES}
-    if matrix != expected or len(scenario.schedule.case_matrix) != 12:
-        _fail("invalid_s1_matrix", "S1 must cover both prompts at 1,2,4,8,12,16 concurrency")
+    expected_concurrencies = (1,) if scenario.vantage == "target_local" else _S1_CONCURRENCIES
+    expected = {
+        (prompt_id, concurrency)
+        for prompt_id in prompt_ids
+        for concurrency in expected_concurrencies
+    }
+    expected_cases = 2 if scenario.vantage == "target_local" else 12
+    if matrix != expected or len(scenario.schedule.case_matrix) != expected_cases:
+        requirement = (
+            "both prompts at concurrency 1"
+            if scenario.vantage == "target_local"
+            else "both prompts at 1,2,4,8,12,16 concurrency"
+        )
+        _fail("invalid_s1_matrix", f"S1 must cover {requirement}")
     counts = {prompt.token_count for prompt in scenario.prompts}
     if len(counts) != 2:
         _fail("invalid_s1_matrix", "S1 short and 32K prompt token counts must be distinct")

@@ -262,8 +262,14 @@ target-bundle target="spark":
 # Benchmark operations — Phase 02
 bench-smoke target="spark":
     cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-smoke --target {{ quote(target) }}
+bench-smoke-local target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-smoke-local --target {{ quote(target) }}
 bench-s1 target="spark":
     cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s1 --target {{ quote(target) }}
+bench-s1-local-shipped target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s1-local-shipped --target {{ quote(target) }}
+bench-s1-local-plain target="spark":
+    cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s1-local-plain --target {{ quote(target) }}
 bench-s2 target="spark":
     cd '{{ ROOT }}' && uv run --frozen --project benchmarks python -m scripts.targetctl bench-s2 --target {{ quote(target) }}
 bench-s3 target="spark":

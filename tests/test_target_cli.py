@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.targetctl.__main__ import main
-from scripts.targetctl.benchmark import BENCHMARK_OPERATIONS, SCENARIOS
+from scripts.targetctl.benchmark import BENCHMARK_OPERATIONS, SCENARIOS, SMOKE_SCENARIOS
 
 
 class BenchmarkCliRoutingTests(unittest.TestCase):
@@ -89,7 +89,18 @@ class BenchmarkCliRoutingTests(unittest.TestCase):
 class BenchmarkRecipeContracts(unittest.TestCase):
     def test_only_implemented_phase_two_recipes_are_exposed(self) -> None:
         text = Path("Justfile").read_text(encoding="utf-8")
-        for operation in ("bench-smoke", "bench-s1", "bench-s2", "bench-s3", "bench-s5a", "bench-s5b", "bench-v1-baseline"):
+        for operation in (
+            "bench-smoke",
+            "bench-smoke-local",
+            "bench-s1",
+            "bench-s1-local-shipped",
+            "bench-s1-local-plain",
+            "bench-s2",
+            "bench-s3",
+            "bench-s5a",
+            "bench-s5b",
+            "bench-v1-baseline",
+        ):
             self.assertIn(f'{operation} target="spark":', text)
             self.assertIn(f"uv run --frozen --project benchmarks python -m scripts.targetctl {operation} --target {{{{ quote(target) }}}}", text)
         self.assertIn("compare baseline candidate:", text)
@@ -98,11 +109,38 @@ class BenchmarkRecipeContracts(unittest.TestCase):
             SCENARIOS,
             {
                 "bench-s1": Path("benchmarks/scenarios/s1.json"),
+                "bench-s1-local-shipped": Path("benchmarks/scenarios/s1-target-shipped.json"),
+                "bench-s1-local-plain": Path("benchmarks/scenarios/s1-target-plain.json"),
                 "bench-s2": Path("benchmarks/scenarios/s2.json"),
                 "bench-s3": Path("benchmarks/scenarios/s3.json"),
                 "bench-s5a": Path("benchmarks/scenarios/s5a.json"),
                 "bench-s5b": Path("benchmarks/scenarios/s5b.json"),
             },
+        )
+        self.assertEqual(
+            SMOKE_SCENARIOS,
+            {
+                "bench-smoke": "bench-s1",
+                "bench-smoke-local": "bench-s1-local-shipped",
+            },
+        )
+        self.assertEqual(
+            BENCHMARK_OPERATIONS,
+            frozenset(
+                {
+                    "bench-smoke",
+                    "bench-smoke-local",
+                    "bench-s1",
+                    "bench-s1-local-shipped",
+                    "bench-s1-local-plain",
+                    "bench-s2",
+                    "bench-s3",
+                    "bench-s5a",
+                    "bench-s5b",
+                    "bench-v1-baseline",
+                    "compare",
+                }
+            ),
         )
 
     def test_explicit_state_migration_recipe_is_exposed(self) -> None:

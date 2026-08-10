@@ -118,6 +118,27 @@ class ScenarioSchemaTests(unittest.TestCase):
         data["schedule"] = {"kind": "offsets", "case_matrix": cases}
         return data
 
+    def _s1_local(self, policy: str = "shipped") -> dict[str, Any]:
+        data = self._s1()
+        data["description"] = f"target-local concurrency-1 {policy} control"
+        data["vantage"] = "target_local"
+        data["server"]["decode_policy"] = policy
+        selected_ids = {"short-c1", "long32k-c1"}
+        data["schedule"]["case_matrix"] = [
+            case
+            for case in data["schedule"]["case_matrix"]
+            if case["id"] in selected_ids
+        ]
+        selected_requests = {
+            request_id
+            for case in data["schedule"]["case_matrix"]
+            for request_id in case["request_ids"]
+        }
+        data["requests"] = [
+            request for request in data["requests"] if request["id"] in selected_requests
+        ]
+        return data
+
     def _s2(self) -> dict[str, Any]:
         data = self._base_s5a()
         data["id"] = "S2"
@@ -308,9 +329,7 @@ class ScenarioSchemaTests(unittest.TestCase):
         data["server"]["decode_policy"] = "plain"
         self._rejects(data, "invalid_server_profile")
 
-        control = self._s1()
-        control["vantage"] = "target_local"
-        control["server"]["decode_policy"] = "plain"
+        control = self._s1_local("plain")
         self.assertEqual(self._load(control).server.decode_policy, "plain")
 
         controller_plain = copy.deepcopy(control)
@@ -330,6 +349,222 @@ class ScenarioSchemaTests(unittest.TestCase):
                 data = self._base_s5a()
                 data["sampling"][field] = value
                 self._rejects(data, "invalid_sampling")
+
+    def test_target_local_s1_matrix_rejects_vantage_and_case_drift(self) -> None:
+        full_local = self._s1()
+        full_local["vantage"] = "target_local"
+        self._rejects(full_local, "invalid_s1_matrix")
+
+        extra_concurrency = self._s1_local()
+        extra_request = copy.deepcopy(extra_concurrency["requests"][0])
+        extra_request["id"] = "short-extra"
+        extra_concurrency["requests"].append(extra_request)
+        extra_concurrency["schedule"]["case_matrix"].append(
+            {
+                "id": "short-c2",
+                "request_ids": [
+                    extra_concurrency["requests"][0]["id"],
+                    extra_request["id"],
+                ],
+            }
+        )
+        self._rejects(extra_concurrency, "invalid_s1_matrix")
+
+        missing_prompt = self._s1_local()
+        missing_prompt["prompts"] = [missing_prompt["prompts"][0]]
+        missing_prompt["requests"] = [missing_prompt["requests"][0]]
+        missing_prompt["schedule"]["case_matrix"] = [
+            missing_prompt["schedule"]["case_matrix"][0]
+        ]
+        self._rejects(missing_prompt, "invalid_s1_matrix")
+
+        controller_minimal = self._s1_local()
+        controller_minimal["vantage"] = "controller_lan"
+        self._rejects(controller_minimal, "invalid_s1_matrix")
+
+    def test_real_canonical_scenario_family_loads_with_frozen_contract(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        scenario_root = repo_root / "benchmarks" / "scenarios"
+        filenames = (
+            "s1.json",
+            "s2.json",
+            "s3.json",
+            "s5a.json",
+            "s5b.json",
+            "s1-target-shipped.json",
+            "s1-target-plain.json",
+        )
+        scenarios = {
+            filename: load_scenario(scenario_root / filename, repo_root)
+            for filename in filenames
+        }
+        manifest = load_calibration_manifest(
+            repo_root / "benchmarks" / "prompts" / "manifest.json",
+            repo_root,
+        )
+        manifest_by_id = {prompt.id: prompt for prompt in manifest.prompts}
+
+        for filename, scenario in scenarios.items():
+            with self.subTest(filename=filename):
+                path = scenario_root / filename
+                raw = json.loads(path.read_bytes())
+                canonical = (
+                    json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode()
+                self.assertEqual(path.read_bytes(), canonical)
+                for prompt in scenario.prompts:
+                    expected_prompt = manifest_by_id[prompt.id]
+                    self.assertEqual(expected_prompt.status, "measured")
+                    self.assertEqual(
+                        (
+                            prompt.path,
+                            prompt.sha256,
+                            prompt.token_count,
+                            prompt.license,
+                        ),
+                        (
+                            expected_prompt.path,
+                            expected_prompt.sha256,
+                            expected_prompt.token_count,
+                            expected_prompt.license,
+                        ),
+                    )
+                self.assertEqual(scenario.server.context_tokens, 262_144)
+                self.assertEqual(scenario.server.default_output_tokens, 393_216)
+                self.assertEqual(scenario.server.dspark_max_nlive, 1)
+                self.assertTrue(scenario.server.terminal_yield_quench)
+                self.assertEqual(
+                    set(normalize_scenario(scenario)["server"]["speculative_overrides"].values()),
+                    {None},
+                )
+                self.assertEqual(scenario.warmup_repetitions, 1)
+                self.assertEqual(scenario.measured_repetitions, 5)
+                self.assertEqual(
+                    (scenario.sampling.temperature, scenario.sampling.top_p, scenario.sampling.seed),
+                    (0.0, 1.0, 0),
+                )
+                self.assertTrue(scenario.preconditions.server_restart_each_repetition)
+                self.assertEqual(scenario.preconditions.cache_state, "cold")
+                self.assertTrue(scenario.preconditions.warmup_server_is_separate)
+                self.assertEqual(scenario.preconditions.cooldown_seconds, 30.0)
+                self.assertEqual(scenario.preconditions.prompt_reuse, "allow")
+
+        primary_s1 = scenarios["s1.json"]
+        self.assertEqual(primary_s1.id, "S1")
+        self.assertEqual(primary_s1.vantage, "controller_lan")
+        self.assertEqual(len(primary_s1.schedule.case_matrix), 12)
+        primary_request_by_id = {request.id: request for request in primary_s1.requests}
+        self.assertEqual(
+            {
+                (
+                    primary_request_by_id[case.request_ids[0]].prompt_id,
+                    len(case.request_ids),
+                )
+                for case in primary_s1.schedule.case_matrix
+            },
+            {
+                (prompt_id, concurrency)
+                for prompt_id in ("mixed_short", "mixed_medium")
+                for concurrency in (1, 2, 4, 8, 12, 16)
+            },
+        )
+        self.assertTrue(
+            all(
+                request.output_budget.kind == "explicit"
+                and request.output_budget.tokens == 128
+                for request in primary_s1.requests
+            )
+        )
+
+        shipped_control = scenarios["s1-target-shipped.json"]
+        plain_control = scenarios["s1-target-plain.json"]
+        for scenario, policy in (
+            (shipped_control, "shipped"),
+            (plain_control, "plain"),
+        ):
+            with self.subTest(policy=policy):
+                self.assertEqual((scenario.id, scenario.vantage), ("S1", "target_local"))
+                self.assertEqual(scenario.server.decode_policy, policy)
+                self.assertEqual(
+                    {
+                        (
+                            {request.id: request for request in scenario.requests}[
+                                case.request_ids[0]
+                            ].prompt_id,
+                            len(case.request_ids),
+                        )
+                        for case in scenario.schedule.case_matrix
+                    },
+                    {("mixed_short", 1), ("mixed_medium", 1)},
+                )
+                self.assertEqual(len(scenario.schedule.case_matrix), 2)
+                self.assertTrue(
+                    all(
+                        request.output_budget.kind == "explicit"
+                        and request.output_budget.tokens == 128
+                        for request in scenario.requests
+                    )
+                )
+        shipped_identity = normalize_scenario(shipped_control)
+        plain_identity = normalize_scenario(plain_control)
+        self.assertNotEqual(
+            shipped_identity.pop("description"), plain_identity.pop("description")
+        )
+        plain_identity["server"]["decode_policy"] = "shipped"
+        self.assertEqual(shipped_identity, plain_identity)
+
+        s2 = scenarios["s2.json"]
+        self.assertEqual(
+            {request.id: request.prompt_id for request in s2.requests},
+            {
+                "planner": "repo_like_very_large",
+                "coder": "repo_like_large",
+                "reviewer": "repo_like_small",
+                "advisor": "repo_like_medium",
+            },
+        )
+        self.assertTrue(
+            all(
+                request.start_offset_ms == 0
+                and request.output_budget.kind == "explicit"
+                and request.output_budget.tokens == 512
+                for request in s2.requests
+            )
+        )
+
+        s3 = scenarios["s3.json"]
+        s3_request_by_id = {request.id: request for request in s3.requests}
+        for request_id in ("active-1", "active-2", "active-3"):
+            request = s3_request_by_id[request_id]
+            self.assertEqual(request.prompt_id, "mixed_medium")
+            self.assertIsNone(request.trigger)
+            self.assertEqual(request.output_budget.tokens, 1_024)
+        injection = s3_request_by_id["cold-long-injection"]
+        self.assertEqual(injection.prompt_id, "repo_like_very_large")
+        self.assertIsNotNone(injection.trigger)
+        self.assertEqual(injection.trigger.minimum_requests, 3)
+        self.assertEqual(injection.output_budget.tokens, 512)
+
+        for filename, budget_kind in (("s5a.json", "explicit"), ("s5b.json", "omitted")):
+            scenario = scenarios[filename]
+            with self.subTest(filename=filename):
+                self.assertEqual(len(scenario.requests), 4)
+                self.assertEqual(len(scenario.schedule.case_matrix), 1)
+                self.assertEqual(len(scenario.schedule.case_matrix[0].request_ids), 4)
+                self.assertTrue(
+                    all(
+                        request.prompt_id == "repo_like_very_large"
+                        and request.start_offset_ms == 0
+                        and request.output_budget.kind == budget_kind
+                        for request in scenario.requests
+                    )
+                )
+        self.assertTrue(
+            all(request.output_budget.tokens == 512 for request in scenarios["s5a.json"].requests)
+        )
+        self.assertTrue(
+            all(request.output_budget.tokens is None for request in scenarios["s5b.json"].requests)
+        )
 
     def test_s2_has_exact_roles_offsets_and_prompt_size_order(self) -> None:
         scenario = self._load(self._s2())
