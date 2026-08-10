@@ -181,6 +181,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             "lease_seconds": build_module.BUILD_LOCK_LEASE_SECONDS,
         })
         payload["lock_token"] = lock["lock_token"]
+        namespace["_build_sass_probe"] = mock.Mock(return_value=None)
         return namespace, payload, roots
 
     def test_doctor_payload_is_finite_and_contains_no_runtime_input(self) -> None:
@@ -1204,8 +1205,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             )
             namespace["_build_file_hash"] = mock.Mock(return_value=(binary_hash, 10))
             namespace["_build_capture"] = mock.Mock(side_effect=[
-                (0, b"ds4-server 1.2.3\n", b"", False, False),
-                (0, b"Function : sm_121\n", b"", False, False),
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b"ELF file sm_121\n", b"", False, False),
             ])
             first_result = namespace["target_build"](first_payload)  # type: ignore[index,operator]
             run_dir = Path(roots["run_dir"])
@@ -1287,8 +1288,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             self.assertNotEqual(first_result["build_id"], None)  # type: ignore[index]
 
             namespace["_build_capture"] = mock.Mock(side_effect=[
-                (0, b"ds4-server 1.2.3\n", b"", False, False),
-                (0, b"Function : sm_121\n", b"", False, False),
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b"ELF file sm_121\n", b"", False, False),
             ])
             second_result = namespace["target_build"](second_payload)  # type: ignore[index,operator]
             self.assertFalse(lock_path.exists())
@@ -1356,8 +1357,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             )
             namespace["_build_file_hash"] = mock.Mock(return_value=(binary_hash, 10))
             namespace["_build_capture"] = mock.Mock(side_effect=[
-                (0, b"ds4-server 1.2.3\n", b"", False, False),
-                (0, b"Function : sm_121\n", b"", False, False),
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b"ELF file sm_121\n", b"", False, False),
             ])
             direct = namespace["target_build"](payload)  # type: ignore[index,operator]
             capture_calls = namespace["_build_capture"].call_args_list  # type: ignore[attr-defined,index]
@@ -1369,7 +1370,10 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             self.assertEqual(version_call[0], (pinned_binary, "--version"))
             self.assertEqual(
                 sass_call[0],
-                ("/usr/local/cuda/bin/cuobjdump", "--dump-sass", pinned_binary),
+                ("/usr/local/cuda/bin/cuobjdump", "--list-elf", pinned_binary),
+            )
+            namespace["_build_sass_probe"].assert_called_once_with(  # type: ignore[union-attr]
+                pinned_binary, version_call[3], version_call[4],
             )
             lock_path = Path(roots["run_dir"]) / namespace["LOCK_NAME"]  # type: ignore[index]
             self.assertFalse(lock_path.exists())
@@ -1413,8 +1417,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             attempt_log_path = run_dir / attempt_log_name
             commit_path = run_dir / commit_name
             namespace["_build_capture"] = mock.Mock(side_effect=[
-                (0, b"ds4-server 1.2.3\n", b"", False, False),
-                (0, b"Function : sm_121\n", b"", False, False),
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b"ELF file sm_121\n", b"", False, False),
             ])
             release = namespace["_release_lock_at_root"]
             release_observation: list[tuple[bool, bool, bool]] = []
@@ -1498,8 +1502,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             ])
             namespace["_build_file_hash"] = mock.Mock(return_value=("c" * 64, 10))
             namespace["_build_capture"] = mock.Mock(side_effect=[
-                (0, b"ds4-server 1.2.3\n", b"", False, False),
-                (0, b"Function : sm_121\n", b"", False, False),
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b"ELF file sm_121\n", b"", False, False),
             ])
             first = namespace["target_build"](first_payload)  # type: ignore[index,operator]
             run_dir = Path(roots["run_dir"])
@@ -1588,8 +1592,316 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             transport.run.assert_not_called()
             self.assertFalse((run_dir / "build.log").exists())
 
+    def test_ds4_version_is_exact_bounded_and_matches_embedded_parser(self) -> None:
+        namespace: dict[str, object] = {
+            "HelperError": TargetError,
+            "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed")),
+        }
+        extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        valid = {
+            b"ds4-server v0.5.6\n": "0.5.6",
+            b"ds4-server v128.0.1": "128.0.1",
+            b"ds4-server v1.2.3.4.5\n": "1.2.3.4.5",
+        }
+        malformed = (
+            b"ds4-server v0.5.6\nCUDA 12.8\n",
+            b"ds4-server 1.2.3\n",
+            b"prefix ds4-server v1.2.3\n",
+            b"ds4-server v1..2\n",
+            b"ds4-server v1.2 beta\n",
+            b"ds4-server v1.2\nDS4 build 4\n",
+            b"ds4-server v" + b"1" * 65 + b"\n",
+        )
+        transport = mock.Mock()
+        for output, expected in valid.items():
+            with self.subTest(output=output):
+                transport.run.return_value = CommandResult(0, False, 1, output, b"")
+                self.assertEqual(build_module._version(transport, Path("/binary")), expected)
+                self.assertEqual(namespace["_build_ds4_version"](output), expected)  # type: ignore[operator]
+        for output in malformed:
+            with self.subTest(output=output):
+                transport.run.return_value = CommandResult(0, False, 1, output, b"")
+                with self.assertRaises(TargetError) as raised:
+                    build_module._version(transport, Path("/binary"))
+                self.assertEqual(raised.exception.code, "build_binary_invalid")
+                self.assertIsNone(namespace["_build_ds4_version"](output))  # type: ignore[operator]
+        transport.run.return_value = CommandResult(
+            0, False, 1, b"ds4-server v0.5.6\n", b"unexpected warning\n",
+        )
+        with self.assertRaises(TargetError):
+            build_module._version(transport, Path("/binary"))
+
+    def test_list_elf_arch_gate_is_exact_complete_and_local_remote_equivalent(self) -> None:
+        namespace: dict[str, object] = {
+            "HelperError": TargetError,
+            "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed")),
+        }
+        extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        binary = Path("/work/engine/ds4/ds4-server")
+        cases = (
+            (b"ELF file 1: kernel.sm_121.cubin\n", True),
+            (b"ELF file 1: kernel.sm_121a.cubin\n", False),
+            (b"ELF file 1: kernel.xsm_121.cubin\n", False),
+            (b"ELF file 1: kernel.sm_12.cubin\n", False),
+        )
+        for output, accepted in cases:
+            with self.subTest(output=output):
+                transport = mock.Mock()
+                transport.run.return_value = CommandResult(0, False, 1, output, b"")
+                with mock.patch.object(build_module, "_stream_sass", return_value=True) as local_probe:
+                    if accepted:
+                        build_module._sass(transport, binary)
+                        local_probe.assert_called_once_with(
+                            (build_module.CUOBJDUMP, "--dump-sass", str(binary)),
+                        )
+                    else:
+                        with self.assertRaises(TargetError) as local_error:
+                            build_module._sass(transport, binary)
+                        self.assertEqual(local_error.exception.code, "build_sass_invalid")
+                        local_probe.assert_not_called()
+                activity = {"mutation_dispatched": True, "process_groups_gone": True}
+                embedded_capture = mock.Mock(
+                    return_value=(0, output, b"", False, False),
+                )
+                namespace["_build_capture"] = embedded_capture
+                embedded_stream = mock.Mock(return_value=True)
+                namespace["_build_stream_sass"] = embedded_stream
+                if accepted:
+                    namespace["_build_sass"]("/pinned/binary", 7, activity)  # type: ignore[operator]
+                    embedded_stream.assert_called_once_with(
+                        (
+                            "/usr/local/cuda/bin/cuobjdump",
+                            "--dump-sass",
+                            "/pinned/binary",
+                        ),
+                        30,
+                        268_435_456,
+                        16_384,
+                        7,
+                        activity,
+                    )
+                else:
+                    with self.assertRaises(TargetError) as embedded_error:
+                        namespace["_build_sass"]("/pinned/binary", 7, activity)  # type: ignore[operator]
+                    self.assertEqual(embedded_error.exception.code, "build_sass_invalid")
+                    embedded_stream.assert_not_called()
+                embedded_capture.assert_called_once_with(
+                    (
+                        "/usr/local/cuda/bin/cuobjdump",
+                        "--list-elf",
+                        "/pinned/binary",
+                    ),
+                    10,
+                    65_536,
+                    7,
+                    activity,
+                )
+        transport = mock.Mock()
+        transport.run.return_value = CommandResult(
+            0, False, 1, b"sm_121\n" + b"x" * 65_536, b"",
+        )
+        with mock.patch.object(build_module, "_stream_sass") as local_probe:
+            with self.assertRaises(TargetError) as oversized_error:
+                build_module._sass(transport, binary)
+            self.assertEqual(oversized_error.exception.code, "build_sass_invalid")
+            local_probe.assert_not_called()
+        transport.run.return_value = CommandResult(0, False, 1, b"ELF sm_121\n", b"")
+        with mock.patch.object(build_module, "_stream_sass", return_value=False):
+            with self.assertRaises(TargetError) as local_error:
+                build_module._sass(transport, binary)
+        self.assertEqual(local_error.exception.code, "build_sass_invalid")
+        embedded_stream = mock.Mock(return_value=False)
+        namespace["_build_stream_sass"] = embedded_stream
+        activity = {}
+        with self.assertRaises(TargetError) as embedded_error:
+            namespace["_build_sass_probe"]("/pinned/binary", 7, activity)  # type: ignore[operator]
+        self.assertEqual(embedded_error.exception.code, "build_sass_invalid")
+        embedded_stream.assert_called_once_with(
+            (
+                "/usr/local/cuda/bin/cuobjdump",
+                "--dump-sass",
+                "/pinned/binary",
+            ),
+            30,
+            268_435_456,
+            16_384,
+            7,
+            activity,
+        )
+
+    def test_streaming_sass_accepts_split_246mb_like_output_without_retention(self) -> None:
+        namespace: dict[str, object] = {
+            "HelperError": TargetError,
+            "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed")),
+        }
+        extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        program = (
+            "import os,time\n"
+            "parts=(b'noise\\nco',b'de for sm_',b'121\\n  Fun',"
+            "b'ction : _Zkernel\\n  /*00',b'00*/ MOV R1, R2;\\n')\n"
+            "for part in parts: os.write(1,part); time.sleep(0.01)\n"
+            "remaining=246178960\n"
+            "chunk=b'x'*4096\n"
+            "while remaining:\n"
+            " count=min(remaining,len(chunk)); os.write(1,chunk[:count]); remaining-=count\n"
+        )
+        args = (sys.executable, "-c", program)
+        started = time.monotonic()
+        self.assertTrue(build_module._stream_sass(args, timeout=5))
+        self.assertLess(time.monotonic() - started, 2)
+        work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            activity = {"mutation_dispatched": True, "process_groups_gone": True}
+            started = time.monotonic()
+            self.assertTrue(
+                namespace["_build_stream_sass"](  # type: ignore[operator]
+                    args, 5, 268_435_456, 16_384, work_fd, activity,
+                ),
+            )
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertTrue(activity["process_groups_gone"])
+        finally:
+            os.close(work_fd)
+
+    def test_streaming_sass_rejects_missing_forged_and_out_of_order_markers(self) -> None:
+        namespace: dict[str, object] = {
+            "HelperError": TargetError,
+            "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed")),
+        }
+        extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        malformed = (
+            b"code for sm_121\n  Function : _Zkernel\n",
+            b"code for sm_121a\n  Function : _Zkernel\n  /*0000*/ MOV R1, R2;\n",
+            b"prefix code for sm_121\n  Function : _Zkernel\n  /*0000*/ MOV R1, R2;\n",
+            b"code for sm_121\n  /*0000*/ MOV R1, R2;\n  Function : _Zkernel\n",
+            b"code for sm_121\n  Function : _Zkernel\n  /*zzzz*/ MOV R1, R2;\n",
+            b"code for sm_121\n  Function :\n  /*0000*/ MOV R1, R2;\n",
+        )
+        work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for output in malformed:
+                with self.subTest(output=output):
+                    program = f"import os; os.write(1,{output!r})"
+                    args = (sys.executable, "-c", program)
+                    self.assertFalse(build_module._stream_sass(args, timeout=2))
+                    activity = {"mutation_dispatched": True, "process_groups_gone": True}
+                    self.assertFalse(
+                        namespace["_build_stream_sass"](  # type: ignore[operator]
+                            args, 2, 65_536, 1_024, work_fd, activity,
+                        ),
+                    )
+                    self.assertTrue(activity["process_groups_gone"])
+        finally:
+            os.close(work_fd)
+
+    def test_streaming_sass_bounds_timeout_scan_stderr_window_and_interruption(self) -> None:
+        namespace: dict[str, object] = {
+            "HelperError": TargetError,
+            "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed")),
+        }
+        extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        programs = (
+            ("timeout", "import time; time.sleep(60)", 0.05, 128, 32),
+            (
+                "oversize",
+                "import os\nchunk=b'x'*64\nwhile True: os.write(1,chunk)",
+                2,
+                128,
+                32,
+            ),
+            (
+                "stderr",
+                "import os\nchunk=b'e'*16\nwhile True: os.write(2,chunk)",
+                2,
+                1_024,
+                32,
+            ),
+            (
+                "window",
+                "import os; os.write(1,b'x'*9000+b'\\ncode for sm_121\\n  Function : f\\n  /*0000*/ NOP;\\n')",
+                2,
+                20_000,
+                32,
+            ),
+            (
+                "interrupted",
+                "import os,signal,time; os.kill(os.getppid(),signal.SIGTERM); time.sleep(60)",
+                2,
+                1_024,
+                32,
+            ),
+        )
+        work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for name, program, timeout, scan_limit, stderr_limit in programs:
+                with self.subTest(name=name):
+                    args = (sys.executable, "-c", program)
+                    started = time.monotonic()
+                    self.assertFalse(
+                        build_module._stream_sass(
+                            args,
+                            timeout=timeout,
+                            scan_limit=scan_limit,
+                            stderr_limit=stderr_limit,
+                        ),
+                    )
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    activity = {"mutation_dispatched": True, "process_groups_gone": True}
+                    started = time.monotonic()
+                    self.assertFalse(
+                        namespace["_build_stream_sass"](  # type: ignore[operator]
+                            args, timeout, scan_limit, stderr_limit, work_fd, activity,
+                        ),
+                    )
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    self.assertTrue(activity["process_groups_gone"])
+        finally:
+            os.close(work_fd)
+
+    def test_streaming_sass_kills_and_reaps_descendant_group_after_proof(self) -> None:
+        namespace: dict[str, object] = {
+            "HelperError": TargetError,
+            "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed")),
+        }
+        extension = build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
+        exec(extension, namespace)
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "descendant.pid"
+            program = (
+                "import os,time\n"
+                "child=os.fork()\n"
+                "if child==0: time.sleep(60); os._exit(0)\n"
+                f"fd=os.open({str(pid_path)!r},os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)\n"
+                "os.write(fd,str(child).encode('ascii'));os.close(fd)\n"
+                "os.write(1,b'code for sm_121\\n  Function : kernel\\n  /*0000*/ NOP;\\n')\n"
+                "time.sleep(60)\n"
+            )
+            args = (sys.executable, "-c", program)
+            self.assertTrue(build_module._stream_sass(args, timeout=2))
+            descendant = int(pid_path.read_text(encoding="ascii"))
+            self.assert_process_not_running(descendant)
+            pid_path.unlink()
+            work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                activity = {"mutation_dispatched": True, "process_groups_gone": True}
+                self.assertTrue(
+                    namespace["_build_stream_sass"](  # type: ignore[operator]
+                        args, 2, 65_536, 1_024, work_fd, activity,
+                    ),
+                )
+                descendant = int(pid_path.read_text(encoding="ascii"))
+                self.assert_process_not_running(descendant)
+                self.assertTrue(activity["process_groups_gone"])
+            finally:
+                os.close(work_fd)
+
     def test_remote_post_build_capture_is_process_group_bounded(self) -> None:
-        namespace: dict[str, object] = {"HelperError": Exception, "_fail": lambda code: (_ for _ in ()).throw(TargetError(code))}
+        namespace: dict[str, object] = {"HelperError": Exception, "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed"))}
         extension = build_module.REMOTE_REDACTION_EXTENSION + build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
         exec(extension, namespace)
         work_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
@@ -1626,7 +1938,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             os.close(work_fd)
 
     def test_remote_post_build_captures_inherit_pinned_work_descriptor(self) -> None:
-        namespace: dict[str, object] = {"HelperError": Exception, "_fail": lambda code: (_ for _ in ()).throw(TargetError(code))}
+        namespace: dict[str, object] = {"HelperError": Exception, "_fail": lambda code: (_ for _ in ()).throw(TargetError(code, "target build failed"))}
         extension = build_module.REMOTE_REDACTION_EXTENSION + build_module.REMOTE_BUILD_EXTENSION.split("@register_action('target_build')", 1)[0]
         exec(extension, namespace)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1634,7 +1946,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             binary = root / "engine" / "ds4" / "ds4-server"
             binary.parent.mkdir(parents=True)
             binary.write_text(
-                f"#!{sys.executable}\nprint('ds4-server 1.2.3')\n",
+                f"#!{sys.executable}\nprint('ds4-server v1.2.3')\n",
                 encoding="ascii",
             )
             binary.chmod(0o700)
@@ -1667,11 +1979,30 @@ class DoctorBuildPayloadTests(unittest.TestCase):
                         work_fd,
                         activity,
                     )  # type: ignore[operator]
+                    proof = namespace["_build_stream_sass"](  # type: ignore[operator]
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import os,pathlib,sys,time;"
+                                "pathlib.Path(sys.argv[1]).read_bytes();"
+                                "os.write(1,b'code for sm_121\\n  Function : kernel\\n"
+                                "  /*0000*/ NOP;\\n');time.sleep(60)"
+                            ),
+                            pinned_binary,
+                        ),
+                        10,
+                        65_536,
+                        1_024,
+                        work_fd,
+                        activity,
+                    )
             finally:
                 os.close(work_fd)
-            self.assertEqual(version, (0, b"ds4-server 1.2.3\n", b"", False, False))
+            self.assertEqual(version, (0, b"ds4-server v1.2.3\n", b"", False, False))
             self.assertEqual(sass, (0, b"Function : sm_121\n", b"", False, False))
-            self.assertEqual(inherited, [(work_fd,), (work_fd,)])
+            self.assertTrue(proof)
+            self.assertEqual(inherited, [(work_fd,), (work_fd,), (work_fd,)])
             self.assertTrue(activity["process_groups_gone"])
 
 
@@ -1802,8 +2133,8 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         )
         namespace["_build_file_hash"] = mock.Mock(return_value=("c" * 64, 10))
         namespace["_build_capture"] = mock.Mock(side_effect=[
-            (0, b"ds4-server 1.2.3\n", b"", False, False),
-            (0, b"Function : sm_121\n", b"", False, False),
+            (0, b"ds4-server v1.2.3\n", b"", False, False),
+            (0, b"ELF file sm_121\n", b"", False, False),
         ])
         namespace["target_build"](payload)  # type: ignore[index,operator]
 

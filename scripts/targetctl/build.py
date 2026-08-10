@@ -11,9 +11,13 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import secrets
 import stat
 import tempfile
+import subprocess
+import time
 from typing import Any, Mapping
 
 from .common import TargetError, record_id_for, write_json_atomic
@@ -41,7 +45,15 @@ BUILD_TIMEOUT_SECONDS = 3_600.0
 BUILD_LOCK_LEASE_SECONDS = 7_200
 BUILD_RECONCILE_LEASE_SECONDS = 3_600
 BUILD_RECONCILE_TIMEOUT_SECONDS = 3_300.0
-_VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])")
+_DS4_VERSION_OUTPUT = re.compile(rb"\Ads4-server v([0-9]+(?:\.[0-9]+)*)\n?\Z")
+_LIST_ELF_ARCH = re.compile(rb"(?<![A-Za-z0-9_])sm_121(?![A-Za-z0-9_])")
+_SASS_FUNCTION = re.compile(rb"[ \t]*Function[ \t]+:[ \t]+\S.*\Z")
+_SASS_INSTRUCTION = re.compile(rb"[ \t]*/\*[0-9A-Fa-f]{4,16}\*/[ \t]+\S.*\Z")
+_LIST_ELF_LIMIT_BYTES = 65_536
+_SASS_SCAN_LIMIT_BYTES = 268_435_456
+_SASS_STDERR_LIMIT_BYTES = 16_384
+_SASS_WINDOW_BYTES = 8_192
+_SASS_TIMEOUT_SECONDS = 30.0
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 _REMOTE_RESULT_FIELDS = frozenset({
@@ -50,7 +62,7 @@ _REMOTE_RESULT_FIELDS = frozenset({
     "build_log_sha256", "exit_code", "duration_ns",
 })
 _REMOTE_FAILURE_CLASSES = frozenset({"timeout", "command_failed", "contract_failed"})
-_VERSION_TEXT = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
+_VERSION_TEXT = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
 _REMOTE_REPORT_FIELDS = _REMOTE_RESULT_FIELDS | frozenset({
     "schema_version", "record_type", "attempt_id",
 })
@@ -223,24 +235,246 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
                 pass
 
 
+def _parse_ds4_version(value: bytes) -> str | None:
+    match = _DS4_VERSION_OUTPUT.fullmatch(value)
+    if match is None or len(match.group(1)) > 64:
+        return None
+    try:
+        return match.group(1).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
 def _version(transport: LocalTransport, binary: Path) -> str:
     result = transport.run((str(binary), "--version"), timeout=10.0, cwd="/", env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"})
-    if result.timed_out or result.exit_code != 0 or len(result.stdout) > 16 * 1024 or len(result.stderr) > 16 * 1024:
+    version = None
+    if not result.timed_out and result.exit_code == 0 and not result.stderr and len(result.stdout) <= 16 * 1024:
+        version = _parse_ds4_version(result.stdout)
+    if version is None:
         raise _error("build_binary_invalid")
-    match = _VERSION.search(result.stdout)
-    if match is None:
-        raise _error("build_binary_invalid")
-    return match.group(1).decode("ascii")
+    return version
+
+
+def _sass_line(state: list[int | bool], line: bytes) -> None:
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    stage = int(state[0])
+    if stage == 0:
+        if line == b"code for sm_121":
+            state[0] = 1
+        return
+    if stage == 1:
+        if _SASS_FUNCTION.fullmatch(line) is not None:
+            state[0] = 2
+        elif _SASS_INSTRUCTION.fullmatch(line) is not None or line.startswith(b"code for "):
+            state[1] = True
+        return
+    if stage == 2:
+        if _SASS_INSTRUCTION.fullmatch(line) is not None:
+            state[0] = 3
+        elif _SASS_FUNCTION.fullmatch(line) is not None or line.startswith(b"code for "):
+            state[1] = True
+
+
+def _kill_group(process_group: int | None) -> bool:
+    if not isinstance(process_group, int) or process_group <= 1:
+        return False
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+
+def _group_gone(process_group: int | None) -> bool:
+    if not isinstance(process_group, int) or process_group <= 1:
+        return False
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _stream_sass(
+    args: tuple[str, ...],
+    *,
+    timeout: float = _SASS_TIMEOUT_SECONDS,
+    scan_limit: int = _SASS_SCAN_LIMIT_BYTES,
+    stderr_limit: int = _SASS_STDERR_LIMIT_BYTES,
+    pass_fds: tuple[int, ...] = (),
+) -> bool:
+    """Prove the first sm_121 instruction without retaining cuobjdump output."""
+
+    process: subprocess.Popen[bytes] | None = None
+    process_group: int | None = None
+    wait_attempted = False
+    cleanup_ok = True
+    interrupted = [False]
+    old_handlers: dict[int, Any] = {}
+    old_mask: set[signal.Signals] | None = None
+    blocked = False
+    state: list[int | bool] = [0, False]
+    pending = bytearray()
+    scanned = 0
+    stderr_seen = 0
+
+    def interrupted_handler(_signum: int, _frame: Any) -> None:
+        interrupted[0] = True
+        if process_group is not None:
+            _kill_group(process_group)
+
+    try:
+        watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        for signum in watched:
+            old_handlers[signum] = signal.signal(signum, interrupted_handler)
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        blocked = True
+        try:
+            process = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/",
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                start_new_session=True,
+                pass_fds=pass_fds,
+            )
+        except OSError:
+            return False
+        process_group = process.pid
+        if process_group <= 1:
+            raise _error("build_process_unknown")
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        blocked = False
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            assert process.stdout is not None and process.stderr is not None
+            for stream, is_stdout in ((process.stdout, True), (process.stderr, False)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, is_stdout)
+            finished = False
+            while selector.get_map() or process.poll() is None:
+                if interrupted[0] or bool(state[1]) or scanned > scan_limit or stderr_seen > stderr_limit:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                for key, _ in selector.select(min(0.1, remaining)):
+                    stream_room = (
+                        _SASS_WINDOW_BYTES - len(pending)
+                        if key.data
+                        else stderr_limit - stderr_seen
+                    )
+                    try:
+                        chunk = os.read(
+                            key.fileobj.fileno(),
+                            min(
+                                4096,
+                                max(1, scan_limit - scanned + 1),
+                                max(1, stream_room + 1),
+                            ),
+                        )
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        state[1] = True
+                        break
+                    if not chunk:
+                        try:
+                            selector.unregister(key.fileobj)
+                        except (KeyError, OSError, ValueError):
+                            pass
+                        key.fileobj.close()
+                        continue
+                    scanned += len(chunk)
+                    if key.data:
+                        pending.extend(chunk)
+                        while True:
+                            newline = pending.find(b"\n")
+                            if newline < 0:
+                                break
+                            _sass_line(state, bytes(pending[:newline]))
+                            del pending[:newline + 1]
+                            if int(state[0]) == 3 or bool(state[1]):
+                                break
+                        if len(pending) > _SASS_WINDOW_BYTES:
+                            state[1] = True
+                    else:
+                        stderr_seen += len(chunk)
+                    if int(state[0]) == 3 or bool(state[1]) or scanned > scan_limit or stderr_seen > stderr_limit:
+                        break
+                if int(state[0]) == 3:
+                    finished = True
+                    break
+            if not finished and pending and process.poll() is not None:
+                _sass_line(state, bytes(pending))
+                finished = int(state[0]) == 3 and not bool(state[1])
+            for key in tuple(selector.get_map().values()):
+                try:
+                    selector.unregister(key.fileobj)
+                except (KeyError, OSError, ValueError):
+                    pass
+                try:
+                    key.fileobj.close()
+                except OSError:
+                    pass
+        cleanup_ok = _kill_group(process_group) and cleanup_ok
+        wait_attempted = True
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            cleanup_ok = False
+        cleanup_ok = _group_gone(process_group) and cleanup_ok
+        if not cleanup_ok:
+            raise _error("build_process_unknown")
+        return (
+            finished
+            and not interrupted[0]
+            and not bool(state[1])
+            and scanned <= scan_limit
+            and stderr_seen <= stderr_limit
+        )
+    finally:
+        if process is not None and not wait_attempted:
+            cleanup_ok = _kill_group(process_group) and cleanup_ok
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                cleanup_ok = False
+            cleanup_ok = _group_gone(process_group) and cleanup_ok
+        for signum, handler in old_handlers.items():
+            signal.signal(signum, handler)
+        if blocked and old_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if not cleanup_ok:
+            raise _error("build_process_unknown")
 
 
 def _sass(transport: LocalTransport, binary: Path) -> None:
-    result = transport.run((CUOBJDUMP, "--dump-sass", str(binary)), timeout=30.0, cwd="/", env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"})
-    if result.timed_out or result.exit_code != 0 or len(result.stdout) > MAX_BUILD_OUTPUT_BYTES or len(result.stderr) > MAX_BUILD_OUTPUT_BYTES:
-        raise _error("build_sass_invalid")
-    # cuobjdump labels the architecture in the section header.  Both forms are
-    # accepted because CUDA toolkits differ in their spelling, never an empty
-    # or merely PTX-only result.
-    if not result.stdout.strip() or not re.search(rb"\bsm_121a?\b", result.stdout):
+    result = transport.run((CUOBJDUMP, "--list-elf", str(binary)), timeout=10.0, cwd="/", env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"})
+    if (
+        result.timed_out
+        or result.exit_code != 0
+        or len(result.stdout) + len(result.stderr) > _LIST_ELF_LIMIT_BYTES
+        or _LIST_ELF_ARCH.search(result.stdout) is None
+        or not _stream_sass((CUOBJDUMP, "--dump-sass", str(binary)))
+    ):
         raise _error("build_sass_invalid")
 
 
@@ -318,6 +552,8 @@ def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapsho
             state = {"schema_version": 1, "record_type": "build", "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "build_id": build_id, "binary_sha256": binary_hash, "binary_size": size, "version": version, "sass": "verified", "build_log_sha256": log_hash, "exit_code": exit_code, "duration_ns": max(1, result.duration_ns)}
             write_json_atomic(run_dir / "build.json", state, mode=0o600)
         except TargetError as exc:
+            if exc.code == "build_process_unknown":
+                raise
             return BuildResult("failed", _failure_class(exc.code), build_id=None, binary_sha256=None, **attempted, version=None, binary_size=None, sass=None)
         return BuildResult("succeeded", None, snapshot.snapshot_id, snapshot.applied_tree_hash, build_id, binary_hash, "make-cuda-spark", version, size, "verified", log_hash, exit_code, max(1, result.duration_ns))
 
@@ -617,6 +853,103 @@ def _build_close_registered(selector):
         except (KeyError,OSError,ValueError): pass
         try: key.fileobj.close()
         except OSError: pass
+def _build_ds4_version(value):
+    match=_build_re.fullmatch(rb'ds4-server v([0-9]+(?:\.[0-9]+)*)\n?',value)
+    if match is None or len(match.group(1))>64: return None
+    try: return match.group(1).decode('ascii')
+    except UnicodeDecodeError: return None
+def _build_sass_line(state,line):
+    if line.endswith(b'\r'): line=line[:-1]
+    stage=state[0]
+    function=_build_re.fullmatch(rb'[ \t]*Function[ \t]+:[ \t]+\S.*',line) is not None
+    instruction=_build_re.fullmatch(rb'[ \t]*/\*[0-9A-Fa-f]{4,16}\*/[ \t]+\S.*',line) is not None
+    if stage==0:
+        if line==b'code for sm_121': state[0]=1
+    elif stage==1:
+        if function: state[0]=2
+        elif instruction or line.startswith(b'code for '): state[1]=True
+    elif stage==2:
+        if instruction: state[0]=3
+        elif function or line.startswith(b'code for '): state[1]=True
+def _build_stream_sass(args,timeout,scan_limit,stderr_limit,work_fd,activity):
+    process=None; process_group=None; wait_attempted=False; cleanup_ok=True
+    old_handlers={}; old_mask=None; blocked=False; interrupted=[False]
+    state=[0,False]; pending=bytearray(); scanned=0; stderr_seen=0; finished=False
+    watched=(_build_signal.SIGHUP,_build_signal.SIGINT,_build_signal.SIGTERM)
+    def interrupted_handler(signum,frame):
+        interrupted[0]=True
+        if process_group is not None: _build_kill_group(process_group)
+    try:
+        for signum in watched: old_handlers[signum]=_build_signal.signal(signum,interrupted_handler)
+        old_mask=_build_signal.pthread_sigmask(_build_signal.SIG_BLOCK,watched); blocked=True
+        try:
+            process=_build_subprocess.Popen(args,stdin=_build_subprocess.DEVNULL,stdout=_build_subprocess.PIPE,stderr=_build_subprocess.PIPE,cwd='/',env={'LANG':'C','LC_ALL':'C','PATH':'/usr/bin:/bin'},start_new_session=True,pass_fds=(work_fd,))
+        except OSError: _fail('build_command_failed')
+        activity['process_groups_gone']=False
+        process_group=process.pid
+        if not isinstance(process_group,int) or process_group<=1: _fail('build_process_unknown')
+        _build_signal.pthread_sigmask(_build_signal.SIG_SETMASK,old_mask); blocked=False
+        deadline=_build_time.monotonic()+timeout
+        with _build_selectors.DefaultSelector() as selector:
+            for stream,is_stdout in ((process.stdout,True),(process.stderr,False)):
+                _build_os.set_blocking(stream.fileno(),False); selector.register(stream,_build_selectors.EVENT_READ,is_stdout)
+            while selector.get_map() or process.poll() is None:
+                if interrupted[0] or state[1] or scanned>scan_limit or stderr_seen>stderr_limit: break
+                remaining=deadline-_build_time.monotonic()
+                if remaining<=0: break
+                for key,_ in selector.select(min(0.1,remaining)):
+                    stream_room=8192-len(pending) if key.data else stderr_limit-stderr_seen
+                    try: chunk=_build_os.read(key.fileobj.fileno(),min(4096,max(1,scan_limit-scanned+1),max(1,stream_room+1)))
+                    except BlockingIOError: continue
+                    except OSError: state[1]=True; break
+                    if not chunk:
+                        try: selector.unregister(key.fileobj)
+                        except (KeyError,OSError,ValueError): pass
+                        key.fileobj.close(); continue
+                    scanned+=len(chunk)
+                    if key.data:
+                        pending.extend(chunk)
+                        while True:
+                            newline=pending.find(b'\n')
+                            if newline<0: break
+                            _build_sass_line(state,bytes(pending[:newline])); del pending[:newline+1]
+                            if state[0]==3 or state[1]: break
+                        if len(pending)>8192: state[1]=True
+                    else: stderr_seen+=len(chunk)
+                    if state[0]==3 or state[1] or scanned>scan_limit or stderr_seen>stderr_limit: break
+                if state[0]==3: finished=True; break
+            if not finished and pending and process.poll() is not None:
+                _build_sass_line(state,bytes(pending)); finished=state[0]==3 and not state[1]
+            _build_close_registered(selector)
+        cleanup_ok=_build_kill_group(process_group) and cleanup_ok
+        wait_attempted=True
+        try: process.wait(timeout=1)
+        except _build_subprocess.TimeoutExpired: cleanup_ok=False
+        cleanup_ok=_build_group_gone(process_group) and cleanup_ok
+        if cleanup_ok: activity['process_groups_gone']=True
+        if not cleanup_ok: _fail('build_process_unknown')
+        return finished and not interrupted[0] and not state[1] and scanned<=scan_limit and stderr_seen<=stderr_limit
+    finally:
+        if process is not None and not wait_attempted:
+            cleanup_ok=_build_kill_group(process_group) and cleanup_ok
+            for stream in (process.stdout,process.stderr):
+                if stream is not None and not stream.closed:
+                    try: stream.close()
+                    except OSError: pass
+            wait_attempted=True
+            try: process.wait(timeout=1)
+            except _build_subprocess.TimeoutExpired: cleanup_ok=False
+            cleanup_ok=_build_group_gone(process_group) and cleanup_ok
+            if cleanup_ok: activity['process_groups_gone']=True
+        for signum,handler in old_handlers.items(): _build_signal.signal(signum,handler)
+        if blocked: _build_signal.pthread_sigmask(_build_signal.SIG_SETMASK,old_mask)
+        if not cleanup_ok: _fail('build_process_unknown')
+def _build_sass_probe(binary,work_fd,activity):
+    if not _build_stream_sass(('/usr/local/cuda/bin/cuobjdump','--dump-sass',binary),30,268435456,16384,work_fd,activity): _fail('build_sass_invalid')
+def _build_sass(binary,work_fd,activity):
+    code,stdout,stderr,timed_out,oversize=_build_capture(('/usr/local/cuda/bin/cuobjdump','--list-elf',binary),10,65536,work_fd,activity)
+    if timed_out or oversize or code or _build_re.search(rb'(?<![A-Za-z0-9_])sm_121(?![A-Za-z0-9_])',stdout) is None: _fail('build_sass_invalid')
+    _build_sass_probe(binary,work_fd,activity)
 def _build_capture(args,timeout,limit,work_fd,activity):
     process=None; process_group=None; wait_attempted=False; cleanup_ok=True
     stdout=bytearray(); stderr=bytearray(); timed_out=False; oversize=False
@@ -845,7 +1178,7 @@ def _build_validate_result(data,result,log_hash,work_fd):
     if not isinstance(result,dict) or set(result)!=_BUILD_RESULT_KEYS or result['source_snapshot_id']!=data['snapshot_id'] or result['source_applied_tree_hash']!=data['applied_tree_hash'] or result['command']!='make-cuda-spark' or result['build_log_sha256']!=log_hash or not isinstance(result['duration_ns'],int) or isinstance(result['duration_ns'],bool) or not 1<=result['duration_ns']<=3630000000000: _fail('build_reconcile_invalid')
     if result['status']=='succeeded':
         version=result['version']; size=result['binary_size']
-        if result['failure_class'] is not None or not _build_hex(result['build_id']) or not _build_hex(result['binary_sha256']) or not isinstance(version,str) or not 1<=len(version)<=64 or _build_re.fullmatch(r'[0-9]+(?:\.[0-9]+){0,3}',version) is None or not isinstance(size,int) or isinstance(size,bool) or not 1<=size<=(1<<63)-1 or result['sass']!='verified' or result['exit_code']!=0 or isinstance(result['exit_code'],bool): _fail('build_reconcile_invalid')
+        if result['failure_class'] is not None or not _build_hex(result['build_id']) or not _build_hex(result['binary_sha256']) or not isinstance(version,str) or not 1<=len(version)<=64 or _build_re.fullmatch(r'[0-9]+(?:\.[0-9]+)*',version) is None or not isinstance(size,int) or isinstance(size,bool) or not 1<=size<=(1<<63)-1 or result['sass']!='verified' or result['exit_code']!=0 or isinstance(result['exit_code'],bool): _fail('build_reconcile_invalid')
         binary='/proc/self/fd/%d/engine/ds4/ds4-server'%work_fd
         digest,actual_size=_build_file_hash(binary,True)
         ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':actual_size,'sass':'sm_121'}
@@ -879,11 +1212,9 @@ def target_build(payload):
             try:
                 binary=cwd+'/engine/ds4/ds4-server'; digest,size=_build_file_hash(binary,True)
                 version_code,version_stdout,version_stderr,version_timed_out,version_oversize=_build_capture((binary,'--version'),10,16384,work_fd,activity)
-                version_match=None if version_timed_out or version_oversize or version_code or len(version_stderr)>16384 else _build_re.search(rb'(?<![0-9])([0-9]+(?:\.[0-9]+){0,3})(?![0-9])',version_stdout)
-                if not version_match: _fail('build_binary_invalid')
-                version=version_match.group(1).decode('ascii')
-                sass_code,sass_stdout,sass_stderr,sass_timed_out,sass_oversize=_build_capture(('/usr/local/cuda/bin/cuobjdump','--dump-sass',binary),30,1048576,work_fd,activity)
-                if sass_timed_out or sass_oversize or sass_code or len(sass_stderr)>1048576 or not sass_stdout.strip() or not _build_re.search(rb'\bsm_121a?\b',sass_stdout): _fail('build_sass_invalid')
+                version=None if version_timed_out or version_oversize or version_code or version_stderr else _build_ds4_version(version_stdout)
+                if version is None: _fail('build_binary_invalid')
+                _build_sass(binary,work_fd,activity)
                 ident={'schema_version':1,'source_snapshot_id':data['snapshot_id'],'source_applied_tree_hash':data['applied_tree_hash'],'binary_sha256':digest,'version':version,'binary_size':size,'sass':'sm_121'}
                 build_id=_build_record_id(ident)
                 result=_build_success(data,log_hash,duration_ns,build_id,digest,version,size)
