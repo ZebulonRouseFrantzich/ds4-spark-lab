@@ -327,6 +327,28 @@ class TargetHelperSourceTests(unittest.TestCase):
             self.transport.run_helper("source_verify", request, extension_source=_SOURCE_EXTENSION, allowed_error_codes={"unexpected_entry", "source_lifecycle"})
         self.assertEqual(error.exception.code, "unexpected_entry")
 
+    def test_source_verification_default_rejects_doctor_allowed_build_output(self) -> None:
+        work = Path(self.payload["workdir"])
+        engine = work / "engine" / "ds4"
+        engine.mkdir(parents=True)
+        (engine / "source.c").write_bytes(b"source\n")
+        (engine / "ds4-server").write_bytes(b"generated binary\n")
+        request = {
+            **self.payload,
+            **self.tokens,
+            "entries": ["engine/ds4/source.c"],
+        }
+
+        with self.assertRaises(TargetError) as error:
+            self.transport.run_helper(
+                "source_verify",
+                request,
+                extension_source=_SOURCE_EXTENSION,
+                allowed_error_codes={"unexpected_entry", "source_lifecycle"},
+            )
+
+        self.assertEqual(error.exception.code, "unexpected_entry")
+
     def test_running_or_unknown_lifecycle_refuses_before_transfer(self) -> None:
         run = Path(self.payload["run_dir"])
         (run / "run.json").write_text(

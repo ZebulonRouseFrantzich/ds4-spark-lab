@@ -78,6 +78,8 @@ _LOCAL_BUILD_OUTPUTS = {
         "ds4_eval.o",
         "ds4_agent.o",
         "ds4_web.o",
+        "ds4_test",
+        "ds4_test.o",
     ),
     "cuda/mmq": (
         "ds4_ggml_stubs.o",
@@ -87,6 +89,10 @@ _LOCAL_BUILD_OUTPUTS = {
         "mmid.o",
         "mmvq.o",
         "ds4_repack.o",
+    ),
+    "tests": (
+        "cuda_long_context_smoke",
+        "cuda_long_context_smoke.o",
     ),
 }
 
@@ -210,7 +216,7 @@ def _open_owned_directory(name: str, parent_fd: int) -> int:
 
 
 def _prepare_local_build_outputs(root: Path) -> None:
-    """Unlink every fixed cuda-spark output without writing through aliases."""
+    """Unlink every fixed build or qualification output without following aliases."""
 
     try:
         root_fd = os.open(

@@ -19,6 +19,7 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Any, Iterable, Mapping
 
 from benchmarks.src.ds4bench.artifacts import RESULT_FILE_LIMITS, RESULT_FILES, verify_result
@@ -68,10 +69,9 @@ BASELINE_OPERATIONS = (
     "bench-s3",
     "bench-s5a",
     "bench-s5b",
-    "bench-s1-local-shipped",
-    "bench-s1-local-plain",
+    "bench-s1-local-paired",
 )
-BENCHMARK_OPERATIONS = frozenset({*SMOKE_SCENARIOS, *SCENARIOS, "bench-v1-baseline", "compare"})
+BENCHMARK_OPERATIONS = frozenset({*SMOKE_SCENARIOS, *SCENARIOS, *BASELINE_OPERATIONS, "bench-v1-baseline", "compare"})
 CHUNK_BYTES = 384 * 1024
 MAX_STAGE_FILE_BYTES = 8 * 1024 * 1024
 MAX_STAGE_BYTES = 80 * 1024 * 1024
@@ -422,8 +422,39 @@ def prepare_benchmark(repo_root: str | os.PathLike[str], target: str, scenario_p
     return PreparedBenchmark(root, config, transport, source, build, runtime, root / scenario_path, scenario, normalized, portable, manifest, prompt_hash, _directory(root / RESULT_ROOT, create=True))
 
 
-def _metadata(prepared: PreparedBenchmark, run_id: str, repetition: int) -> dict[str, object]:
+def _metadata(
+    prepared: PreparedBenchmark,
+    run_id: str,
+    repetition: int,
+    *,
+    pairing: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     local = prepared.scenario.vantage == "target_local"
+    resolved_pairing: dict[str, object] = {
+        "pair_id": None,
+        "block_id": None,
+        "order": None,
+        "repetition": repetition,
+    }
+    if pairing is not None:
+        if (
+            set(pairing) != set(resolved_pairing)
+            or pairing.get("order") not in {"A", "B"}
+            or pairing.get("repetition") != repetition
+            or type(repetition) is not int
+            or not 0 <= repetition <= 99
+        ):
+            _fail("benchmark_pairing_invalid")
+        for field in ("pair_id", "block_id"):
+            value = pairing.get(field)
+            if (
+                not isinstance(value, str)
+                or not 1 <= len(value) <= 64
+                or value in {".", ".."}
+                or any(char not in _SAFE for char in value)
+            ):
+                _fail("benchmark_pairing_invalid")
+        resolved_pairing = dict(pairing)
     return {
         "schema_version": 1, "run_id": run_id, "scenario_id": prepared.scenario.id,
         "prompt_manifest_sha256": prepared.prompt_manifest_sha256, "vantage": prepared.scenario.vantage,
@@ -432,7 +463,7 @@ def _metadata(prepared: PreparedBenchmark, run_id: str, repetition: int) -> dict
         "observed_execution": {"status": "unavailable", "reason": "not_exposed_by_frozen_source"},
         "network": {"path": "target_loopback" if local else "direct_private_lan", "http_version": "HTTP/1.1", "tls": False, "link_speed_mbps": None, "mtu_bytes": None},
         "warmup_repetitions": prepared.scenario.warmup_repetitions, "measured_repetitions": prepared.scenario.measured_repetitions,
-        "pairing": {"pair_id": None, "block_id": None, "order": None, "repetition": repetition},
+        "pairing": resolved_pairing,
         "runtime_bundle": {"bundle_sha256": prepared.portable.bundle_sha256, "manifest_sha256": prepared.portable.manifest_sha256, "lock_sha256": prepared.portable.lock_sha256} if local else None,
     }
 
@@ -651,11 +682,18 @@ def _download_target(prepared: PreparedBenchmark, run_id: str) -> Path:
             _remove_local_tree(staging)
 
 
-def run_repetition(prepared: PreparedBenchmark, case_id: str, repetition: int, *, retain: bool) -> Path | None:
+def run_repetition(
+    prepared: PreparedBenchmark,
+    case_id: str,
+    repetition: int,
+    *,
+    retain: bool,
+    pairing: Mapping[str, object] | None = None,
+) -> Path | None:
     from . import workflow
 
     run_id = "b-" + secrets.token_hex(15)
-    metadata = _metadata(prepared, run_id, repetition)
+    metadata = _metadata(prepared, run_id, repetition, pairing=pairing)
     staged = pending = False
     cleanup_result = None
     client_result = promoted = None
@@ -725,6 +763,9 @@ def run_repetition(prepared: PreparedBenchmark, case_id: str, repetition: int, *
             except OSError as error:
                 if cleanup_error is None:
                     cleanup_error = error
+    cooldown_seconds = prepared.scenario.preconditions.cooldown_seconds
+    if cooldown_seconds > 0:
+        time.sleep(cooldown_seconds)
     if cleanup_error is not None:
         if isinstance(cleanup_error, TargetError):
             raise cleanup_error
@@ -762,8 +803,125 @@ def run_scenario(repo_root: str | os.PathLike[str], target: str, operation: str,
     return {"status": "succeeded", "scenario": prepared.scenario.id, "vantage": prepared.scenario.vantage, "artifacts": artifacts, "measured_results": len(artifacts)}
 
 
+def _paired_scenario_basis(
+    prepared: PreparedBenchmark,
+    expected_policy: str,
+) -> tuple[str, dict[str, object]]:
+    normalized = prepared.normalized
+    server = normalized.get("server")
+    description = normalized.get("description")
+    if (
+        prepared.scenario.vantage != "target_local"
+        or not isinstance(description, str)
+        or not isinstance(server, Mapping)
+        or server.get("decode_policy") != expected_policy
+    ):
+        _fail("benchmark_paired_scenario_mismatch")
+    basis = dict(normalized)
+    basis.pop("description")
+    server_basis = dict(server)
+    server_basis.pop("decode_policy")
+    basis["server"] = server_basis
+    return description, basis
+
+
+def _validate_paired_s1_controls(
+    shipped: PreparedBenchmark,
+    plain: PreparedBenchmark,
+) -> None:
+    shipped_description, shipped_basis = _paired_scenario_basis(shipped, "shipped")
+    plain_description, plain_basis = _paired_scenario_basis(plain, "plain")
+    if shipped_description == plain_description or shipped_basis != plain_basis:
+        _fail("benchmark_paired_scenario_mismatch")
+
+
+def _paired_artifact(prepared: PreparedBenchmark, result: Path | None) -> str:
+    if result is None:
+        _fail("benchmark_result_invalid")
+    try:
+        return result.relative_to(prepared.root).as_posix()
+    except ValueError:
+        _fail("benchmark_result_invalid")
+
+
+def run_paired_s1_controls(
+    repo_root: str | os.PathLike[str],
+    target: str,
+) -> dict[str, object]:
+    shipped = prepare_benchmark(
+        repo_root,
+        target,
+        SCENARIOS["bench-s1-local-shipped"],
+    )
+    plain = prepare_benchmark(
+        repo_root,
+        target,
+        SCENARIOS["bench-s1-local-plain"],
+    )
+    _validate_paired_s1_controls(shipped, plain)
+
+    cases = shipped.scenario.schedule.case_matrix
+    for case in cases:
+        for prepared in (shipped, plain):
+            for warmup in range(prepared.scenario.warmup_repetitions):
+                run_repetition(
+                    prepared,
+                    case.id,
+                    warmup % prepared.scenario.measured_repetitions,
+                    retain=False,
+                )
+
+    campaign_id = secrets.token_hex(8)
+    artifacts: dict[str, list[str]] = {"shipped": [], "plain": []}
+    for case_index, case in enumerate(cases):
+        for repetition in range(shipped.scenario.measured_repetitions):
+            pair_id = f"pair-{campaign_id}-{case_index}-{repetition}"
+            block_id = f"block-{campaign_id}-{case_index}-{repetition // 2}"
+            execution = (
+                (("shipped", shipped, "A"), ("plain", plain, "B"))
+                if repetition % 2 == 0
+                else (("plain", plain, "B"), ("shipped", shipped, "A"))
+            )
+            for label, prepared, order in execution:
+                result = run_repetition(
+                    prepared,
+                    case.id,
+                    repetition,
+                    retain=True,
+                    pairing={
+                        "pair_id": pair_id,
+                        "block_id": block_id,
+                        "order": order,
+                        "repetition": repetition,
+                    },
+                )
+                artifacts[label].append(_paired_artifact(prepared, result))
+    return {
+        "status": "succeeded",
+        "scenario": shipped.scenario.id,
+        "vantage": "target_local",
+        "alternation": {
+            "A": "shipped",
+            "B": "plain",
+            "even_repetition": "AB",
+            "odd_repetition": "BA",
+        },
+        "artifacts": artifacts,
+        "measured_results": {
+            "shipped": len(artifacts["shipped"]),
+            "plain": len(artifacts["plain"]),
+        },
+    }
+
+
 def run_baseline(repo_root: str | os.PathLike[str], target: str) -> dict[str, object]:
-    return {"status": "succeeded", "scenarios": [run_scenario(repo_root, target, operation) for operation in BASELINE_OPERATIONS]}
+    scenarios: list[dict[str, object]] = []
+    for operation in BASELINE_OPERATIONS:
+        if operation == "bench-s1-local-paired":
+            scenarios.append(run_paired_s1_controls(repo_root, target))
+        else:
+            scenarios.append(run_scenario(repo_root, target, operation))
+    return {"status": "succeeded", "scenarios": scenarios}
 
 
 def compare(repo_root: str | os.PathLike[str], baseline: str | os.PathLike[str], candidate: str | os.PathLike[str]) -> dict[str, object]:
@@ -797,6 +955,8 @@ def execute_benchmark(repo_root: str | os.PathLike[str], target: str, operation:
         _fail("benchmark_input_invalid")
     if operation == "bench-v1-baseline":
         return run_baseline(repo_root, target)
+    if operation == "bench-s1-local-paired":
+        return run_paired_s1_controls(repo_root, target)
     if operation in SMOKE_SCENARIOS:
         return run_scenario(repo_root, target, operation, smoke=True)
     return run_scenario(repo_root, target, operation)
@@ -1249,4 +1409,4 @@ def benchmark_stage_remove(payload):
   finally: os.close(root)
 '''
 
-__all__ = ["BASELINE_OPERATIONS", "BENCHMARK_HELPER_EXTENSION", "BENCHMARK_OPERATIONS", "MODEL_ID", "SCENARIOS", "SMOKE_SCENARIOS", "compare", "execute_benchmark", "prepare_benchmark", "run_baseline", "run_repetition", "run_scenario", "structured_benchmark_result"]
+__all__ = ["BASELINE_OPERATIONS", "BENCHMARK_HELPER_EXTENSION", "BENCHMARK_OPERATIONS", "MODEL_ID", "SCENARIOS", "SMOKE_SCENARIOS", "compare", "execute_benchmark", "prepare_benchmark", "run_baseline", "run_paired_s1_controls", "run_repetition", "run_scenario", "structured_benchmark_result"]

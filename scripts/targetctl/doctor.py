@@ -29,6 +29,38 @@ _HASH_CHUNK_BYTES = 1024 * 1024
 # A 1 TiB GGUF is far beyond current single-node deployment weights while
 # bounding hostile sparse files before any hashing read is attempted.
 MAX_WEIGHT_BYTES = 1 << 40
+_REMOTE_DOCTOR_BUILD_OUTPUTS = tuple(sorted((
+    "engine/ds4/.ds4-cuda-config.mk",
+    "engine/ds4/ds4",
+    "engine/ds4/ds4-server",
+    "engine/ds4/ds4-bench",
+    "engine/ds4/ds4-eval",
+    "engine/ds4/ds4-agent",
+    "engine/ds4/ds4_weight_server",
+    "engine/ds4/ds4_cli.o",
+    "engine/ds4/linenoise.o",
+    "engine/ds4/ds4.o",
+    "engine/ds4/ds4_distributed.o",
+    "engine/ds4/ds4_cuda.o",
+    "engine/ds4/ds4_server.o",
+    "engine/ds4/ds4_kvstore.o",
+    "engine/ds4/rax.o",
+    "engine/ds4/ds4_bench.o",
+    "engine/ds4/ds4_eval.o",
+    "engine/ds4/ds4_agent.o",
+    "engine/ds4/ds4_web.o",
+    "engine/ds4/cuda/mmq/ds4_ggml_stubs.o",
+    "engine/ds4/cuda/mmq/ds4_mmq.o",
+    "engine/ds4/cuda/mmq/ds4_mmq_d2r.o",
+    "engine/ds4/cuda/mmq/quantize.o",
+    "engine/ds4/cuda/mmq/mmid.o",
+    "engine/ds4/cuda/mmq/mmvq.o",
+    "engine/ds4/cuda/mmq/ds4_repack.o",
+    "engine/ds4/ds4_test",
+    "engine/ds4/ds4_test.o",
+    "engine/ds4/tests/cuda_long_context_smoke",
+    "engine/ds4/tests/cuda_long_context_smoke.o",
+)))
 _VERSION_TEXT = r"[0-9]{1,10}(?:\.[0-9]{1,10}){0,3}"
 _VERSION_VALUE = _VERSION_TEXT.encode("ascii")
 _CUDA_VERSION_VALUE = rb"[0-9]{1,10}(?:\.[0-9]{1,10}){1,3}"
@@ -783,7 +815,8 @@ collect_doctor = doctor
 # The extension has no imports from the synchronized source tree.  It returns
 # the same finite payload validated above: no command output or private path
 # leaves the target.
-REMOTE_DOCTOR_EXTENSION = r'''
+REMOTE_DOCTOR_EXTENSION = (
+    "_DOCTOR_BUILD_OUTPUTS=" + repr(_REMOTE_DOCTOR_BUILD_OUTPUTS) + "\n" + r'''
 import hashlib as _doctor_hashlib, json as _doctor_json, os as _doctor_os, re as _doctor_re, selectors as _doctor_selectors, signal as _doctor_signal, stat as _doctor_stat, subprocess as _doctor_subprocess, time as _doctor_time
 _DOCTOR_SAFE_TOOL_LOCATION=_doctor_re.compile(r'/(?:usr|nix/store)/(?:[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}/)*[A-Za-z0-9][A-Za-z0-9._+@=-]{0,127}\Z')
 _DOCTOR_MAX_TOOL_SYMLINKS=40
@@ -1024,7 +1057,7 @@ def _doctor_source_state(run_fd,data):
     if not isinstance(state,dict) or set(state)!={'schema_version','snapshot_id','applied_tree_hash','dirty'} or state.get('schema_version')!=1 or not isinstance(state.get('snapshot_id'),str) or not isinstance(state.get('applied_tree_hash'),str) or not isinstance(state.get('dirty'),bool) or not hmac.compare_digest(state['snapshot_id'],data['snapshot_id']) or not hmac.compare_digest(state['applied_tree_hash'],data['applied_tree_hash']) or state['dirty'] is not data['dirty']: _fail('doctor_source_mismatch')
     _assert_named_identity(run_fd,'source.json',{'device':item.st_dev,'inode':item.st_ino},'doctor_source_mismatch')
 def _doctor_tree(work_fd,data):
-    names=_source_entries(work_fd,data['entries']); hashed=[]
+    names=_source_entries(work_fd,data['entries'],_DOCTOR_BUILD_OUTPUTS); hashed=[]
     for name in names:
         parent_fd,leaf=_entry_parent(work_fd,name)
         try:
@@ -1085,6 +1118,7 @@ def target_doctor(payload):
     finally:
         _doctor_os.close(work_fd); _doctor_os.close(run_fd)
 '''
+)
 
 
 

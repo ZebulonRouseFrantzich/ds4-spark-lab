@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import base64
 import hashlib
 import json
@@ -28,6 +29,7 @@ from scripts.targetctl.benchmark import (
     execute_benchmark,
     prepare_benchmark,
     run_baseline,
+    run_paired_s1_controls,
     run_repetition,
     run_scenario,
     structured_benchmark_result,
@@ -65,6 +67,7 @@ def _scenario(vantage: str = "controller_lan") -> SimpleNamespace:
         warmup_repetitions=1,
         measured_repetitions=2,
         deadlines=SimpleNamespace(server_seconds=5.0),
+        preconditions=SimpleNamespace(cooldown_seconds=0.0),
         schedule=SimpleNamespace(case_matrix=(SimpleNamespace(id="c1"),)),
     )
 
@@ -324,6 +327,164 @@ class PreflightContracts(unittest.TestCase):
 
 
 class OperationRoutingContracts(unittest.TestCase):
+    def _paired_prepared(
+        self,
+        root: Path,
+    ) -> tuple[PreparedBenchmark, PreparedBenchmark]:
+        shipped = _prepared(root / "shipped", vantage="target_local")
+        plain = _prepared(root / "plain", vantage="target_local")
+        cases = (
+            SimpleNamespace(id="short-c1"),
+            SimpleNamespace(id="medium-c1"),
+        )
+        shipped_scenario = _scenario("target_local")
+        shipped_scenario.measured_repetitions = 5
+        shipped_scenario.schedule.case_matrix = cases
+        plain_scenario = _scenario("target_local")
+        plain_scenario.measured_repetitions = 5
+        plain_scenario.schedule.case_matrix = cases
+        server = dict(shipped.normalized["server"])
+        return (
+            replace(
+                shipped,
+                scenario=shipped_scenario,
+                normalized={
+                    "description": "shipped control",
+                    "server": {**server, "decode_policy": "shipped"},
+                },
+            ),
+            replace(
+                plain,
+                scenario=plain_scenario,
+                normalized={
+                    "description": "plain control",
+                    "server": {**server, "decode_policy": "plain"},
+                },
+            ),
+        )
+
+    def test_paired_controls_run_warmups_then_ab_ba_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            shipped, plain = self._paired_prepared(Path(temporary))
+            calls: list[tuple[str, str, int, bool, object]] = []
+
+            def repeated(prepared, case_id, repetition, *, retain, pairing=None):
+                label = "shipped" if prepared is shipped else "plain"
+                calls.append((label, case_id, repetition, retain, pairing))
+                if not retain:
+                    return None
+                return prepared.result_root / f"{case_id}-r{repetition}"
+
+            with patch(
+                "scripts.targetctl.benchmark.prepare_benchmark",
+                side_effect=(shipped, plain),
+            ), patch(
+                "scripts.targetctl.benchmark.run_repetition",
+                side_effect=repeated,
+            ):
+                result = run_paired_s1_controls(".", "spark")
+
+        expected: list[tuple[str, str, int, bool]] = [
+            ("shipped", "short-c1", 0, False),
+            ("plain", "short-c1", 0, False),
+            ("shipped", "medium-c1", 0, False),
+            ("plain", "medium-c1", 0, False),
+        ]
+        for case_id in ("short-c1", "medium-c1"):
+            for repetition in range(5):
+                labels = (
+                    ("shipped", "plain")
+                    if repetition % 2 == 0
+                    else ("plain", "shipped")
+                )
+                expected.extend(
+                    (label, case_id, repetition, True) for label in labels
+                )
+        self.assertEqual([entry[:4] for entry in calls], expected)
+        self.assertTrue(all(entry[4] is None for entry in calls[:4]))
+
+        measured = calls[4:]
+        for case_id in ("short-c1", "medium-c1"):
+            blocks: dict[int, str] = {}
+            for repetition in range(5):
+                pair = [
+                    entry
+                    for entry in measured
+                    if entry[1:3] == (case_id, repetition)
+                ]
+                self.assertEqual(len(pair), 2)
+                metadata = [entry[4] for entry in pair]
+                self.assertEqual(metadata[0]["pair_id"], metadata[1]["pair_id"])
+                self.assertEqual(metadata[0]["block_id"], metadata[1]["block_id"])
+                self.assertEqual(
+                    {entry[0]: entry[4]["order"] for entry in pair},
+                    {"shipped": "A", "plain": "B"},
+                )
+                self.assertEqual(
+                    {entry[4]["repetition"] for entry in pair},
+                    {repetition},
+                )
+                blocks[repetition] = metadata[0]["block_id"]
+            self.assertEqual(blocks[0], blocks[1])
+            self.assertEqual(blocks[2], blocks[3])
+            self.assertNotEqual(blocks[1], blocks[2])
+
+        expected_artifacts = {
+            label: [
+                f"results/{case_id}-r{repetition}"
+                for case_id in ("short-c1", "medium-c1")
+                for repetition in range(5)
+            ]
+            for label in ("shipped", "plain")
+        }
+        self.assertEqual(result["artifacts"], expected_artifacts)
+        self.assertEqual(
+            result["alternation"],
+            {
+                "A": "shipped",
+                "B": "plain",
+                "even_repetition": "AB",
+                "odd_repetition": "BA",
+            },
+        )
+        self.assertEqual(
+            result["measured_results"],
+            {"shipped": 10, "plain": 10},
+        )
+
+    def test_paired_controls_fail_closed_on_scenario_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            shipped, plain = self._paired_prepared(Path(temporary))
+            plain = replace(
+                plain,
+                normalized={
+                    **plain.normalized,
+                    "measured_repetitions": 6,
+                },
+            )
+            with patch(
+                "scripts.targetctl.benchmark.prepare_benchmark",
+                side_effect=(shipped, plain),
+            ), patch(
+                "scripts.targetctl.benchmark.run_repetition",
+            ) as repeated:
+                with self.assertRaises(TargetError) as caught:
+                    run_paired_s1_controls(".", "spark")
+        self.assertEqual(
+            caught.exception.code,
+            "benchmark_paired_scenario_mismatch",
+        )
+        repeated.assert_not_called()
+
+    def test_paired_operation_routes_to_alternating_runner(self) -> None:
+        with patch(
+            "scripts.targetctl.benchmark.run_paired_s1_controls",
+            return_value={"status": "succeeded"},
+        ) as paired:
+            result = execute_benchmark(".", "spark", "bench-s1-local-paired")
+        paired.assert_called_once_with(".", "spark")
+        self.assertEqual(result, {"status": "succeeded"})
+
     def test_local_smoke_uses_shipped_control_and_first_case_only(self) -> None:
         with patch("scripts.targetctl.benchmark.run_scenario", return_value={"status": "succeeded"}) as dispatched:
             execute_benchmark(".", "spark", "bench-smoke-local")
@@ -349,24 +510,39 @@ class OperationRoutingContracts(unittest.TestCase):
                 self.assertEqual(result["vantage"], "target_local")
                 self.assertEqual(result["artifacts"], [promoted.relative_to(root).as_posix()])
 
-    def test_baseline_runs_primary_family_then_separate_local_controls(self) -> None:
+    def test_baseline_runs_primary_family_then_paired_local_controls(self) -> None:
         expected = (
             "bench-s1",
             "bench-s2",
             "bench-s3",
             "bench-s5a",
             "bench-s5b",
-            "bench-s1-local-shipped",
-            "bench-s1-local-plain",
+            "bench-s1-local-paired",
         )
         self.assertEqual(BASELINE_OPERATIONS, expected)
+        dispatched: list[str] = []
+
+        def scenario(_root, _target, operation):
+            dispatched.append(operation)
+            return {"operation": operation}
+
+        def paired(_root, _target):
+            dispatched.append("bench-s1-local-paired")
+            return {"operation": "bench-s1-local-paired"}
+
         with patch(
             "scripts.targetctl.benchmark.run_scenario",
-            side_effect=lambda _root, _target, operation: {"operation": operation},
-        ) as dispatched:
+            side_effect=scenario,
+        ), patch(
+            "scripts.targetctl.benchmark.run_paired_s1_controls",
+            side_effect=paired,
+        ):
             result = run_baseline(".", "spark")
-        self.assertEqual([item.args[2] for item in dispatched.call_args_list], list(expected))
-        self.assertEqual(result["scenarios"], [{"operation": operation} for operation in expected])
+        self.assertEqual(dispatched, list(expected))
+        self.assertEqual(
+            result["scenarios"],
+            [{"operation": operation} for operation in expected],
+        )
 
 
 
@@ -403,24 +579,51 @@ class WorkflowDispatchContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             prepared = _prepared(Path(temporary), vantage="target_local")
             prepared.result_root.mkdir()
-            with patch("scripts.targetctl.benchmark._stage"), patch("scripts.targetctl.workflow._store_pending_run"), patch("scripts.targetctl.workflow._clear_pending_run"), patch("scripts.targetctl.benchmark.launch_profile_from_scenario", return_value=SimpleNamespace()), patch("scripts.targetctl.benchmark.serve") as launched, patch("scripts.targetctl.benchmark.cleanup", return_value=self._cleanup()), patch("scripts.targetctl.benchmark._remove_report"), patch("scripts.targetctl.benchmark._remove_stage"), patch("scripts.targetctl.benchmark._run_target") as target_client, patch("scripts.targetctl.benchmark._helper", return_value={"status": "verified"}), patch("scripts.targetctl.benchmark._download_target", return_value=prepared.result_root / "b-result"):
-                result = run_repetition(prepared, "c1", 0, retain=True)
+            pairing = {
+                "pair_id": "pair-control-0",
+                "block_id": "block-control-0",
+                "order": "A",
+                "repetition": 0,
+            }
+            with patch("scripts.targetctl.benchmark._stage") as stage, patch("scripts.targetctl.workflow._store_pending_run"), patch("scripts.targetctl.workflow._clear_pending_run"), patch("scripts.targetctl.benchmark.launch_profile_from_scenario", return_value=SimpleNamespace()), patch("scripts.targetctl.benchmark.serve") as launched, patch("scripts.targetctl.benchmark.cleanup", return_value=self._cleanup()), patch("scripts.targetctl.benchmark._remove_report"), patch("scripts.targetctl.benchmark._remove_stage"), patch("scripts.targetctl.benchmark._run_target") as target_client, patch("scripts.targetctl.benchmark._helper", return_value={"status": "verified"}), patch("scripts.targetctl.benchmark._download_target", return_value=prepared.result_root / "b-result"), patch("scripts.targetctl.benchmark.time.sleep") as cooled:
+                result = run_repetition(
+                    prepared,
+                    "c1",
+                    0,
+                    retain=True,
+                    pairing=pairing,
+                )
             self.assertIsNotNone(result)
             self.assertIsNone(launched.call_args.kwargs["bind_host"])
             target_client.assert_called_once()
-            metadata = _metadata(prepared, "b-abc", 0)
+            cooled.assert_not_called()
+            self.assertEqual(stage.call_args.args[2]["pairing"], pairing)
+            metadata = _metadata(prepared, "b-abc", 0, pairing=pairing)
             self.assertEqual(metadata["network"]["path"], "target_loopback")
             self.assertIsNotNone(metadata["runtime_bundle"])
+            self.assertEqual(metadata["pairing"], pairing)
 
-    def test_interruption_always_cleans_server_stage_and_pending_state(self) -> None:
+    def test_failure_cools_down_after_server_report_and_stage_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             prepared = _prepared(Path(temporary), vantage="controller_lan")
-            with patch("scripts.targetctl.benchmark._stage"), patch("scripts.targetctl.workflow._store_pending_run"), patch("scripts.targetctl.workflow._clear_pending_run") as cleared, patch("scripts.targetctl.benchmark.launch_profile_from_scenario", return_value=SimpleNamespace()), patch("scripts.targetctl.benchmark.serve"), patch("scripts.targetctl.benchmark._run_controller", side_effect=KeyboardInterrupt), patch("scripts.targetctl.benchmark.cleanup", return_value=self._cleanup()) as stopped, patch("scripts.targetctl.benchmark._remove_report"), patch("scripts.targetctl.benchmark._remove_stage") as removed:
-                with self.assertRaises(KeyboardInterrupt):
+            prepared.scenario.preconditions.cooldown_seconds = 2.5
+            events: list[str] = []
+
+            def event(name):
+                def record(*_args, **_kwargs):
+                    events.append(name)
+                    if name == "server":
+                        return self._cleanup()
+                    return None
+
+                return record
+
+            with patch("scripts.targetctl.benchmark._stage"), patch("scripts.targetctl.workflow._store_pending_run"), patch("scripts.targetctl.workflow._clear_pending_run"), patch("scripts.targetctl.benchmark.launch_profile_from_scenario", return_value=SimpleNamespace()), patch("scripts.targetctl.benchmark.serve"), patch("scripts.targetctl.benchmark._run_controller", side_effect=RuntimeError("client failed")), patch("scripts.targetctl.benchmark.cleanup", side_effect=event("server")), patch("scripts.targetctl.benchmark._remove_report", side_effect=event("report")), patch("scripts.targetctl.benchmark._remove_stage", side_effect=event("stage")), patch("scripts.targetctl.benchmark.time.sleep", side_effect=event("cooldown")) as cooled:
+                with self.assertRaises(TargetError) as caught:
                     run_repetition(prepared, "c1", 0, retain=True)
-            stopped.assert_called_once()
-            removed.assert_called_once()
-            cleared.assert_called_once()
+            self.assertEqual(caught.exception.code, "benchmark_execution_failed")
+            self.assertEqual(events, ["server", "report", "stage", "cooldown"])
+            cooled.assert_called_once_with(2.5)
 
     def test_scenario_failure_is_fixed_and_private_safe(self) -> None:
         canary = "/private/scenario/location"

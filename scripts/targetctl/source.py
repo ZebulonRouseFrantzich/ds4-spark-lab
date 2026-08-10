@@ -691,19 +691,71 @@ def _source_relative(value):
         _fail("invalid_entries")
     return value
 
-def _source_entries(root_fd, entries):
+def _source_entries(root_fd, entries, allowed_extra_files=()):
     if not isinstance(entries, list) or len(entries) > MAX_ENTRIES:
         _fail("invalid_entries")
     names = [_source_relative(item) for item in entries]
     if names != sorted(set(names)):
         _fail("invalid_entries")
+    if not isinstance(allowed_extra_files, (list, tuple)) or len(allowed_extra_files) > MAX_ENTRIES:
+        _fail("invalid_entries")
+    extra_names = [_source_relative(item) for item in allowed_extra_files]
+    if extra_names != sorted(set(extra_names)):
+        _fail("invalid_entries")
     expected = set(names)
+    allowed_extras = set(extra_names)
+    if expected & allowed_extras:
+        _fail("invalid_entries")
     prefixes = set()
     for name in names:
         bits = name.split("/")[:-1]
         for index in range(1, len(bits) + 1):
             prefixes.add("/".join(bits[:index]))
     count = [0]
+    def validate_extra(fd, name, scanned):
+        if (not stat.S_ISREG(scanned.st_mode) or
+                scanned.st_uid != os.geteuid() or scanned.st_nlink != 1):
+            _fail("unsafe_entry")
+        try:
+            extra_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=fd,
+            )
+        except OSError:
+            _fail("unsafe_entry")
+        try:
+            opened = os.fstat(extra_fd)
+            scanned_pin = (
+                scanned.st_dev, scanned.st_ino, scanned.st_mode,
+                scanned.st_uid, scanned.st_nlink,
+            )
+            opened_pin = (
+                opened.st_dev, opened.st_ino, opened.st_mode,
+                opened.st_uid, opened.st_nlink,
+            )
+            if (not stat.S_ISREG(opened.st_mode) or
+                    opened.st_uid != os.geteuid() or opened.st_nlink != 1 or
+                    opened_pin != scanned_pin):
+                _fail("unsafe_entry")
+            after = os.fstat(extra_fd)
+            named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            for current in (after, named):
+                current_pin = (
+                    current.st_dev, current.st_ino, current.st_mode,
+                    current.st_uid, current.st_nlink,
+                )
+                if (not stat.S_ISREG(current.st_mode) or
+                        current.st_uid != os.geteuid() or
+                        current.st_nlink != 1 or current_pin != opened_pin):
+                    _fail("unsafe_entry")
+        except HelperError:
+            raise
+        except OSError:
+            _fail("unsafe_entry")
+        finally:
+            os.close(extra_fd)
     def visit(fd, prefix=""):
         try:
             scan_fd = os.dup(fd)
@@ -719,7 +771,9 @@ def _source_entries(root_fd, entries):
                         if not stat.S_ISREG(item.st_mode):
                             _fail("unsafe_entry")
                         continue
-                    if stat.S_ISDIR(item.st_mode):
+                    if relative in allowed_extras:
+                        validate_extra(fd, name, item)
+                    elif stat.S_ISDIR(item.st_mode):
                         if relative not in prefixes:
                             _fail("unexpected_entry")
                         next_fd = _open_directory(fd, name)

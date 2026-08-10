@@ -690,6 +690,190 @@ class DoctorBuildPayloadTests(unittest.TestCase):
         self.assertTrue(callable(namespace["_doctor_cmd"]))  # type: ignore[index]
         self.assertEqual(namespace["_doctor_version"]("nvcc", b"Copyright 2005-2025\nCuda compilation tools, release 12.8, V12.8.93\n"), "12.8")  # type: ignore[index,operator]
 
+    def test_post_build_doctor_tree_accepts_complete_fixed_output_inventory(self) -> None:
+        cleanup_outputs = tuple(sorted(
+            (
+                f"engine/ds4/{name}"
+                if parent == "."
+                else f"engine/ds4/{parent}/{name}"
+            )
+            for parent, names in build_module._LOCAL_BUILD_OUTPUTS.items()
+            for name in names
+        ))
+        self.assertEqual(
+            doctor_module._REMOTE_DOCTOR_BUILD_OUTPUTS,
+            cleanup_outputs,
+        )
+
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(
+            helper_source(
+                doctor_module._SOURCE_EXTENSION
+                + doctor_module.REMOTE_DOCTOR_EXTENSION
+            ),
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            sources = {
+                "engine/ds4/cuda/mmq/source.c": b"int mmq_source;\n",
+                "engine/ds4/source.c": b"int source;\n",
+                "engine/ds4/tests/source.c": b"int test_source;\n",
+            }
+            for source_name, source_content in sources.items():
+                source = work / source_name
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(source_content)
+            for relative in doctor_module._REMOTE_DOCTOR_BUILD_OUTPUTS:
+                output = work / relative
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(relative.encode("ascii"))
+
+            applied_hash = namespace["_frame_hash"]([  # type: ignore[index,operator]
+                (
+                    source_name,
+                    "file",
+                    0,
+                    len(source_content),
+                    hashlib.sha256(source_content).digest(),
+                )
+                for source_name, source_content in sorted(sources.items())
+            ])
+            work_fd = os.open(
+                work, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                namespace["_doctor_tree"](  # type: ignore[index,operator]
+                    work_fd,
+                    {
+                        "entries": sorted(sources),
+                        "applied_tree_hash": applied_hash,
+                    },
+                )
+            finally:
+                os.close(work_fd)
+
+    def test_post_build_doctor_tree_rejects_unlisted_extra(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(
+            helper_source(
+                doctor_module._SOURCE_EXTENSION
+                + doctor_module.REMOTE_DOCTOR_EXTENSION
+            ),
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            source_name = "engine/ds4/source.c"
+            source = work / source_name
+            source.parent.mkdir(parents=True)
+            source_content = b"int source;\n"
+            source.write_bytes(source_content)
+            (source.parent / "unlisted-build-output").write_bytes(b"extra")
+            applied_hash = namespace["_frame_hash"]([  # type: ignore[index,operator]
+                (
+                    source_name,
+                    "file",
+                    0,
+                    len(source_content),
+                    hashlib.sha256(source_content).digest(),
+                ),
+            ])
+            work_fd = os.open(
+                work, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                with self.assertRaises(namespace["HelperError"]) as error:  # type: ignore[arg-type,index]
+                    namespace["_doctor_tree"](  # type: ignore[index,operator]
+                        work_fd,
+                        {
+                            "entries": [source_name],
+                            "applied_tree_hash": applied_hash,
+                        },
+                    )
+                self.assertEqual(error.exception.code, "unexpected_entry")
+            finally:
+                os.close(work_fd)
+
+    def test_allowed_extra_requires_safe_regular_single_link_owned_file(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module._SOURCE_EXTENSION), namespace)
+        helper_error = namespace["HelperError"]
+
+        for shape in ("symlink", "hardlink", "fifo", "directory", "wrong_owner"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                output = work / "allowed-output"
+                canary = work.parent / f"{work.name}-canary"
+                if shape == "symlink":
+                    canary.write_bytes(b"canary")
+                    output.symlink_to(canary)
+                elif shape == "hardlink":
+                    canary.write_bytes(b"canary")
+                    os.link(canary, output)
+                elif shape == "fifo":
+                    os.mkfifo(output)
+                elif shape == "directory":
+                    output.mkdir()
+                else:
+                    output.write_bytes(b"owned by the real euid")
+
+                work_fd = os.open(
+                    work, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                )
+                try:
+                    if shape == "wrong_owner":
+                        with mock.patch.object(
+                            os, "geteuid", return_value=os.geteuid() + 1,
+                        ):
+                            with self.assertRaises(helper_error) as error:
+                                namespace["_source_entries"](  # type: ignore[index,operator]
+                                    work_fd, [], ["allowed-output"],
+                                )
+                    else:
+                        with self.assertRaises(helper_error) as error:
+                            namespace["_source_entries"](  # type: ignore[index,operator]
+                                work_fd, [], ["allowed-output"],
+                            )
+                    self.assertEqual(error.exception.code, "unsafe_entry")
+                finally:
+                    os.close(work_fd)
+                    try:
+                        canary.unlink()
+                    except FileNotFoundError:
+                        pass
+
+    def test_allowed_extra_inventory_is_validated_before_enumeration(self) -> None:
+        namespace: dict[str, object] = {"__name__": "targetctl_helper"}
+        exec(helper_source(doctor_module._SOURCE_EXTENSION), namespace)
+        helper_error = namespace["HelperError"]
+        with tempfile.TemporaryDirectory() as temporary:
+            work_fd = os.open(
+                temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                invalid = (
+                    None,
+                    "allowed-output",
+                    ["../allowed-output"],
+                    ["second", "first"],
+                    ["allowed-output", "allowed-output"],
+                )
+                for allowed in invalid:
+                    with self.subTest(allowed=allowed):
+                        with self.assertRaises(helper_error) as error:
+                            namespace["_source_entries"](  # type: ignore[index,operator]
+                                work_fd, [], allowed,
+                            )
+                        self.assertEqual(error.exception.code, "invalid_entries")
+                with self.assertRaises(helper_error) as overlap:
+                    namespace["_source_entries"](  # type: ignore[index,operator]
+                        work_fd, ["allowed-output"], ["allowed-output"],
+                    )
+                self.assertEqual(overlap.exception.code, "invalid_entries")
+            finally:
+                os.close(work_fd)
+
     def test_embedded_nix_identity_matches_controller_resolved_path_rules(self) -> None:
         namespace: dict[str, object] = {"__name__": "targetctl_helper"}
         exec(helper_source(doctor_module.REMOTE_DOCTOR_EXTENSION), namespace)
@@ -1051,16 +1235,29 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             root = Path(temporary) / "source"
             engine = root / "engine" / "ds4"
             (engine / "cuda" / "mmq").mkdir(parents=True)
+            (engine / "tests").mkdir()
             canary = Path(temporary) / "outside-canary"
             content = b"outside data must survive"
             canary.write_bytes(content)
             canary.chmod(0o600)
             output = engine / ".ds4-cuda-config.mk"
             os.link(canary, output)
+            qualification_outputs = (
+                engine / "ds4_test",
+                engine / "ds4_test.o",
+                engine / "tests" / "cuda_long_context_smoke",
+                engine / "tests" / "cuda_long_context_smoke.o",
+            )
+            for qualification_output in qualification_outputs:
+                qualification_output.write_bytes(b"qualification output")
 
             build_module._prepare_local_build_outputs(root)
 
             self.assertFalse(output.exists())
+            self.assertTrue(
+                all(not qualification_output.exists()
+                    for qualification_output in qualification_outputs),
+            )
             self.assertEqual(canary.read_bytes(), content)
             self.assertEqual(canary.stat().st_nlink, 1)
 
