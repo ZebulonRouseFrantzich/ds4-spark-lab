@@ -278,7 +278,7 @@ def _open_regular(name: str, *, dir_fd: int, flags: int = os.O_RDONLY) -> tuple[
         item = os.fstat(fd)
     except OSError:
         _fail("unsafe_state")
-    if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600:
+    if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or item.st_nlink != 1:
         os.close(fd)
         _fail("unsafe_state")
     return fd, item
@@ -575,6 +575,7 @@ def _lock_state(lock_fd: int) -> dict[str, Any]:
 def _install_lock(root_fd: int, state: dict[str, Any]) -> bool:
     name = ".targetctl-lock-stage-" + secrets.token_hex(16)
     data = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("ascii")
+    stage_identity = None
     try:
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=root_fd)
         try:
@@ -585,13 +586,23 @@ def _install_lock(root_fd: int, state: dict[str, Any]) -> bool:
                     _fail("unsafe_lock")
                 view = view[written:]
             os.fsync(fd)
+            stage_identity = _identity(fd)
         finally:
             os.close(fd)
         try:
             os.link(name, LOCK_NAME, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
         except FileExistsError:
             return False
-        os.unlink(name, dir_fd=root_fd)
+        try:
+            os.unlink(name, dir_fd=root_fd)
+        except FileNotFoundError:
+            lock_fd, _ = _open_regular(LOCK_NAME, dir_fd=root_fd)
+            try:
+                if _identity(lock_fd) != stage_identity or _lock_state(lock_fd) != state:
+                    _fail("unsafe_lock")
+                _assert_named_identity(root_fd, LOCK_NAME, stage_identity, "unsafe_lock")
+            finally:
+                os.close(lock_fd)
         os.fsync(root_fd)
         return True
     except HelperError:
@@ -685,28 +696,47 @@ def _cleanup_stale_lock_stages(root_fd: int) -> int:
         _fail("unsafe_lock")
     cleaned = 0
     for name in candidates:
-        try:
-            item = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        except OSError:
-            continue
-        if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or item.st_nlink != 1:
-            continue
+        fd = None
         try:
             fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
-            identity = _identity(fd)
-            current = os.fstat(fd)
-            if (current.st_dev, current.st_ino, current.st_nlink) != (item.st_dev, item.st_ino, 1):
-                os.close(fd)
+            item = os.fstat(fd)
+            if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600:
                 continue
-            _assert_named_identity(root_fd, name, identity, "unsafe_lock")
+            identity = _identity(fd)
+            if item.st_nlink == 1:
+                _assert_named_identity(root_fd, name, identity, "unsafe_lock")
+            elif item.st_nlink == 2:
+                try:
+                    lock_item = os.stat(LOCK_NAME, dir_fd=root_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if (
+                    not stat.S_ISREG(lock_item.st_mode)
+                    or lock_item.st_uid != os.geteuid()
+                    or stat.S_IMODE(lock_item.st_mode) != 0o600
+                    or (lock_item.st_dev, lock_item.st_ino, lock_item.st_nlink)
+                    != (item.st_dev, item.st_ino, 2)
+                ):
+                    continue
+                _lock_state(fd)
+                _assert_named_identity(root_fd, name, identity, "unsafe_lock")
+                _assert_named_identity(root_fd, LOCK_NAME, identity, "unsafe_lock")
+            else:
+                continue
             os.unlink(name, dir_fd=root_fd)
-            os.close(fd)
             cleaned += 1
+        except HelperError:
+            raise
         except OSError:
             continue
+        finally:
+            if fd is not None:
+                os.close(fd)
     if cleaned:
-        try: os.fsync(root_fd)
-        except OSError: _fail("unsafe_lock")
+        try:
+            os.fsync(root_fd)
+        except OSError:
+            _fail("unsafe_lock")
     return cleaned
 
 

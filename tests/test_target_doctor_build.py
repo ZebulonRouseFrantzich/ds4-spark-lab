@@ -934,7 +934,7 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             )
             failure = CommandResult(2, False, 17, b"compiler: /private/build-", b"canary\x1b[31m failed\n")
             timeout = CommandResult(-1, True, 19, b"timeout /private/build-", b"canary\n")
-            with mock.patch.object(build_module, "verify_applied_tree"), mock.patch.object(build_module, "_sha256_regular", return_value=("c" * 64, 10)), mock.patch.object(build_module, "_version", return_value="1.2.3"), mock.patch.object(build_module, "_sass"):
+            with mock.patch.object(build_module, "verify_applied_tree", return_value=snapshot.applied_tree_hash), mock.patch.object(build_module, "_prepare_local_build_outputs"), mock.patch.object(build_module, "_sha256_regular", return_value=("c" * 64, 10)), mock.patch.object(build_module, "_version", return_value="1.2.3"), mock.patch.object(build_module, "_sass"):
                 transport = mock.Mock()
                 transport.run.return_value = failure
                 nonzero = build_module._build_local(config, transport, snapshot, jobs=1)
@@ -956,6 +956,113 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             preflight = build_module._failed("build_jobs_invalid", snapshot)
             self.assertEqual((preflight.command, preflight.build_log_sha256, preflight.exit_code, preflight.duration_ns), (None, None, None, None))
             self.assertEqual((preflight.source_snapshot_id, preflight.source_applied_tree_hash), ("a" * 64, "b" * 64))
+
+    def test_local_post_build_source_change_invalidates_active_success(self) -> None:
+        snapshot = SimpleNamespace(
+            snapshot_id="a" * 64,
+            applied_tree_hash="b" * 64,
+            entries=("inventoried.c",),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            run_dir = Path(temporary) / "run"
+            root.mkdir()
+            run_dir.mkdir(mode=0o700)
+            source = root / "inventoried.c"
+            source.write_bytes(b"original source\n")
+            active_path = run_dir / "build.json"
+            active_path.write_bytes(b"older active build")
+            config = SimpleNamespace(
+                source_root=str(root),
+                local_run_dir=run_dir,
+                model_path=None,
+                drafter_path=None,
+            )
+            observations: list[bytes] = []
+
+            def verify(root_path: Path, checked: object) -> str:
+                self.assertEqual(root_path, root)
+                self.assertIs(checked, snapshot)
+                content = source.read_bytes()
+                observations.append(content)
+                if content != b"original source\n":
+                    raise TargetError(
+                        "applied_hash_mismatch",
+                        "source contents no longer match the snapshot",
+                    )
+                return snapshot.applied_tree_hash
+
+            def mutate_during_sass(_: object, __: Path) -> None:
+                source.write_bytes(b"changed during post-check\n")
+
+            transport = mock.Mock()
+            transport.run.return_value = CommandResult(
+                0, False, 23, b"successful build\n", b"",
+            )
+            with (
+                mock.patch.object(
+                    build_module, "verify_applied_tree", side_effect=verify,
+                ) as verify_mock,
+                mock.patch.object(build_module, "_prepare_local_build_outputs"),
+                mock.patch.object(
+                    build_module, "_sha256_regular", return_value=("c" * 64, 10),
+                ),
+                mock.patch.object(
+                    build_module, "_version", return_value="1.2.3",
+                ),
+                mock.patch.object(
+                    build_module, "_sass", side_effect=mutate_during_sass,
+                ),
+            ):
+                result = build_module._build_local(
+                    config, transport, snapshot, jobs=1,
+                )
+
+            self.assertEqual(verify_mock.call_count, 3)
+            self.assertEqual(
+                observations,
+                [
+                    b"original source\n",
+                    b"original source\n",
+                    b"changed during post-check\n",
+                ],
+            )
+            self.assertEqual(
+                (result.status, result.failure_class, result.exit_code),
+                ("failed", "contract_failed", 0),
+            )
+            self.assertTrue(
+                all(
+                    getattr(result, field) is None
+                    for field in (
+                        "build_id", "binary_sha256", "version", "binary_size", "sass",
+                    )
+                )
+            )
+            self.assertFalse(active_path.exists())
+            self.assertEqual(
+                result.build_log_sha256,
+                hashlib.sha256((run_dir / "build.log").read_bytes()).hexdigest(),
+            )
+
+    def test_local_build_output_cleanup_unlinks_hardlink_without_writing_canary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            engine = root / "engine" / "ds4"
+            (engine / "cuda" / "mmq").mkdir(parents=True)
+            canary = Path(temporary) / "outside-canary"
+            content = b"outside data must survive"
+            canary.write_bytes(content)
+            canary.chmod(0o600)
+            output = engine / ".ds4-cuda-config.mk"
+            os.link(canary, output)
+
+            build_module._prepare_local_build_outputs(root)
+
+            self.assertFalse(output.exists())
+            self.assertEqual(canary.read_bytes(), content)
+            self.assertEqual(canary.stat().st_nlink, 1)
+
 
     def test_remote_build_extension_registers_with_complete_helper_source(self) -> None:
         extension_source = (
@@ -1444,6 +1551,129 @@ class DoctorBuildPayloadTests(unittest.TestCase):
             recovered = namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
             self.assertEqual(recovered["lease_state"], "released")  # type: ignore[index]
             self.assertFalse(lock_path.exists())
+
+
+    def test_target_action_persists_post_build_source_mismatch_without_active_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+            source = Path(roots["workdir"]) / "inventoried.c"
+            source.write_bytes(b"original source\n")
+            payload["entries"] = ["inventoried.c"]
+            work_fd = os.open(
+                roots["workdir"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                payload["applied_tree_hash"] = namespace["_build_applied_hash"](  # type: ignore[index,operator]
+                    work_fd, payload["entries"], True,
+                )
+            finally:
+                os.close(work_fd)
+
+            run_dir = Path(roots["run_dir"])
+            active_path = run_dir / "build.json"
+            active_path.write_bytes(b"older active build")
+            os.chmod(active_path, 0o600)
+            namespace["_build_make"] = mock.Mock(
+                return_value=(0, 17, b"successful build\n", False, False, False),
+            )
+            namespace["_build_file_hash"] = mock.Mock(
+                return_value=("c" * 64, 10),
+            )
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
+            ])
+
+            def mutate_after_sass(*_: object) -> None:
+                source.write_bytes(b"changed during sass\n")
+
+            namespace["_build_sass_probe"].side_effect = mutate_after_sass  # type: ignore[index,union-attr]
+            direct = namespace["target_build"](payload)  # type: ignore[index,operator]
+
+            self.assertEqual(
+                (direct["status"], direct["failure_class"], direct["exit_code"]),  # type: ignore[index]
+                ("failed", "contract_failed", 0),
+            )
+            self.assertTrue(
+                all(
+                    direct[key] is None  # type: ignore[index]
+                    for key in ("build_id", "binary_sha256", "version", "binary_size", "sass")
+                )
+            )
+            self.assertFalse(active_path.exists())
+            report_name, attempt_log_name, commit_name = namespace["_build_attempt_names"](  # type: ignore[index,operator]
+                payload["attempt_id"],
+            )
+            report_path = run_dir / report_name
+            attempt_log_path = run_dir / attempt_log_name
+            commit_path = run_dir / commit_name
+            report = json.loads(report_path.read_text(encoding="ascii"))
+            self.assertEqual(
+                {key: report[key] for key in namespace["_BUILD_RESULT_KEYS"]},  # type: ignore[index]
+                direct,
+            )
+            self.assertEqual(report["attempt_id"], payload["attempt_id"])
+            commit = json.loads(commit_path.read_text(encoding="ascii"))
+            self.assertEqual(
+                commit["attempt_report_sha256"],
+                hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                commit["attempt_log_sha256"],
+                hashlib.sha256(attempt_log_path.read_bytes()).hexdigest(),
+            )
+            self.assertFalse(
+                (run_dir / namespace["LOCK_NAME"]).exists(),  # type: ignore[index]
+            )
+
+            reconciled = namespace["target_build_reconcile"](payload)  # type: ignore[index,operator]
+            self.assertEqual(
+                {key: reconciled["report"][key] for key in namespace["_BUILD_RESULT_KEYS"]},  # type: ignore[index]
+                direct,
+            )
+            self.assertEqual(reconciled["lease_state"], "released")  # type: ignore[index]
+            self.assertFalse(active_path.exists())
+
+    def test_target_action_rechecks_lease_after_post_build_source_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            namespace, payload, roots = self._remote_action_fixture(Path(temporary))
+            namespace["_build_make"] = mock.Mock(
+                return_value=(0, 17, b"successful build\n", False, False, False),
+            )
+            namespace["_build_file_hash"] = mock.Mock(
+                return_value=("c" * 64, 10),
+            )
+            namespace["_build_capture"] = mock.Mock(side_effect=[
+                (0, b"ds4-server v1.2.3\n", b"", False, False),
+                (0, b".sm_121a.cubin\n", b"", False, False),
+            ])
+            lock_path = Path(roots["run_dir"]) / namespace["LOCK_NAME"]  # type: ignore[index]
+            applied_hash = namespace["_build_applied_hash"]  # type: ignore[index]
+            calls = 0
+
+            def expire_after_hash(*args: object) -> object:
+                nonlocal calls
+                value = applied_hash(*args)  # type: ignore[operator]
+                calls += 1
+                if calls == 2:
+                    state = json.loads(lock_path.read_text(encoding="ascii"))
+                    state["deadline_monotonic_ns"] = time.monotonic_ns() - 1
+                    lock_path.write_text(json.dumps(state), encoding="ascii")
+                    lock_path.chmod(0o600)
+                return value
+
+            namespace["_build_applied_hash"] = expire_after_hash
+            report_name, attempt_log_name, commit_name = namespace["_build_attempt_names"](  # type: ignore[index,operator]
+                payload["attempt_id"],
+            )
+            with self.assertRaises(namespace["HelperError"]) as raised:  # type: ignore[arg-type,index]
+                namespace["target_build"](payload)  # type: ignore[index,operator]
+
+            self.assertEqual(raised.exception.code, "lock_token_mismatch")
+            self.assertEqual(calls, 2)
+            run_dir = Path(roots["run_dir"])
+            for name in (report_name, attempt_log_name, commit_name, "build.json"):
+                self.assertFalse((run_dir / name).exists())
 
     def test_target_action_pre_spawn_failure_persists_evidence_and_releases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

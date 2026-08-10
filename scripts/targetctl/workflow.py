@@ -603,12 +603,12 @@ def _time() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _stored_log_identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+def _stored_log_identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int, int]:
     """Return the pathname/file identity that must remain stable during promotion."""
-    return (item.st_mode, item.st_uid, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+    return (item.st_mode, item.st_uid, item.st_nlink, item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
 
 
-def _read_stored_log_snapshot(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> tuple[bytes, tuple[int, int, int, int, int, int, int]]:
+def _read_stored_log_snapshot(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> tuple[bytes, tuple[int, int, int, int, int, int, int, int]]:
     """Read a stored log and retain its pinned identity for a later stability check."""
     try:
         before = os.lstat(path)
@@ -619,6 +619,7 @@ def _read_stored_log_snapshot(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> tu
         or not stat.S_ISREG(before.st_mode)
         or before.st_uid != os.getuid()
         or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1
         or before.st_size > max_bytes
     ):
         _fail("artifact_log_unavailable", "sanitized stored report is unavailable")
@@ -654,7 +655,7 @@ def _read_stored_log(path: Path, max_bytes: int = MAX_TEXT_BYTES) -> bytes:
     return _read_stored_log_snapshot(path, max_bytes)[0]
 
 
-def _assert_stored_log_unchanged(path: Path, expected: tuple[int, int, int, int, int, int, int]) -> None:
+def _assert_stored_log_unchanged(path: Path, expected: tuple[int, int, int, int, int, int, int, int]) -> None:
     """Reject a live report that changed while its controller copy was promoted."""
     try:
         current = os.lstat(path)

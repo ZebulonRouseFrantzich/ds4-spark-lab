@@ -121,6 +121,74 @@ class RemoteRootTests(unittest.TestCase):
         )
         self.assertIn("lock_token", remote.acquire_lock({"run_dir": payload["run_dir"], "run_token": run_token, "lease_seconds": 60}))
 
+    def test_interrupted_lock_install_collapses_verified_stage_pair(self) -> None:
+        payload, state = initialized(self.tmp_path)
+        run = Path(payload["run_dir"])
+        run_token = state["run"]["token"]
+        stage = run / (".targetctl-lock-stage-" + "a" * 32)
+        stage.write_text(
+            json.dumps(
+                {
+                    "boot_id": remote._boot_id(),
+                    "deadline_monotonic_ns": time.monotonic_ns() - 1,
+                    "token": "b" * 64,
+                }
+            ),
+            encoding="ascii",
+        )
+        stage.chmod(0o600)
+        os.link(stage, run / remote.LOCK_NAME)
+        self.assertEqual(stage.stat().st_nlink, 2)
+
+        recovered = remote.acquire_lock(
+            {
+                "run_dir": payload["run_dir"],
+                "run_token": run_token,
+                "lease_seconds": 60,
+            }
+        )
+
+        self.assertTrue(recovered["reclaimed"])
+        self.assertEqual(recovered["stale_lock_stages_cleaned"], 1)
+        self.assertFalse(stage.exists())
+        self.assertEqual((run / remote.LOCK_NAME).stat().st_nlink, 1)
+        remote.release_lock(
+            {
+                "run_dir": payload["run_dir"],
+                "run_token": run_token,
+                "lock_token": recovered["lock_token"],
+            }
+        )
+
+
+    def test_live_lock_install_accepts_verified_concurrent_stage_cleanup(self) -> None:
+        payload, state = initialized(self.tmp_path)
+        run = Path(payload["run_dir"])
+        root_fd = remote._open_root(str(run))
+        self.addCleanup(os.close, root_fd)
+        lock_state = {
+            "boot_id": remote._boot_id(),
+            "deadline_monotonic_ns": time.monotonic_ns() + 60_000_000_000,
+            "token": "c" * 64,
+        }
+        real_link = remote.os.link
+
+        def link_then_cleanup(*args, **kwargs) -> None:
+            real_link(*args, **kwargs)
+            self.assertEqual(remote._cleanup_stale_lock_stages(root_fd), 1)
+
+        with mock.patch.object(remote.os, "link", side_effect=link_then_cleanup):
+            self.assertTrue(remote._install_lock(root_fd, lock_state))
+
+        lock_fd, item = remote._open_regular(remote.LOCK_NAME, dir_fd=root_fd)
+        try:
+            self.assertEqual(item.st_nlink, 1)
+            self.assertEqual(remote._lock_state(lock_fd), lock_state)
+        finally:
+            os.close(lock_fd)
+        os.unlink(remote.LOCK_NAME, dir_fd=root_fd)
+
+
     def test_expired_lock_reclaims_only_owned_receiver_pairs_and_malformed_fails_closed(self) -> None:
         payload, state = initialized(self.tmp_path)
         run = Path(payload["run_dir"])

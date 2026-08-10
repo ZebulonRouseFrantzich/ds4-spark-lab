@@ -57,6 +57,39 @@ _SASS_STDERR_LIMIT_BYTES = 16_384
 _SASS_WINDOW_BYTES = 8_192
 _SASS_TIMEOUT_SECONDS = 30.0
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
+_LOCAL_BUILD_OUTPUTS = {
+    ".": (
+        ".ds4-cuda-config.mk",
+        "ds4",
+        "ds4-server",
+        "ds4-bench",
+        "ds4-eval",
+        "ds4-agent",
+        "ds4_weight_server",
+        "ds4_cli.o",
+        "linenoise.o",
+        "ds4.o",
+        "ds4_distributed.o",
+        "ds4_cuda.o",
+        "ds4_server.o",
+        "ds4_kvstore.o",
+        "rax.o",
+        "ds4_bench.o",
+        "ds4_eval.o",
+        "ds4_agent.o",
+        "ds4_web.o",
+    ),
+    "cuda/mmq": (
+        "ds4_ggml_stubs.o",
+        "ds4_mmq.o",
+        "ds4_mmq_d2r.o",
+        "quantize.o",
+        "mmid.o",
+        "mmvq.o",
+        "ds4_repack.o",
+    ),
+}
+
 
 _REMOTE_RESULT_FIELDS = frozenset({
     "status", "failure_class", "source_snapshot_id", "source_applied_tree_hash",
@@ -137,14 +170,14 @@ def _failed(code: str, snapshot: SourceSnapshot | None = None) -> BuildResult:
 def _sha256_regular(path: Path, *, executable: bool = False) -> tuple[str, int]:
     try:
         before = os.stat(path, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_size < 1 or (executable and not before.st_mode & stat.S_IXUSR):
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1 or before.st_size < 1 or (executable and not before.st_mode & stat.S_IXUSR):
             raise OSError
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         raise _error("build_binary_invalid") from None
     try:
         pinned = os.fstat(fd)
-        if (pinned.st_dev, pinned.st_ino, pinned.st_size) != (before.st_dev, before.st_ino, before.st_size):
+        if (pinned.st_dev, pinned.st_ino, pinned.st_mode, pinned.st_uid, pinned.st_nlink, pinned.st_size) != (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink, before.st_size):
             raise _error("build_binary_invalid")
         digest = hashlib.sha256()
         while True:
@@ -153,11 +186,80 @@ def _sha256_regular(path: Path, *, executable: bool = False) -> tuple[str, int]:
                 break
             digest.update(block)
         after = os.fstat(fd)
-        if (after.st_dev, after.st_ino, after.st_size) != (pinned.st_dev, pinned.st_ino, pinned.st_size):
+        if (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size) != (pinned.st_dev, pinned.st_ino, pinned.st_mode, pinned.st_uid, pinned.st_nlink, pinned.st_size):
             raise _error("build_binary_invalid")
         return digest.hexdigest(), after.st_size
     finally:
         os.close(fd)
+
+def _open_owned_directory(name: str, parent_fd: int) -> int:
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        item = os.fstat(fd)
+    except OSError:
+        raise _error("build_source_mismatch") from None
+    if not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid():
+        os.close(fd)
+        raise _error("build_source_mismatch")
+    return fd
+
+
+def _prepare_local_build_outputs(root: Path) -> None:
+    """Unlink every fixed cuda-spark output without writing through aliases."""
+
+    try:
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError:
+        raise _error("build_source_mismatch") from None
+    engine_fd = ds4_fd = -1
+    try:
+        engine_fd = _open_owned_directory("engine", root_fd)
+        ds4_fd = _open_owned_directory("ds4", engine_fd)
+        for parent, names in _LOCAL_BUILD_OUTPUTS.items():
+            parent_fd = os.dup(ds4_fd)
+            try:
+                if parent != ".":
+                    for component in parent.split("/"):
+                        next_fd = _open_owned_directory(component, parent_fd)
+                        os.close(parent_fd)
+                        parent_fd = next_fd
+                changed = False
+                for name in names:
+                    try:
+                        item = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        raise _error("build_source_mismatch") from None
+                    if stat.S_ISDIR(item.st_mode):
+                        raise _error("build_source_mismatch")
+                    try:
+                        os.unlink(name, dir_fd=parent_fd)
+                    except OSError:
+                        raise _error("build_source_mismatch") from None
+                    changed = True
+                if changed:
+                    os.fsync(parent_fd)
+            except OSError:
+                raise _error("build_source_mismatch") from None
+            finally:
+                os.close(parent_fd)
+    finally:
+        if ds4_fd >= 0:
+            os.close(ds4_fd)
+        if engine_fd >= 0:
+            os.close(engine_fd)
+        os.close(root_fd)
+
 
 
 def _safe_run_dir(path: Path) -> None:
@@ -236,6 +338,25 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
             except FileNotFoundError:
                 pass
 
+
+
+def _remove_local_active_build(run_dir: Path) -> None:
+    """Invalidate any prior active build after a post-build source mismatch."""
+
+    try:
+        os.unlink(run_dir / "build.json")
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise _error("build_state_write_failed") from None
+    try:
+        directory_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        raise _error("build_state_write_failed") from None
 
 def _parse_ds4_version(value: bytes) -> str | None:
     match = _DS4_VERSION_OUTPUT.fullmatch(value)
@@ -525,6 +646,11 @@ def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapsho
             verify_applied_tree(root, snapshot)
         except TargetError:
             raise _error("build_source_mismatch") from None
+        _prepare_local_build_outputs(root)
+        try:
+            verify_applied_tree(root, snapshot)
+        except TargetError:
+            raise _error("build_source_mismatch") from None
         result = transport.run((MAKE, "-C", "engine/ds4", "cuda-spark", f"-j{jobs}"), timeout=BUILD_TIMEOUT_SECONDS, cwd=str(root), env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"})
         private_paths = tuple(
             value
@@ -557,11 +683,19 @@ def _build_local(config: Any, transport: LocalTransport, snapshot: SourceSnapsho
             version = _version(transport, binary)
             _sass(transport, binary)
             build_id = _build_id(snapshot, binary_hash, version, size)
+            try:
+                applied = verify_applied_tree(root, snapshot)
+            except TargetError:
+                raise _error("build_source_mismatch") from None
+            if applied != snapshot.applied_tree_hash:
+                raise _error("build_source_mismatch")
             state = {"schema_version": 1, "record_type": "build", "source_snapshot_id": snapshot.snapshot_id, "source_applied_tree_hash": snapshot.applied_tree_hash, "build_id": build_id, "binary_sha256": binary_hash, "binary_size": size, "version": version, "sass": "verified", "build_log_sha256": log_hash, "exit_code": exit_code, "duration_ns": max(1, result.duration_ns)}
             write_json_atomic(run_dir / "build.json", state, mode=0o600)
         except TargetError as exc:
             if exc.code == "build_process_unknown":
                 raise
+            if exc.code == "build_source_mismatch":
+                _remove_local_active_build(run_dir)
             return BuildResult("failed", _failure_class(exc.code), build_id=None, binary_sha256=None, **attempted, version=None, binary_size=None, sass=None)
         return BuildResult("succeeded", None, snapshot.snapshot_id, snapshot.applied_tree_hash, build_id, binary_hash, "make-cuda-spark", version, size, "verified", log_hash, exit_code, max(1, result.duration_ns))
 
@@ -836,6 +970,12 @@ def _build_atomic(run_fd,name,value):
         try: _build_os.unlink(temp,dir_fd=run_fd)
         except FileNotFoundError: pass
         except OSError: _fail('build_state_write_failed')
+def _build_remove_active(run_fd):
+    try: _build_os.unlink('build.json',dir_fd=run_fd)
+    except FileNotFoundError: return
+    except OSError: _fail('build_state_write_failed')
+    try: _build_os.fsync(run_fd)
+    except OSError: _fail('build_state_write_failed')
 def _build_record_id(value):
     raw=_build_json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')
     parts=(b'targetctl.record.v1',raw); h=_build_hashlib.sha256()
@@ -1234,6 +1374,18 @@ def target_build(payload):
                 if error.code=='build_process_unknown': raise
                 if error.code not in {'build_binary_invalid','build_sass_invalid','build_command_failed'}: raise
                 result=_build_failed(data,'contract_failed',log_hash,0,duration_ns)
+        lease_pin=_build_assert_lock(run_fd,run_identity,paths['run_token'],data['lock_token'],'lock_token_mismatch')
+        _assert_pinned_root(work_fd,work_identity)
+        try: source_matches=hmac.compare_digest(_build_applied_hash(work_fd,data['entries'],True),data['applied_tree_hash'])
+        except HelperError as error:
+            if error.code not in {'entry_changed','unsafe_entry','missing_path','symlink_path','unsafe_path'}: raise
+            source_matches=False
+        except OSError: source_matches=False
+        _assert_pinned_root(work_fd,work_identity)
+        _build_assert_lock(run_fd,run_identity,paths['run_token'],data['lock_token'],'lock_token_mismatch',lease_pin)
+        if not source_matches:
+            result=_build_failed(data,'contract_failed',log_hash,result['exit_code'],duration_ns)
+            _build_remove_active(run_fd)
         report=_build_report(data,result); report_bytes=_build_report_bytes(report)
         report_hash=_build_hashlib.sha256(report_bytes).hexdigest()
         report_name,attempt_log_name,commit_name=_build_attempt_names(data['attempt_id'])
@@ -1279,7 +1431,6 @@ def target_build_reconcile(payload):
         else:
             commit=_build_load_commit(commit_bytes)
             if commit['attempt_id']!=data['attempt_id']: _fail('build_reconcile_invalid')
-        if _build_applied_hash(work_fd,data['entries'],True)!=data['applied_tree_hash']: _fail('build_reconcile_invalid')
         report_bytes=_build_read(run_fd,report_name,65536,'build_reconcile_unavailable')
         report=_build_load_report(report_bytes)
         report_hash=_build_hashlib.sha256(report_bytes).hexdigest()
@@ -1289,6 +1440,7 @@ def target_build_reconcile(payload):
         if not hmac.compare_digest(commit['attempt_log_sha256'],log_hash): _fail('build_reconcile_invalid')
         result={key:report[key] for key in _BUILD_RESULT_KEYS}
         _build_validate_result(data,result,log_hash,work_fd)
+        if result['status']=='succeeded' and _build_applied_hash(work_fd,data['entries'],True)!=data['applied_tree_hash']: _fail('build_reconcile_invalid')
         _build_assert_lock(run_fd,run_identity,paths['run_token'],current_token,'build_reconcile_invalid',lease_pin)
         if result['status']=='succeeded': _build_atomic(run_fd,'build.json',_build_report_bytes(_build_active(result)))
         _assert_pinned_root(work_fd,work_identity)

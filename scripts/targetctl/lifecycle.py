@@ -268,13 +268,18 @@ import sys
 import time
 
 RUN_FD = int(os.environ['TARGETCTL_SV_RUN_FD'])
+LOG_FD = int(os.environ['TARGETCTL_SV_LOG_FD'])
 MAX_LOG_BYTES = 1048576
 
 def _read_json(name):
   fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), dir_fd=RUN_FD)
   try:
+    item = os.fstat(fd)
+    if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or item.st_nlink != 1:
+      raise ValueError('invalid_spec')
     raw = os.read(fd, 65537)
-    if len(raw) > 65536 or os.read(fd, 1):
+    after = os.fstat(fd)
+    if len(raw) > 65536 or os.read(fd, 1) or (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_nlink, item.st_size) != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size) or item.st_size != len(raw):
       raise ValueError('invalid_spec')
   finally:
     os.close(fd)
@@ -335,7 +340,7 @@ def _unlink_owned(name):
     return
   try:
     item = os.fstat(fd)
-    if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600:
+    if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or item.st_nlink != 1:
       return
   finally:
     os.close(fd)
@@ -392,17 +397,36 @@ redaction_secrets = ()
 
 child = None
 child_pgid = None
-log_fd = None
+log_fd = LOG_FD
+log_identity = None
 redactor = None
 written = 0
 stopping = False
 deadline = None
 failure_stage = 'spec'
 
+def _log_descriptor_identity(require_named=False):
+  item = os.fstat(log_fd)
+  identity = (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_nlink)
+  if not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o600 or item.st_nlink != 1:
+    raise OSError('unsafe_log')
+  if require_named:
+    named = os.stat('server.log', dir_fd=RUN_FD, follow_symlinks=False)
+    if identity != (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_nlink):
+      raise OSError('unsafe_log')
+  return identity
+
+
+def _assert_log_descriptor():
+  if log_identity is None or _log_descriptor_identity() != log_identity:
+    raise OSError('unsafe_log')
+
+
 def _flush():
   global written
   if redactor is None or log_fd is None:
     return
+  _assert_log_descriptor()
   try:
     if written >= MAX_LOG_BYTES:
       redactor['full'] = True
@@ -441,6 +465,9 @@ signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGHUP, _stop)
 try:
+  failure_stage = 'log_validate'
+  log_identity = _log_descriptor_identity(require_named=True)
+  failure_stage = 'spec'
   spec = _read_json(sys.argv[1])
   profile = {
     'schema_version': 1, 'accelerator': 'cuda', 'context_tokens': 32768,
@@ -491,9 +518,8 @@ try:
   state['supervisor_start_ticks'] = supervisor_ticks
   state['supervisor_cmdline_sha256'] = supervisor_cmdline_sha256
   _atom_json('run.json', state)
-  failure_stage = 'log_open'
+  failure_stage = 'log_setup'
   redactor = _targetctl_redactor(redaction_secrets)
-  log_fd = os.open('server.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0), 0o600, dir_fd=RUN_FD)
   failure_stage = 'child_spawn'
   env = {'LANG': 'C', 'LC_ALL': 'C', 'PATH': '/usr/bin:/bin', 'DS4_CONT_MTP_MODE':'2', 'DS4_CONT_DSPARK':'1', 'DS4_DSPARK_MODEL': spec.get('drafter', '')}
   child = subprocess.Popen(spec['argv'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(int(os.environ['TARGETCTL_SV_DIR_FD']),), env=env)
@@ -536,6 +562,7 @@ try:
 except BaseException:
   if log_fd is not None:
     try:
+      _assert_log_descriptor()
       os.write(log_fd, ('[targetctl-supervisor:%s]\n' % failure_stage).encode('ascii'))
       os.fsync(log_fd)
     except OSError:
@@ -641,6 +668,30 @@ def _lc_atom(root_fd,name,data):
     finally:os.close(fd)
     os.replace(temp,name,src_dir_fd=root_fd,dst_dir_fd=root_fd);os.fsync(root_fd)
   except OSError:_fail('unsafe_state')
+def _lc_install_log(root_fd):
+  temp='.server.log.'+secrets.token_hex(12)
+  fd=None
+  try:
+    fd=os.open(temp,os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
+    item=os.fstat(fd)
+    identity=(item.st_dev,item.st_ino,item.st_mode,item.st_uid,item.st_nlink)
+    if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.geteuid() or stat.S_IMODE(item.st_mode)!=0o600 or item.st_nlink!=1:_fail('unsafe_state')
+    os.fsync(fd)
+    os.replace(temp,'server.log',src_dir_fd=root_fd,dst_dir_fd=root_fd)
+    temp=None
+    os.fsync(root_fd)
+    after=os.fstat(fd)
+    named=os.stat('server.log',dir_fd=root_fd,follow_symlinks=False)
+    if identity!=(after.st_dev,after.st_ino,after.st_mode,after.st_uid,after.st_nlink) or identity!=(named.st_dev,named.st_ino,named.st_mode,named.st_uid,named.st_nlink):_fail('unsafe_state')
+    return fd
+  except BaseException:
+    if fd is not None:
+      try:os.close(fd)
+      except OSError:pass
+    if temp is not None:
+      try:os.unlink(temp,dir_fd=root_fd)
+      except OSError:pass
+    raise
 def _lc_read(root_fd,name):
   fd,item=_open_regular(name,dir_fd=root_fd)
   try:
@@ -776,11 +827,11 @@ def _lc_remove_owned(root_fd,name):
   except OSError:return 'unknown'
   try:
     before=os.fstat(fd)
-    if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid() or stat.S_IMODE(before.st_mode)!=0o600:return 'unknown'
+    if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid() or stat.S_IMODE(before.st_mode)!=0o600 or before.st_nlink!=1:return 'unknown'
   finally:os.close(fd)
   try:
     after=os.stat(name,dir_fd=root_fd,follow_symlinks=False)
-    if(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):return 'unknown'
+    if(before.st_dev,before.st_ino,before.st_mode,before.st_uid,before.st_nlink,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_mode,after.st_uid,after.st_nlink,after.st_size,after.st_mtime_ns,after.st_ctime_ns):return 'unknown'
     os.unlink(name,dir_fd=root_fd)
     return 'cleared'
   except FileNotFoundError:return 'cleared'
@@ -800,7 +851,7 @@ def _lc_guard(root_fd):
   try:
     fd=os.open('.targetctl-lifecycle-v1.lock',os.O_RDWR|os.O_CREAT|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
     item=os.fstat(fd)
-    if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.geteuid() or stat.S_IMODE(item.st_mode)!=0o600:raise OSError()
+    if not stat.S_ISREG(item.st_mode) or item.st_uid!=os.geteuid() or stat.S_IMODE(item.st_mode)!=0o600 or item.st_nlink!=1:raise OSError()
     fcntl.flock(fd,fcntl.LOCK_EX)
     return fd
   except OSError:
@@ -885,6 +936,7 @@ def lifecycle_serve(payload):
   guard_fd=None
   lease_owned=False
   dispatch_recorded=False
+  log_fd=None
   try:
     paths=_lc_roots(data)
     root_fd,sv_dir_fd=_lc_open_dir(paths)
@@ -909,12 +961,7 @@ def lifecycle_serve(payload):
     if not _lc_active_build(build,data,binary_hash):_fail('startup_failed')
     binary_exec='/proc/self/fd/%d/%s'%(sv_dir_fd,data['binary_path'])
     argv=(['/usr/bin/python3',binary_exec]if data['binary_path'].endswith('.py')else[binary_exec])+['--cuda','-m',paths['model_path'],'-c','32768','--host','127.0.0.1','--port',str(data['port'])]
-    try:
-      log_fd=os.open('server.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0),0o600,dir_fd=root_fd)
-    except FileExistsError:
-      log_fd,_=_open_regular('server.log',dir_fd=root_fd,flags=os.O_WRONLY)
-    try:os.ftruncate(log_fd,0);os.fsync(log_fd)
-    finally:os.close(log_fd)
+    log_fd=_lc_install_log(root_fd)
     profile=dict(LAUNCH_PROFILE)
     state={
       'schema_version':RUN_STATE_SCHEMA_VERSION,'run_id':data['run_id'],'state':'starting',
@@ -941,13 +988,15 @@ def lifecycle_serve(payload):
     finally:
       if sv_temp is not None:_lc_remove_owned(root_fd,sv_temp)
     env=dict(os.environ)
-    env['TARGETCTL_SV_DIR_FD']=str(sv_dir_fd);env['TARGETCTL_SV_RUN_FD']=str(root_fd)
+    env['TARGETCTL_SV_DIR_FD']=str(sv_dir_fd);env['TARGETCTL_SV_RUN_FD']=str(root_fd);env['TARGETCTL_SV_LOG_FD']=str(log_fd)
     sv_program='/proc/self/fd/%d/supervisor.py'%root_fd
     try:
-      p=subprocess.Popen(['/usr/bin/python3','-I','-S',sv_program,'launch.json'],cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,pass_fds=(sv_dir_fd,root_fd),env=env)
+      p=subprocess.Popen(['/usr/bin/python3','-I','-S',sv_program,'launch.json'],cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,pass_fds=(sv_dir_fd,root_fd,log_fd),env=env)
     except BaseException:
       state['state']='failed_startup';_lc_write_state(root_fd,state);_lc_temp_outcome(root_fd)
       _fail('startup_failed')
+    finally:
+      os.close(log_fd);log_fd=None
     lease_owned=False
     deadline=time.monotonic()+data['startup_timeout_ms']/1000
     process_exited=False
@@ -973,6 +1022,9 @@ def lifecycle_serve(payload):
     raise
   finally:
     if lease_owned and paths is not None and root_fd is not None:_lc_release_lease(paths,root_fd,data['run_id'])
+    if log_fd is not None:
+      try:os.close(log_fd)
+      except OSError:pass
     if guard_fd is not None:_lc_unguard(guard_fd)
     if root_fd is not None:os.close(root_fd)
     if sv_dir_fd is not None:os.close(sv_dir_fd)

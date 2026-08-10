@@ -614,6 +614,27 @@ class LifecycleTests(unittest.TestCase):
         cl = stop(self.config, self.transport, self.runtime, run_id=result.run_id)
         self.assertEqual(cl.server_log_sha256, expected_hash)
 
+    def test_serve_replaces_hardlinked_log_without_touching_canary(self) -> None:
+        self._setup_work()
+        canary = self.root / "outside-canary"
+        canary_content = b"outside data must survive"
+        canary.write_bytes(canary_content)
+        canary.chmod(0o600)
+        (self.run / "server.log").unlink()
+        os.link(canary, self.run / "server.log")
+
+        result = serve(self.config, self.transport, self.runtime)
+        try:
+            self.assertEqual(canary.read_bytes(), canary_content)
+            self.assertNotEqual(
+                (canary.stat().st_dev, canary.stat().st_ino),
+                ((self.run / "server.log").stat().st_dev, (self.run / "server.log").stat().st_ino),
+            )
+            self.assertEqual((self.run / "server.log").stat().st_nlink, 1)
+        finally:
+            stop(self.config, self.transport, self.runtime, run_id=result.run_id)
+
+
     # ---- No orphan PGID after stop ----------------------------------------
 
     def test_no_orphan_pgid_after_stop(self) -> None:

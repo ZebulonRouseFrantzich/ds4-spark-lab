@@ -197,6 +197,21 @@ class RemoteFdSecurityTests(unittest.TestCase):
             os.close(root_fd)
         self.assertTrue(report.exists())
 
+    def test_read_report_rejects_hardlink_without_touching_canary(self) -> None:
+        payload, token, run = self._initialized_run()
+        canary = self.tmp_path / "outside-canary"
+        content = b"outside data must survive"
+        self._write_report(canary, content)
+        os.link(canary, run / "server.log")
+
+        with self.assertRaises(remote.HelperError) as raised:
+            remote.read_report(
+                {"run_dir": payload["run_dir"], "run_token": token, "name": "server.log"}
+            )
+        self.assertEqual(raised.exception.code, "unsafe_state")
+        self.assertEqual(canary.read_bytes(), content)
+
+
     def test_remove_reports_respects_locks_and_uses_its_pinned_root(self) -> None:
         payload, token, run = self._initialized_run()
         digest = self._write_report(run / "build.log", b"original")

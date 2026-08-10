@@ -272,6 +272,24 @@ class WorkflowBundleEvidenceTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "artifact_log_unavailable")
                 self.assertFalse((bundle._staging / "texts" / f"{report_name}-log.txt").exists())
 
+    def test_local_log_promotion_rejects_hardlink_without_touching_canary(self) -> None:
+        from scripts.targetctl.workflow import _read_stored_log_snapshot
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canary = root / "outside-canary"
+            report = root / "server.log"
+            content = b"outside data must survive"
+            canary.write_bytes(content)
+            canary.chmod(0o600)
+            os.link(canary, report)
+
+            with self.assertRaises(TargetError) as raised:
+                _read_stored_log_snapshot(report)
+            self.assertEqual(raised.exception.code, "artifact_log_unavailable")
+            self.assertEqual(canary.read_bytes(), content)
+
+
 
 class _WorkflowFixture:
     """Small factory for independently valid public workflow evidence."""
