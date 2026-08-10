@@ -13,7 +13,7 @@ multi-turn continuations, and mixed latency requirements.
 ## Current status
 
 **Phase 00 — Workspace bootstrap: Qualified (2026-08-08). Phase 01 —
-execution target: Active and not Qualified.**
+execution target: Qualified (2026-08-09).**
 
 Phase 00 qualified at commit
 `69af8ea605972ba79430db3d92dbf1940f824df2` on
@@ -22,10 +22,12 @@ submodules, pinned Nix userspace, and root Just workflow. See the
 [Phase 00 qualification record](docs/roadmap/phase-00-qualification.md) for
 retained evidence.
 
-Phase 01 is being implemented on `phase/01_execution_target`. Its controller
-and target workflows require the validation gates in the
-[active phase document](docs/roadmap/phase-01-execution-target.md); the
-destructive DGX Spark qualification has not run for this implementation.
+Phase 01 qualified at implementation candidate
+`e82ed34b5bfd08bbc96031fa36c11eb2054d8e14` on
+`phase/01_execution_target`. Its controller and target workflows passed the
+configured DGX Spark sync, doctor, native-build, lifecycle, functional-smoke,
+cleanup, artifact, privacy, and review gates. See the
+[Phase 01 qualification record](docs/roadmap/phase-01-qualification.md).
 Phases after Phase 01 remain **Planned**.
 
 Start with:
@@ -37,8 +39,7 @@ Start with:
 ## Getting started
 
 Nix must have `nix-command` and `flakes` experimental features enabled. To
-inspect the active, not-yet-qualified Phase 01 implementation, clone its branch
-recursively:
+inspect the qualified Phase 01 implementation, clone its branch recursively:
 
 ```sh
 git clone --branch phase/01_execution_target --recurse-submodules https://github.com/ZebulonRouseFrantzich/ds4-spark-lab.git

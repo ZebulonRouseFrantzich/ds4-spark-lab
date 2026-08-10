@@ -2,10 +2,14 @@
 
 ## Status
 
-**Active — 2026-08-09.** Phase 01 controller operations and recipes are
-implemented, but Phase 01 is **not Qualified**. The destructive SSH target gate
-has not been executed for this implementation; it remains required before any
-qualification claim.
+**Qualified — 2026-08-09.** Retained evidence:
+[Phase 01 qualification record](phase-01-qualification.md).
+
+The qualified lab implementation candidate is
+`e82ed34b5bfd08bbc96031fa36c11eb2054d8e14`. The record proves the
+configured DGX Spark sync, doctor, native build, deterministic functional
+smoke, failure/interruption cleanup, artifact return, privacy gates, and
+independent reviews. No fork source or engine behavior changed.
 
 ## Depends on
 
