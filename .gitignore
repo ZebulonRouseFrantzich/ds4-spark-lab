@@ -6,6 +6,7 @@
 # Raw, regenerable outputs
 /benchmarks/results/
 /artifacts/phase-01-runs/
+/artifacts/phase-02-runtime/
 /build/
 /dist/
 

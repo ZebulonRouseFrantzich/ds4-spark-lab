@@ -701,6 +701,55 @@ class OpenAIChatClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sample.generated_tokens, 1)
         self.assertEqual(len(sample.token_event_timestamps_ns), 1)
 
+    async def test_first_model_token_callback_runs_once_and_is_failure_isolated(self) -> None:
+        async def handler(
+            _reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+            _body: dict[str, object],
+        ) -> None:
+            await send_headers(writer)
+            for content in ("first", "second"):
+                event = {"choices": [{"delta": {"content": content}}]}
+                writer.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
+                await writer.drain()
+                await asyncio.sleep(0)
+            terminal = {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            }
+            writer.write(
+                f"data: {json.dumps(terminal)}\n\ndata: [DONE]\n\n".encode("utf-8")
+            )
+            await writer.drain()
+
+        observed: list[int] = []
+
+        def callback(timestamp_ns: int) -> None:
+            observed.append(timestamp_ns)
+            raise RuntimeError("observer failures are not request failures")
+
+        self.server.handler = handler
+        async with OpenAIChatClient(
+            self.server.endpoint, concurrency=2, deadlines=deadlines()
+        ) as client:
+            sample = await run_request(
+                client,
+                make_request(),
+                scenario_run_id="run-1",
+                repetition=2,
+                prompt="fixture",
+                model="fixture-model",
+                sampling=SAMPLING,
+                clock_domain="controller-monotonic",
+                on_first_model_token=callback,
+            )
+            await asyncio.sleep(0)
+
+        self.assertEqual(observed, [sample.first_model_token_ns])
+        self.assertEqual(sample.finish_class, "stop")
+        self.assertIsNone(sample.error_class)
+
+
 
 if __name__ == "__main__":
     unittest.main()

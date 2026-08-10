@@ -256,6 +256,7 @@ async def run_request(
     sampling: Sampling,
     clock_domain: str,
     clock: Callable[[], int] = time.monotonic_ns,
+    on_first_model_token: Callable[[int], None] | None = None,
 ) -> RequestSample:
     """Run one request, mapping every terminal path except cancellation to a sample.
 
@@ -274,6 +275,8 @@ async def run_request(
         raise ValueError("prompt")
     if not isinstance(model, str) or not model:
         raise ValueError("model")
+    if on_first_model_token is not None and not callable(on_first_model_token):
+        raise ValueError("on_first_model_token")
     if client._closed:
         raise RuntimeError("client_closed")
 
@@ -299,6 +302,7 @@ async def run_request(
         max_event_bytes=client._max_event_bytes,
         max_body_bytes=client._max_body_bytes,
     )
+    first_model_token_callback_scheduled = False
 
     try:
         async with asyncio.timeout(client._overall_seconds):
@@ -337,9 +341,18 @@ async def run_request(
                                 raise SSEError("data_after_done")
                             done = True
                             break
-                        _consume_model_event(
+                        observed_first_token = _consume_model_event(
                             event.data, state=state, timestamp_ns=chunk_ns
                         )
+                        if (
+                            observed_first_token
+                            and not first_model_token_callback_scheduled
+                            and on_first_model_token is not None
+                        ):
+                            _schedule_first_model_token_callback(
+                                on_first_model_token, chunk_ns
+                            )
+                            first_model_token_callback_scheduled = True
                     if done:
                         # ``feed`` decodes the entire yielded chunk. Finalize now
                         # so a terminal marker cannot hide a partial UTF-8
@@ -356,9 +369,18 @@ async def run_request(
                                 raise SSEError("data_after_done")
                             done = True
                             break
-                        _consume_model_event(
+                        observed_first_token = _consume_model_event(
                             event.data, state=state, timestamp_ns=eof_ns
                         )
+                        if (
+                            observed_first_token
+                            and not first_model_token_callback_scheduled
+                            and on_first_model_token is not None
+                        ):
+                            _schedule_first_model_token_callback(
+                                on_first_model_token, eof_ns
+                            )
+                            first_model_token_callback_scheduled = True
                 if not done:
                     return state.terminal(
                         clock=clock,
@@ -443,6 +465,7 @@ async def settle_request(
     sampling: Sampling,
     clock_domain: str,
     clock: Callable[[], int] = time.monotonic_ns,
+    on_first_model_token: Callable[[int], None] | None = None,
 ) -> RequestSample:
     """Always settle cancellation to the one terminal sample carried with it."""
 
@@ -457,6 +480,7 @@ async def settle_request(
             sampling=sampling,
             clock_domain=clock_domain,
             clock=clock,
+            on_first_model_token=on_first_model_token,
         )
     except RequestCancelled as exc:
         return exc.sample
@@ -487,7 +511,8 @@ async def _read_error_body(
 
 def _consume_model_event(
     data: str, *, state: _SampleState, timestamp_ns: int
-) -> None:
+) -> bool:
+    had_model_token = bool(state.token_timestamps)
     parsed = json.loads(data)
     if not isinstance(parsed, dict):
         raise _ModelEventError
@@ -534,6 +559,27 @@ def _consume_model_event(
             ):
                 raise _ModelEventError
             state.generated_tokens = completion_tokens
+    return not had_model_token and bool(state.token_timestamps)
+
+
+def _schedule_first_model_token_callback(
+    callback: Callable[[int], None], timestamp_ns: int
+) -> None:
+    """Queue a failure-isolated observer without awaiting it in the stream."""
+
+    asyncio.get_running_loop().call_soon(
+        _invoke_first_model_token_callback, callback, timestamp_ns
+    )
+
+
+def _invoke_first_model_token_callback(
+    callback: Callable[[int], None], timestamp_ns: int
+) -> None:
+    try:
+        callback(timestamp_ns)
+    except Exception:
+        # Observability must never change or terminate the measured request.
+        pass
 
 
 def _is_model_delta(delta: dict[str, Any]) -> bool:

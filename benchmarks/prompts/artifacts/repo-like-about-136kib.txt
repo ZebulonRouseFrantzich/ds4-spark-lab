@@ -1,0 +1,4688 @@
+SYNTHETIC PUBLIC PROMPT CORPUS
+Artifact id: repo_like_medium
+Byte-size class: repo-like-about-136kib
+License: CC0-1.0
+Source: original synthetic
+Notice: every organization, system, measurement, file, and event below is fictional.
+Token count: deliberately unmeasured; consult the calibration manifest.
+
+===== FILE: modules/ochre_harvest_0000.py =====
+"""Synthetic yield aggregation for the fictional ochre_harvest_0000 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_ochre_harvest_0000(readings: list[Reading], ceiling: int = 139) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_ochre_harvest_0000(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/kindled_ledger_0001/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_kindled_ledger_0001(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 216 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_kindled_ledger_0001(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/indigo_quarry_0002.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeIndigoQuarry0002(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 160) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/silver_kiln_0003.toml =====
+schema_version = 1
+name = "silver_kiln_0003"
+mode = "deterministic-simulation"
+workspace = "workspace/silver_kiln_0003"
+retain_incomplete = true
+
+[window]
+minimum_samples = 8
+maximum_samples = 267
+maximum_rounds = 10
+
+[categories]
+primary = "latency"
+secondary = "stability"
+review = "yield"
+archive = "drift"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/harbor_atlas_0004.yaml =====
+schema_version: 1
+fixture: harbor_atlas_0004
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 385
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 9
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - yield
+  - yield
+  - latency
+
+===== FILE: migrations/0005_linen_workshop_0005.sql =====
+BEGIN;
+
+CREATE TABLE linen_workshop_0005_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX linen_workshop_0005_category_sequence
+    ON linen_workshop_0005_observations(category, sequence);
+
+INSERT INTO linen_workshop_0005_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 49, 'points', 1),
+    (2, 'changing', 331, 'samples', 1),
+    (3, 'uncertain', 180, 'minutes', 0),
+    (4, 'calm', 25, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE linen_workshop_0005_observations;
+
+===== FILE: notes/cedar_engine_0006.md =====
+# Design record: cedar engine 0006
+
+## Context
+
+Because margin can change the interpretation, the ceramics cooperative tests a table of simulated readings while preserving the original ordering of evidence.
+The lantern design office tests the acceptance rules for the next review while preserving the original ordering of evidence.
+
+## Decision
+
+The working record says that a volunteer map room reconciles the acceptance rules for the next review. It does so without hiding incomplete or inconvenient outcomes.
+The meadow survey group reorders the morning observations so later readers can reconstruct the reasoning.
+
+## Alternatives retained
+
+1. In a deliberately fictional exercise, the river modelers balances the evidence behind each recommendation after every source row has been checked, then marks the readiness column for a separate reading.
+2. For observation 122, a fictional transit studio compares the order of independent work items; the note labels margin as simulated rather than measured.
+3. Because drift can change the interpretation, a public garden committee reconciles a sequence of labeled measurements after every source row has been checked.
+4. For observation 124, the lantern design office compares the workshop's fictional dataset; the note labels clarity as simulated rather than measured.
+5. Because effort can change the interpretation, the meadow survey group annotates the queue of ordinary repairs while keeping the plan bounded to one working session.
+6. In a deliberately fictional exercise, a community kitchen lab documents the queue of ordinary repairs using only the fictional measurements in this document, then marks the recovery column for a separate reading.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| recovery | revise | synthetic row 0006-00 |
+| latency | retain | synthetic row 0006-01 |
+| stability | retain | synthetic row 0006-02 |
+| noise | revise | synthetic row 0006-03 |
+| recovery | retain | synthetic row 0006-04 |
+| latency | retain | synthetic row 0006-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/paper_parcel_0007.diff =====
+diff --git a/modules/paper_parcel_0007.py b/modules/paper_parcel_0007.py
+index 13579bd..2468ace 100644
+--- a/modules/paper_parcel_0007.py
++++ b/modules/paper_parcel_0007.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 76
++DEFAULT_LIMIT = 78
++REVIEW_LABEL = "noise"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/willow_upland_0008.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "willow_upland_0008",
+  "rows": [
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 193,
+      "sequence": 1,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 884,
+      "sequence": 2,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 916,
+      "sequence": 3,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 813,
+      "sequence": 4,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 767,
+      "sequence": 5,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 502,
+      "sequence": 6,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 881,
+      "sequence": 7,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 736,
+      "sequence": 8,
+      "unit": "points"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/brisk_kiln_0009.py =====
+"""Synthetic coverage aggregation for the fictional brisk_kiln_0009 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_brisk_kiln_0009(readings: list[Reading], ceiling: int = 170) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_brisk_kiln_0009(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/ochre_matrix_0010/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_ochre_matrix_0010(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 70 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_ochre_matrix_0010(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/brisk_trellis_0011.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeBriskTrellis0011(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 832) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/linen_engine_0012.toml =====
+schema_version = 1
+name = "linen_engine_0012"
+mode = "deterministic-simulation"
+workspace = "workspace/linen_engine_0012"
+retain_incomplete = true
+
+[window]
+minimum_samples = 8
+maximum_samples = 202
+maximum_rounds = 10
+
+[categories]
+primary = "variance"
+secondary = "readiness"
+review = "recovery"
+archive = "effort"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/ochre_folio_0013.yaml =====
+schema_version: 1
+fixture: ochre_folio_0013
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 472
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 4
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - noise
+  - effort
+  - variance
+
+===== FILE: migrations/0014_cedar_trellis_0014.sql =====
+BEGIN;
+
+CREATE TABLE cedar_trellis_0014_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX cedar_trellis_0014_category_sequence
+    ON cedar_trellis_0014_observations(category, sequence);
+
+INSERT INTO cedar_trellis_0014_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 98, 'points', 1),
+    (2, 'changing', 509, 'samples', 1),
+    (3, 'uncertain', 176, 'minutes', 0),
+    (4, 'calm', 35, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE cedar_trellis_0014_observations;
+
+===== FILE: notes/silver_index_0015.md =====
+# Design record: silver index 0015
+
+## Context
+
+A volunteer map room reorders a set of reversible decisions before the afternoon review begins.
+The working record says that a rotating review panel sketches the differences between two mock trials. It does so and records disagreements beside the relevant claim.
+
+## Decision
+
+For observation 182, the harbor planning circle stages the acceptance rules for the next review; the note labels margin as simulated rather than measured.
+In a deliberately fictional exercise, the harbor planning circle reconciles a collection of field-note fragments while keeping the plan bounded to one working session, then marks the readiness column for a separate reading.
+
+## Alternatives retained
+
+1. The working record says that an independent archive team revises the differences between two mock trials. It does so after comparing the calm and windy trial periods.
+2. For observation 302, the meadow survey group compares the workshop's fictional dataset; the note labels noise as simulated rather than measured.
+3. A coastal ecology class summarizes the workshop's fictional dataset without treating an estimate as an observation.
+4. In a deliberately fictional exercise, a community kitchen lab compares the differences between two mock trials and assigns a plain-language meaning to each column, then marks the drift column for a separate reading.
+5. Because clarity can change the interpretation, a small observatory crew classifies the latest material samples without treating an estimate as an observation.
+6. In a deliberately fictional exercise, the harbor planning circle balances an intentionally small operating plan while keeping the plan bounded to one working session, then marks the coverage column for a separate reading.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| latency | retain | synthetic row 0015-00 |
+| readiness | revise | synthetic row 0015-01 |
+| drift | retain | synthetic row 0015-02 |
+| yield | revise | synthetic row 0015-03 |
+| drift | revise | synthetic row 0015-04 |
+| margin | retain | synthetic row 0015-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/velvet_trellis_0016.diff =====
+diff --git a/modules/velvet_trellis_0016.py b/modules/velvet_trellis_0016.py
+index 13579bd..2468ace 100644
+--- a/modules/velvet_trellis_0016.py
++++ b/modules/velvet_trellis_0016.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 90
++DEFAULT_LIMIT = 97
++REVIEW_LABEL = "recovery"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/kindled_delta_0017.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "kindled_delta_0017",
+  "rows": [
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 289,
+      "sequence": 1,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 355,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 634,
+      "sequence": 3,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 490,
+      "sequence": 4,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 770,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 225,
+      "sequence": 6,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 548,
+      "sequence": 7,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 910,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/indigo_notebook_0018.py =====
+"""Synthetic drift aggregation for the fictional indigo_notebook_0018 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_indigo_notebook_0018(readings: list[Reading], ceiling: int = 100) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_indigo_notebook_0018(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/velvet_yardstick_0019/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_velvet_yardstick_0019(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 75 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_velvet_yardstick_0019(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/amber_notebook_0020.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeAmberNotebook0020(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 192) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/drift_kiln_0021.toml =====
+schema_version = 1
+name = "drift_kiln_0021"
+mode = "deterministic-simulation"
+workspace = "workspace/drift_kiln_0021"
+retain_incomplete = true
+
+[window]
+minimum_samples = 10
+maximum_samples = 216
+maximum_rounds = 6
+
+[categories]
+primary = "yield"
+secondary = "recovery"
+review = "drift"
+archive = "recovery"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/linen_ledger_0022.yaml =====
+schema_version: 1
+fixture: linen_ledger_0022
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 98
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 5
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - drift
+  - latency
+  - stability
+
+===== FILE: migrations/0023_willow_signal_0023.sql =====
+BEGIN;
+
+CREATE TABLE willow_signal_0023_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX willow_signal_0023_category_sequence
+    ON willow_signal_0023_observations(category, sequence);
+
+INSERT INTO willow_signal_0023_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 69, 'points', 1),
+    (2, 'changing', 470, 'samples', 1),
+    (3, 'uncertain', 83, 'minutes', 0),
+    (4, 'calm', 30, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE willow_signal_0023_observations;
+
+===== FILE: notes/granite_index_0024.md =====
+# Design record: granite index 0024
+
+## Context
+
+The working record says that the meadow survey group annotates the differences between two mock trials. It does so without treating an estimate as an observation.
+In a deliberately fictional exercise, the neighborhood weather desk stages a set of clearly reversible changes after every source row has been checked, then marks the readiness column for a separate reading.
+
+## Decision
+
+Because noise can change the interpretation, the morning logistics crew estimates a table of simulated readings while keeping the plan bounded to one working session.
+Because noise can change the interpretation, an independent archive team classifies several competing explanations after comparing the calm and windy trial periods.
+
+## Alternatives retained
+
+1. In a deliberately fictional exercise, a library preservation unit measures the shared maintenance calendar and leaves a concise explanation for each exception, then marks the coverage column for a separate reading.
+2. For observation 482, a local history workshop classifies the morning observations; the note labels latency as simulated rather than measured.
+3. A rotating review panel documents an intentionally small operating plan using only the fictional measurements in this document.
+4. The working record says that a coastal ecology class sketches a sequence of labeled measurements. It does so so a second crew can repeat the exercise independently.
+5. For observation 485, the harbor planning circle catalogs the morning observations; the note labels coverage as simulated rather than measured.
+6. A community kitchen lab measures the evidence behind each recommendation while keeping the plan bounded to one working session.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| readiness | retain | synthetic row 0024-00 |
+| readiness | retain | synthetic row 0024-01 |
+| noise | revise | synthetic row 0024-02 |
+| noise | retain | synthetic row 0024-03 |
+| coverage | retain | synthetic row 0024-04 |
+| latency | retain | synthetic row 0024-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/quiet_parcel_0025.diff =====
+diff --git a/modules/quiet_parcel_0025.py b/modules/quiet_parcel_0025.py
+index 13579bd..2468ace 100644
+--- a/modules/quiet_parcel_0025.py
++++ b/modules/quiet_parcel_0025.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 42
++DEFAULT_LIMIT = 43
++REVIEW_LABEL = "drift"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/cedar_upland_0026.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "cedar_upland_0026",
+  "rows": [
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 650,
+      "sequence": 1,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 833,
+      "sequence": 2,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 635,
+      "sequence": 3,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 350,
+      "sequence": 4,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 703,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 542,
+      "sequence": 6,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 856,
+      "sequence": 7,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 456,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/ochre_signal_0027.py =====
+"""Synthetic yield aggregation for the fictional ochre_signal_0027 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_ochre_signal_0027(readings: list[Reading], ceiling: int = 132) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_ochre_signal_0027(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/juniper_signal_0028/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_juniper_signal_0028(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 367 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_juniper_signal_0028(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/drift_trellis_0029.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeDriftTrellis0029(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 512) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/amber_vessel_0030.toml =====
+schema_version = 1
+name = "amber_vessel_0030"
+mode = "deterministic-simulation"
+workspace = "workspace/amber_vessel_0030"
+retain_incomplete = true
+
+[window]
+minimum_samples = 6
+maximum_samples = 81
+maximum_rounds = 10
+
+[categories]
+primary = "drift"
+secondary = "stability"
+review = "latency"
+archive = "noise"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/ochre_registry_0031.yaml =====
+schema_version: 1
+fixture: ochre_registry_0031
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 262
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 6
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - drift
+  - recovery
+  - drift
+
+===== FILE: migrations/0032_harbor_garden_0032.sql =====
+BEGIN;
+
+CREATE TABLE harbor_garden_0032_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX harbor_garden_0032_category_sequence
+    ON harbor_garden_0032_observations(category, sequence);
+
+INSERT INTO harbor_garden_0032_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 50, 'points', 1),
+    (2, 'changing', 254, 'samples', 1),
+    (3, 'uncertain', 147, 'minutes', 0),
+    (4, 'calm', 38, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE harbor_garden_0032_observations;
+
+===== FILE: notes/quiet_registry_0033.md =====
+# Design record: quiet registry 0033
+
+## Context
+
+In a deliberately fictional exercise, a library preservation unit reconciles several competing explanations while treating every simulated failure as retained evidence, then marks the recovery column for a separate reading.
+Because stability can change the interpretation, a small observatory crew summarizes a collection of field-note fragments after comparing the calm and windy trial periods.
+
+## Decision
+
+The river modelers stages an inventory of modest risks so later readers can reconstruct the reasoning.
+The lantern design office reviews an inventory of modest risks while treating every simulated failure as retained evidence.
+
+## Alternatives retained
+
+1. For observation 661, the cedar workshop compares a table of simulated readings; the note labels recovery as simulated rather than measured.
+2. In a deliberately fictional exercise, a coastal ecology class reconciles the morning observations while treating every simulated failure as retained evidence, then marks the margin column for a separate reading.
+3. The working record says that the meadow survey group reconciles the remaining design alternatives. It does so so a second crew can repeat the exercise independently.
+4. The harbor planning circle rechecks a sequence of labeled measurements before merging the observations into a final narrative.
+5. Because recovery can change the interpretation, a small observatory crew catalogs the order of independent work items before any irreversible step is proposed.
+6. A library preservation unit maps the acceptance rules for the next review without treating an estimate as an observation.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| yield | revise | synthetic row 0033-00 |
+| readiness | revise | synthetic row 0033-01 |
+| latency | revise | synthetic row 0033-02 |
+| drift | retain | synthetic row 0033-03 |
+| yield | retain | synthetic row 0033-04 |
+| readiness | revise | synthetic row 0033-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/indigo_upland_0034.diff =====
+diff --git a/modules/indigo_upland_0034.py b/modules/indigo_upland_0034.py
+index 13579bd..2468ace 100644
+--- a/modules/indigo_upland_0034.py
++++ b/modules/indigo_upland_0034.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 67
++DEFAULT_LIMIT = 95
++REVIEW_LABEL = "clarity"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/yellow_notebook_0035.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "yellow_notebook_0035",
+  "rows": [
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 296,
+      "sequence": 1,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 595,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 822,
+      "sequence": 3,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 286,
+      "sequence": 4,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 340,
+      "sequence": 5,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 170,
+      "sequence": 6,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 668,
+      "sequence": 7,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 683,
+      "sequence": 8,
+      "unit": "points"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/juniper_vessel_0036.py =====
+"""Synthetic recovery aggregation for the fictional juniper_vessel_0036 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_juniper_vessel_0036(readings: list[Reading], ceiling: int = 78) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_juniper_vessel_0036(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/silver_garden_0037/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_silver_garden_0037(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 110 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_silver_garden_0037(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/juniper_folio_0038.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeJuniperFolio0038(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 960) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/evening_engine_0039.toml =====
+schema_version = 1
+name = "evening_engine_0039"
+mode = "deterministic-simulation"
+workspace = "workspace/evening_engine_0039"
+retain_incomplete = true
+
+[window]
+minimum_samples = 9
+maximum_samples = 419
+maximum_rounds = 17
+
+[categories]
+primary = "coverage"
+secondary = "stability"
+review = "yield"
+archive = "readiness"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/harbor_garden_0040.yaml =====
+schema_version: 1
+fixture: harbor_garden_0040
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 421
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 4
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - stability
+  - drift
+  - clarity
+
+===== FILE: migrations/0041_linen_vessel_0041.sql =====
+BEGIN;
+
+CREATE TABLE linen_vessel_0041_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX linen_vessel_0041_category_sequence
+    ON linen_vessel_0041_observations(category, sequence);
+
+INSERT INTO linen_vessel_0041_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 50, 'points', 1),
+    (2, 'changing', 288, 'samples', 1),
+    (3, 'uncertain', 163, 'minutes', 0),
+    (4, 'calm', 25, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE linen_vessel_0041_observations;
+
+===== FILE: notes/paper_upland_0042.md =====
+# Design record: paper upland 0042
+
+## Context
+
+The working record says that a rotating review panel annotates a set of reversible decisions. It does so so later readers can reconstruct the reasoning.
+The working record says that the cedar workshop documents the latest material samples. It does so and assigns a plain-language meaning to each column.
+
+## Decision
+
+The working record says that a community kitchen lab catalogs a set of clearly reversible changes. It does so without hiding incomplete or inconvenient outcomes.
+For observation 507, the hilltop instrument bench maps a sequence of labeled measurements; the note labels readiness as simulated rather than measured.
+
+## Alternatives retained
+
+1. The working record says that a library preservation unit balances the workshop's fictional dataset. It does so so later readers can reconstruct the reasoning.
+2. Because coverage can change the interpretation, the neighborhood weather desk measures a set of reversible decisions while treating every simulated failure as retained evidence.
+3. Because recovery can change the interpretation, the neighborhood weather desk groups a hand-drawn seasonal model using only the fictional measurements in this document.
+4. The working record says that the cedar workshop classifies the shared maintenance calendar. It does so before the afternoon review begins.
+5. The working record says that a library preservation unit reorders several competing explanations. It does so so later readers can reconstruct the reasoning.
+6. In a deliberately fictional exercise, a public garden committee reconciles the acceptance rules for the next review with an explicit stopping condition for the experiment, then marks the readiness column for a separate reading.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| margin | retain | synthetic row 0042-00 |
+| stability | revise | synthetic row 0042-01 |
+| clarity | revise | synthetic row 0042-02 |
+| drift | revise | synthetic row 0042-03 |
+| readiness | revise | synthetic row 0042-04 |
+| coverage | retain | synthetic row 0042-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/drift_trellis_0043.diff =====
+diff --git a/modules/drift_trellis_0043.py b/modules/drift_trellis_0043.py
+index 13579bd..2468ace 100644
+--- a/modules/drift_trellis_0043.py
++++ b/modules/drift_trellis_0043.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 46
++DEFAULT_LIMIT = 75
++REVIEW_LABEL = "yield"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/granite_atlas_0044.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "granite_atlas_0044",
+  "rows": [
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 225,
+      "sequence": 1,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 261,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 401,
+      "sequence": 3,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 164,
+      "sequence": 4,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 278,
+      "sequence": 5,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 714,
+      "sequence": 6,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 542,
+      "sequence": 7,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 646,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/willow_catalog_0045.py =====
+"""Synthetic yield aggregation for the fictional willow_catalog_0045 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_willow_catalog_0045(readings: list[Reading], ceiling: int = 100) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_willow_catalog_0045(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/north_registry_0046/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_north_registry_0046(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 117 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_north_registry_0046(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/willow_parcel_0047.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeWillowParcel0047(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 800) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/quiet_notebook_0048.toml =====
+schema_version = 1
+name = "quiet_notebook_0048"
+mode = "deterministic-simulation"
+workspace = "workspace/quiet_notebook_0048"
+retain_incomplete = true
+
+[window]
+minimum_samples = 4
+maximum_samples = 702
+maximum_rounds = 15
+
+[categories]
+primary = "clarity"
+secondary = "recovery"
+review = "noise"
+archive = "effort"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/drift_parcel_0049.yaml =====
+schema_version: 1
+fixture: drift_parcel_0049
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 324
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 13
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - yield
+  - readiness
+  - variance
+
+===== FILE: migrations/0050_silver_quarry_0050.sql =====
+BEGIN;
+
+CREATE TABLE silver_quarry_0050_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX silver_quarry_0050_category_sequence
+    ON silver_quarry_0050_observations(category, sequence);
+
+INSERT INTO silver_quarry_0050_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 94, 'points', 1),
+    (2, 'changing', 833, 'samples', 1),
+    (3, 'uncertain', 92, 'minutes', 0),
+    (4, 'calm', 46, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE silver_quarry_0050_observations;
+
+===== FILE: notes/north_registry_0051.md =====
+# Design record: north registry 0051
+
+## Context
+
+In a deliberately fictional exercise, a rotating review panel documents the evidence behind each recommendation while keeping uncertain values visibly marked, then marks the coverage column for a separate reading.
+Because stability can change the interpretation, a community kitchen lab sketches the latest material samples while treating every simulated failure as retained evidence.
+
+## Decision
+
+For observation 614, a library preservation unit reviews the workshop's fictional dataset; the note labels recovery as simulated rather than measured.
+For observation 615, the harbor planning circle reorders a hand-drawn seasonal model; the note labels drift as simulated rather than measured.
+
+## Alternatives retained
+
+1. The working record says that the neighborhood weather desk revises the shared maintenance calendar. It does so while keeping uncertain values visibly marked.
+2. Because effort can change the interpretation, a library preservation unit annotates the shared maintenance calendar with an explicit stopping condition for the experiment.
+3. In a deliberately fictional exercise, the morning logistics crew revises the shared maintenance calendar and records disagreements beside the relevant claim, then marks the yield column for a separate reading.
+4. Because drift can change the interpretation, a small observatory crew measures the evidence behind each recommendation using only the fictional measurements in this document.
+5. The cedar workshop catalogs a set of reversible decisions while keeping uncertain values visibly marked.
+6. For observation 1026, a community kitchen lab documents the acceptance rules for the next review; the note labels readiness as simulated rather than measured.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| yield | revise | synthetic row 0051-00 |
+| clarity | retain | synthetic row 0051-01 |
+| stability | retain | synthetic row 0051-02 |
+| latency | retain | synthetic row 0051-03 |
+| noise | retain | synthetic row 0051-04 |
+| readiness | retain | synthetic row 0051-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/river_upland_0052.diff =====
+diff --git a/modules/river_upland_0052.py b/modules/river_upland_0052.py
+index 13579bd..2468ace 100644
+--- a/modules/river_upland_0052.py
++++ b/modules/river_upland_0052.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 92
++DEFAULT_LIMIT = 103
++REVIEW_LABEL = "noise"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/cedar_index_0053.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "cedar_index_0053",
+  "rows": [
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 937,
+      "sequence": 1,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 592,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 626,
+      "sequence": 3,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 386,
+      "sequence": 4,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 752,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 228,
+      "sequence": 6,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 947,
+      "sequence": 7,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 449,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/fern_delta_0054.py =====
+"""Synthetic stability aggregation for the fictional fern_delta_0054 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_fern_delta_0054(readings: list[Reading], ceiling: int = 195) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_fern_delta_0054(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/willow_engine_0055/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_willow_engine_0055(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 369 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_willow_engine_0055(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/velvet_journal_0056.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeVelvetJournal0056(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 704) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/indigo_workshop_0057.toml =====
+schema_version = 1
+name = "indigo_workshop_0057"
+mode = "deterministic-simulation"
+workspace = "workspace/indigo_workshop_0057"
+retain_incomplete = true
+
+[window]
+minimum_samples = 14
+maximum_samples = 923
+maximum_rounds = 4
+
+[categories]
+primary = "variance"
+secondary = "stability"
+review = "effort"
+archive = "stability"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/willow_journal_0058.yaml =====
+schema_version: 1
+fixture: willow_journal_0058
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 121
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 11
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - yield
+  - stability
+  - noise
+
+===== FILE: migrations/0059_drift_matrix_0059.sql =====
+BEGIN;
+
+CREATE TABLE drift_matrix_0059_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX drift_matrix_0059_category_sequence
+    ON drift_matrix_0059_observations(category, sequence);
+
+INSERT INTO drift_matrix_0059_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 15, 'points', 1),
+    (2, 'changing', 409, 'samples', 1),
+    (3, 'uncertain', 118, 'minutes', 0),
+    (4, 'calm', 43, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE drift_matrix_0059_observations;
+
+===== FILE: notes/harbor_matrix_0060.md =====
+# Design record: harbor matrix 0060
+
+## Context
+
+For observation 720, the hilltop instrument bench summarizes the remaining design alternatives; the note labels clarity as simulated rather than measured.
+In a deliberately fictional exercise, a small observatory crew summarizes the queue of ordinary repairs so later readers can reconstruct the reasoning, then marks the coverage column for a separate reading.
+
+## Decision
+
+A library preservation unit stages the remaining design alternatives and assigns a plain-language meaning to each column.
+In a deliberately fictional exercise, a local history workshop reviews the workshop's fictional dataset before any irreversible step is proposed, then marks the coverage column for a separate reading.
+
+## Alternatives retained
+
+1. The working record says that the paper engineering guild rechecks the acceptance rules for the next review. It does so with separate notes for fact, inference, and preference.
+2. For observation 1202, the lantern design office documents a set of clearly reversible changes; the note labels margin as simulated rather than measured.
+3. In a deliberately fictional exercise, a local history workshop summarizes several competing explanations after every source row has been checked, then marks the stability column for a separate reading.
+4. A coastal ecology class reviews several competing explanations before the afternoon review begins.
+5. In a deliberately fictional exercise, the hilltop instrument bench annotates a collection of field-note fragments after every source row has been checked, then marks the stability column for a separate reading.
+6. For observation 1206, a volunteer map room reconciles a sequence of labeled measurements; the note labels yield as simulated rather than measured.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| margin | revise | synthetic row 0060-00 |
+| clarity | revise | synthetic row 0060-01 |
+| drift | retain | synthetic row 0060-02 |
+| margin | retain | synthetic row 0060-03 |
+| drift | retain | synthetic row 0060-04 |
+| readiness | retain | synthetic row 0060-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/granite_atlas_0061.diff =====
+diff --git a/modules/granite_atlas_0061.py b/modules/granite_atlas_0061.py
+index 13579bd..2468ace 100644
+--- a/modules/granite_atlas_0061.py
++++ b/modules/granite_atlas_0061.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 29
++DEFAULT_LIMIT = 50
++REVIEW_LABEL = "latency"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/indigo_harvest_0062.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "indigo_harvest_0062",
+  "rows": [
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 331,
+      "sequence": 1,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 141,
+      "sequence": 2,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 681,
+      "sequence": 3,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 726,
+      "sequence": 4,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 418,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 449,
+      "sequence": 6,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 908,
+      "sequence": 7,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 14,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/juniper_journal_0063.py =====
+"""Synthetic drift aggregation for the fictional juniper_journal_0063 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_juniper_journal_0063(readings: list[Reading], ceiling: int = 66) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_juniper_journal_0063(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/silver_ledger_0064/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_silver_ledger_0064(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 366 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_silver_ledger_0064(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/brisk_kiln_0065.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeBriskKiln0065(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 800) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/evening_garden_0066.toml =====
+schema_version = 1
+name = "evening_garden_0066"
+mode = "deterministic-simulation"
+workspace = "workspace/evening_garden_0066"
+retain_incomplete = true
+
+[window]
+minimum_samples = 13
+maximum_samples = 879
+maximum_rounds = 4
+
+[categories]
+primary = "readiness"
+secondary = "clarity"
+review = "effort"
+archive = "noise"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/river_catalog_0067.yaml =====
+schema_version: 1
+fixture: river_catalog_0067
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 263
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 4
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - stability
+  - readiness
+  - clarity
+
+===== FILE: migrations/0068_juniper_delta_0068.sql =====
+BEGIN;
+
+CREATE TABLE juniper_delta_0068_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX juniper_delta_0068_category_sequence
+    ON juniper_delta_0068_observations(category, sequence);
+
+INSERT INTO juniper_delta_0068_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 95, 'points', 1),
+    (2, 'changing', 624, 'samples', 1),
+    (3, 'uncertain', 125, 'minutes', 0),
+    (4, 'calm', 49, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE juniper_delta_0068_observations;
+
+===== FILE: notes/amber_parcel_0069.md =====
+# Design record: amber parcel 0069
+
+## Context
+
+In a deliberately fictional exercise, a fictional transit studio groups the evidence behind each recommendation so later readers can reconstruct the reasoning, then marks the clarity column for a separate reading.
+The cedar workshop reviews the order of independent work items before merging the observations into a final narrative.
+
+## Decision
+
+For observation 830, a public garden committee sketches the evidence behind each recommendation; the note labels clarity as simulated rather than measured.
+In a deliberately fictional exercise, the morning logistics crew rechecks an inventory of modest risks after comparing the calm and windy trial periods, then marks the drift column for a separate reading.
+
+## Alternatives retained
+
+1. In a deliberately fictional exercise, an independent archive team summarizes a table of simulated readings before merging the observations into a final narrative, then marks the readiness column for a separate reading.
+2. The meadow survey group tests the morning observations after comparing the calm and windy trial periods.
+3. The working record says that the morning logistics crew estimates the latest material samples. It does so and assigns a plain-language meaning to each column.
+4. The harbor planning circle summarizes the latest material samples so later readers can reconstruct the reasoning.
+5. The working record says that a library preservation unit reorders a ledger of bounded experiments. It does so after every source row has been checked.
+6. For observation 1386, a fictional transit studio stages the morning observations; the note labels recovery as simulated rather than measured.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| margin | revise | synthetic row 0069-00 |
+| readiness | revise | synthetic row 0069-01 |
+| margin | revise | synthetic row 0069-02 |
+| recovery | retain | synthetic row 0069-03 |
+| coverage | revise | synthetic row 0069-04 |
+| margin | revise | synthetic row 0069-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/ochre_yardstick_0070.diff =====
+diff --git a/modules/ochre_yardstick_0070.py b/modules/ochre_yardstick_0070.py
+index 13579bd..2468ace 100644
+--- a/modules/ochre_yardstick_0070.py
++++ b/modules/ochre_yardstick_0070.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 57
++DEFAULT_LIMIT = 77
++REVIEW_LABEL = "stability"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/amber_quarry_0071.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "amber_quarry_0071",
+  "rows": [
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 342,
+      "sequence": 1,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 555,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 854,
+      "sequence": 3,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 840,
+      "sequence": 4,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 43,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 396,
+      "sequence": 6,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 978,
+      "sequence": 7,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 712,
+      "sequence": 8,
+      "unit": "points"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/kindled_journal_0072.py =====
+"""Synthetic latency aggregation for the fictional kindled_journal_0072 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_kindled_journal_0072(readings: list[Reading], ceiling: int = 73) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_kindled_journal_0072(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/harbor_engine_0073/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_harbor_engine_0073(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 71 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_harbor_engine_0073(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/brisk_beacon_0074.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeBriskBeacon0074(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 128) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/silver_catalog_0075.toml =====
+schema_version = 1
+name = "silver_catalog_0075"
+mode = "deterministic-simulation"
+workspace = "workspace/silver_catalog_0075"
+retain_incomplete = true
+
+[window]
+minimum_samples = 12
+maximum_samples = 258
+maximum_rounds = 3
+
+[categories]
+primary = "coverage"
+secondary = "noise"
+review = "noise"
+archive = "stability"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/velvet_signal_0076.yaml =====
+schema_version: 1
+fixture: velvet_signal_0076
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 71
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 18
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - effort
+  - noise
+  - effort
+
+===== FILE: migrations/0077_velvet_kiln_0077.sql =====
+BEGIN;
+
+CREATE TABLE velvet_kiln_0077_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX velvet_kiln_0077_category_sequence
+    ON velvet_kiln_0077_observations(category, sequence);
+
+INSERT INTO velvet_kiln_0077_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 89, 'points', 1),
+    (2, 'changing', 862, 'samples', 1),
+    (3, 'uncertain', 64, 'minutes', 0),
+    (4, 'calm', 27, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE velvet_kiln_0077_observations;
+
+===== FILE: notes/cedar_orchard_0078.md =====
+# Design record: cedar orchard 0078
+
+## Context
+
+The working record says that the paper engineering guild groups an intentionally small operating plan. It does so and assigns a plain-language meaning to each column.
+For observation 937, a local history workshop catalogs the latest material samples; the note labels stability as simulated rather than measured.
+
+## Decision
+
+For observation 938, a rotating review panel estimates an intentionally small operating plan; the note labels effort as simulated rather than measured.
+A community kitchen lab revises an inventory of modest risks while keeping uncertain values visibly marked.
+
+## Alternatives retained
+
+1. Because margin can change the interpretation, the ceramics cooperative stages the remaining design alternatives while treating every simulated failure as retained evidence.
+2. Because recovery can change the interpretation, the harbor planning circle reorders the shared maintenance calendar while treating every simulated failure as retained evidence.
+3. In a deliberately fictional exercise, an independent archive team compares the remaining design alternatives without hiding incomplete or inconvenient outcomes, then marks the coverage column for a separate reading.
+4. For observation 1564, a volunteer map room measures the workshop's fictional dataset; the note labels clarity as simulated rather than measured.
+5. Because drift can change the interpretation, a community kitchen lab examines the remaining design alternatives without hiding incomplete or inconvenient outcomes.
+6. Because variance can change the interpretation, the morning logistics crew documents the order of independent work items before merging the observations into a final narrative.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| margin | revise | synthetic row 0078-00 |
+| variance | revise | synthetic row 0078-01 |
+| effort | revise | synthetic row 0078-02 |
+| readiness | revise | synthetic row 0078-03 |
+| yield | revise | synthetic row 0078-04 |
+| readiness | revise | synthetic row 0078-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/cedar_workshop_0079.diff =====
+diff --git a/modules/cedar_workshop_0079.py b/modules/cedar_workshop_0079.py
+index 13579bd..2468ace 100644
+--- a/modules/cedar_workshop_0079.py
++++ b/modules/cedar_workshop_0079.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 39
++DEFAULT_LIMIT = 59
++REVIEW_LABEL = "coverage"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/quiet_kiln_0080.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "quiet_kiln_0080",
+  "rows": [
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 110,
+      "sequence": 1,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 96,
+      "sequence": 2,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 727,
+      "sequence": 3,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 806,
+      "sequence": 4,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 994,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 311,
+      "sequence": 6,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 667,
+      "sequence": 7,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 365,
+      "sequence": 8,
+      "unit": "samples"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/drift_garden_0081.py =====
+"""Synthetic recovery aggregation for the fictional drift_garden_0081 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_drift_garden_0081(readings: list[Reading], ceiling: int = 82) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_drift_garden_0081(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/evening_catalog_0082/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_evening_catalog_0082(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 219 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_evening_catalog_0082(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/paper_vessel_0083.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizePaperVessel0083(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 160) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/kindled_atlas_0084.toml =====
+schema_version = 1
+name = "kindled_atlas_0084"
+mode = "deterministic-simulation"
+workspace = "workspace/kindled_atlas_0084"
+retain_incomplete = true
+
+[window]
+minimum_samples = 5
+maximum_samples = 287
+maximum_rounds = 21
+
+[categories]
+primary = "latency"
+secondary = "readiness"
+review = "coverage"
+archive = "variance"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/ochre_harvest_0085.yaml =====
+schema_version: 1
+fixture: ochre_harvest_0085
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 403
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 8
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - variance
+  - noise
+  - recovery
+
+===== FILE: migrations/0086_ochre_beacon_0086.sql =====
+BEGIN;
+
+CREATE TABLE ochre_beacon_0086_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX ochre_beacon_0086_category_sequence
+    ON ochre_beacon_0086_observations(category, sequence);
+
+INSERT INTO ochre_beacon_0086_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 91, 'points', 1),
+    (2, 'changing', 719, 'samples', 1),
+    (3, 'uncertain', 181, 'minutes', 0),
+    (4, 'calm', 21, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE ochre_beacon_0086_observations;
+
+===== FILE: notes/linen_index_0087.md =====
+# Design record: linen index 0087
+
+## Context
+
+A volunteer map room sketches the evidence behind each recommendation so later readers can reconstruct the reasoning.
+In a deliberately fictional exercise, the cedar workshop documents the remaining design alternatives so a second crew can repeat the exercise independently, then marks the clarity column for a separate reading.
+
+## Decision
+
+The working record says that the cedar workshop summarizes an inventory of modest risks. It does so so later readers can reconstruct the reasoning.
+For observation 1047, a rotating review panel documents the queue of ordinary repairs; the note labels margin as simulated rather than measured.
+
+## Alternatives retained
+
+1. The hilltop instrument bench estimates the order of independent work items after every source row has been checked.
+2. Because effort can change the interpretation, the hilltop instrument bench groups a hand-drawn seasonal model and records disagreements beside the relevant claim.
+3. The working record says that a library preservation unit sketches an inventory of modest risks. It does so so later readers can reconstruct the reasoning.
+4. Because recovery can change the interpretation, an independent archive team reviews several competing explanations while keeping the plan bounded to one working session.
+5. In a deliberately fictional exercise, a library preservation unit revises a ledger of bounded experiments after every source row has been checked, then marks the effort column for a separate reading.
+6. The working record says that the meadow survey group sketches the evidence behind each recommendation. It does so while keeping uncertain values visibly marked.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| effort | revise | synthetic row 0087-00 |
+| margin | revise | synthetic row 0087-01 |
+| coverage | revise | synthetic row 0087-02 |
+| noise | revise | synthetic row 0087-03 |
+| readiness | revise | synthetic row 0087-04 |
+| clarity | revise | synthetic row 0087-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/river_beacon_0088.diff =====
+diff --git a/modules/river_beacon_0088.py b/modules/river_beacon_0088.py
+index 13579bd..2468ace 100644
+--- a/modules/river_beacon_0088.py
++++ b/modules/river_beacon_0088.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 91
++DEFAULT_LIMIT = 98
++REVIEW_LABEL = "latency"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/north_catalog_0089.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "north_catalog_0089",
+  "rows": [
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 377,
+      "sequence": 1,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 447,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 200,
+      "sequence": 3,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 675,
+      "sequence": 4,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": false,
+      "reading": 872,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 523,
+      "sequence": 6,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 213,
+      "sequence": 7,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 188,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/meadow_trellis_0090.py =====
+"""Synthetic recovery aggregation for the fictional meadow_trellis_0090 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_meadow_trellis_0090(readings: list[Reading], ceiling: int = 72) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_meadow_trellis_0090(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/linen_trellis_0091/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_linen_trellis_0091(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 269 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_linen_trellis_0091(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/granite_folio_0092.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeGraniteFolio0092(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 800) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/velvet_trellis_0093.toml =====
+schema_version = 1
+name = "velvet_trellis_0093"
+mode = "deterministic-simulation"
+workspace = "workspace/velvet_trellis_0093"
+retain_incomplete = true
+
+[window]
+minimum_samples = 12
+maximum_samples = 91
+maximum_rounds = 11
+
+[categories]
+primary = "stability"
+secondary = "yield"
+review = "yield"
+archive = "readiness"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/kindled_engine_0094.yaml =====
+schema_version: 1
+fixture: kindled_engine_0094
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 314
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 11
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - clarity
+  - clarity
+  - yield
+
+===== FILE: migrations/0095_harbor_harvest_0095.sql =====
+BEGIN;
+
+CREATE TABLE harbor_harvest_0095_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX harbor_harvest_0095_category_sequence
+    ON harbor_harvest_0095_observations(category, sequence);
+
+INSERT INTO harbor_harvest_0095_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 42, 'points', 1),
+    (2, 'changing', 985, 'samples', 1),
+    (3, 'uncertain', 89, 'minutes', 0),
+    (4, 'calm', 44, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE harbor_harvest_0095_observations;
+
+===== FILE: notes/kindled_kiln_0096.md =====
+# Design record: kindled kiln 0096
+
+## Context
+
+Because readiness can change the interpretation, the river modelers examines several competing explanations before merging the observations into a final narrative.
+Because variance can change the interpretation, a volunteer map room measures the shared maintenance calendar so the report remains useful after the details change.
+
+## Decision
+
+The working record says that the paper engineering guild reconciles an inventory of modest risks. It does so after every source row has been checked.
+The working record says that the paper engineering guild annotates the latest material samples. It does so after every source row has been checked.
+
+## Alternatives retained
+
+1. Because coverage can change the interpretation, an independent archive team maps an inventory of modest risks before the afternoon review begins.
+2. For observation 1922, the ceramics cooperative estimates the latest material samples; the note labels yield as simulated rather than measured.
+3. For observation 1923, the river modelers examines the remaining design alternatives; the note labels readiness as simulated rather than measured.
+4. The working record says that a coastal ecology class maps the latest material samples. It does so without hiding incomplete or inconvenient outcomes.
+5. The working record says that the paper engineering guild estimates a collection of field-note fragments. It does so while treating every simulated failure as retained evidence.
+6. A coastal ecology class estimates the remaining design alternatives and assigns a plain-language meaning to each column.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| margin | revise | synthetic row 0096-00 |
+| recovery | revise | synthetic row 0096-01 |
+| recovery | retain | synthetic row 0096-02 |
+| noise | revise | synthetic row 0096-03 |
+| yield | revise | synthetic row 0096-04 |
+| stability | retain | synthetic row 0096-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/amber_orchard_0097.diff =====
+diff --git a/modules/amber_orchard_0097.py b/modules/amber_orchard_0097.py
+index 13579bd..2468ace 100644
+--- a/modules/amber_orchard_0097.py
++++ b/modules/amber_orchard_0097.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 89
++DEFAULT_LIMIT = 97
++REVIEW_LABEL = "recovery"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/fern_parcel_0098.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "fern_parcel_0098",
+  "rows": [
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 755,
+      "sequence": 1,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": false,
+      "reading": 821,
+      "sequence": 2,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 356,
+      "sequence": 3,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 809,
+      "sequence": 4,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 537,
+      "sequence": 5,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 867,
+      "sequence": 6,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 594,
+      "sequence": 7,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 334,
+      "sequence": 8,
+      "unit": "minutes"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/linen_quarry_0099.py =====
+"""Synthetic margin aggregation for the fictional linen_quarry_0099 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_linen_quarry_0099(readings: list[Reading], ceiling: int = 135) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_linen_quarry_0099(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/harbor_journal_0100/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_harbor_journal_0100(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 433 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_harbor_journal_0100(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/amber_ledger_0101.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeAmberLedger0101(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 352) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/kindled_catalog_0102.toml =====
+schema_version = 1
+name = "kindled_catalog_0102"
+mode = "deterministic-simulation"
+workspace = "workspace/kindled_catalog_0102"
+retain_incomplete = true
+
+[window]
+minimum_samples = 13
+maximum_samples = 985
+maximum_rounds = 10
+
+[categories]
+primary = "margin"
+secondary = "coverage"
+review = "stability"
+archive = "noise"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/brisk_harvest_0103.yaml =====
+schema_version: 1
+fixture: brisk_harvest_0103
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 491
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 16
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - clarity
+  - readiness
+  - margin
+
+===== FILE: migrations/0104_silver_beacon_0104.sql =====
+BEGIN;
+
+CREATE TABLE silver_beacon_0104_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX silver_beacon_0104_category_sequence
+    ON silver_beacon_0104_observations(category, sequence);
+
+INSERT INTO silver_beacon_0104_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 32, 'points', 1),
+    (2, 'changing', 821, 'samples', 1),
+    (3, 'uncertain', 176, 'minutes', 0),
+    (4, 'calm', 13, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE silver_beacon_0104_observations;
+
+===== FILE: notes/tidal_yardstick_0105.md =====
+# Design record: tidal yardstick 0105
+
+## Context
+
+The working record says that a rotating review panel sketches the queue of ordinary repairs. It does so while preserving the original ordering of evidence.
+In a deliberately fictional exercise, a library preservation unit balances the acceptance rules for the next review and records disagreements beside the relevant claim, then marks the noise column for a separate reading.
+
+## Decision
+
+Because clarity can change the interpretation, a local history workshop measures the evidence behind each recommendation and assigns a plain-language meaning to each column.
+For observation 1263, the cedar workshop documents the shared maintenance calendar; the note labels readiness as simulated rather than measured.
+
+## Alternatives retained
+
+1. For observation 2101, a local history workshop groups the differences between two mock trials; the note labels coverage as simulated rather than measured.
+2. A library preservation unit estimates a table of simulated readings and assigns a plain-language meaning to each column.
+3. Because drift can change the interpretation, a rotating review panel summarizes the latest material samples using only the fictional measurements in this document.
+4. The ceramics cooperative measures a ledger of bounded experiments with an explicit stopping condition for the experiment.
+5. For observation 2105, a community kitchen lab stages a collection of field-note fragments; the note labels drift as simulated rather than measured.
+6. In a deliberately fictional exercise, a rotating review panel reconciles the latest material samples before any irreversible step is proposed, then marks the drift column for a separate reading.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| readiness | revise | synthetic row 0105-00 |
+| effort | revise | synthetic row 0105-01 |
+| clarity | retain | synthetic row 0105-02 |
+| noise | retain | synthetic row 0105-03 |
+| yield | revise | synthetic row 0105-04 |
+| clarity | revise | synthetic row 0105-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/willow_matrix_0106.diff =====
+diff --git a/modules/willow_matrix_0106.py b/modules/willow_matrix_0106.py
+index 13579bd..2468ace 100644
+--- a/modules/willow_matrix_0106.py
++++ b/modules/willow_matrix_0106.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 87
++DEFAULT_LIMIT = 92
++REVIEW_LABEL = "readiness"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/meadow_atlas_0107.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "meadow_atlas_0107",
+  "rows": [
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 252,
+      "sequence": 1,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 733,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 564,
+      "sequence": 3,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 386,
+      "sequence": 4,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 339,
+      "sequence": 5,
+      "unit": "points"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 245,
+      "sequence": 6,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 355,
+      "sequence": 7,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 396,
+      "sequence": 8,
+      "unit": "points"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/river_garden_0108.py =====
+"""Synthetic readiness aggregation for the fictional river_garden_0108 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_river_garden_0108(readings: list[Reading], ceiling: int = 108) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_river_garden_0108(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/kindled_folio_0109/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_kindled_folio_0109(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 403 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_kindled_folio_0109(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/ochre_folio_0110.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeOchreFolio0110(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 896) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/harbor_vessel_0111.toml =====
+schema_version = 1
+name = "harbor_vessel_0111"
+mode = "deterministic-simulation"
+workspace = "workspace/harbor_vessel_0111"
+retain_incomplete = true
+
+[window]
+minimum_samples = 5
+maximum_samples = 135
+maximum_rounds = 3
+
+[categories]
+primary = "margin"
+secondary = "recovery"
+review = "margin"
+archive = "coverage"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/quiet_catalog_0112.yaml =====
+schema_version: 1
+fixture: quiet_catalog_0112
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 304
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 1
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - variance
+  - coverage
+  - yield
+
+===== FILE: migrations/0113_meadow_workshop_0113.sql =====
+BEGIN;
+
+CREATE TABLE meadow_workshop_0113_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX meadow_workshop_0113_category_sequence
+    ON meadow_workshop_0113_observations(category, sequence);
+
+INSERT INTO meadow_workshop_0113_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 67, 'points', 1),
+    (2, 'changing', 974, 'samples', 1),
+    (3, 'uncertain', 38, 'minutes', 0),
+    (4, 'calm', 13, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE meadow_workshop_0113_observations;
+
+===== FILE: notes/ochre_garden_0114.md =====
+# Design record: ochre garden 0114
+
+## Context
+
+In a deliberately fictional exercise, a public garden committee maps a sequence of labeled measurements with an explicit stopping condition for the experiment, then marks the variance column for a separate reading.
+Because readiness can change the interpretation, a small observatory crew documents the remaining design alternatives so later readers can reconstruct the reasoning.
+
+## Decision
+
+The working record says that a small observatory crew classifies the queue of ordinary repairs. It does so while keeping the plan bounded to one working session.
+Because clarity can change the interpretation, the lantern design office tests a table of simulated readings and records disagreements beside the relevant claim.
+
+## Alternatives retained
+
+1. Because effort can change the interpretation, a small observatory crew reorders a collection of field-note fragments while treating every simulated failure as retained evidence.
+2. The working record says that a coastal ecology class documents a hand-drawn seasonal model. It does so and records disagreements beside the relevant claim.
+3. In a deliberately fictional exercise, the ceramics cooperative examines a table of simulated readings before the afternoon review begins, then marks the yield column for a separate reading.
+4. For observation 2284, a public garden committee reconciles the evidence behind each recommendation; the note labels margin as simulated rather than measured.
+5. Because variance can change the interpretation, a rotating review panel rechecks a hand-drawn seasonal model without hiding incomplete or inconvenient outcomes.
+6. Because recovery can change the interpretation, the neighborhood weather desk examines an inventory of modest risks and records disagreements beside the relevant claim.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| margin | revise | synthetic row 0114-00 |
+| readiness | revise | synthetic row 0114-01 |
+| drift | retain | synthetic row 0114-02 |
+| coverage | retain | synthetic row 0114-03 |
+| stability | revise | synthetic row 0114-04 |
+| effort | revise | synthetic row 0114-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/meadow_beacon_0115.diff =====
+diff --git a/modules/meadow_beacon_0115.py b/modules/meadow_beacon_0115.py
+index 13579bd..2468ace 100644
+--- a/modules/meadow_beacon_0115.py
++++ b/modules/meadow_beacon_0115.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 82
++DEFAULT_LIMIT = 98
++REVIEW_LABEL = "coverage"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
+
+===== FILE: fixtures/kindled_delta_0116.json =====
+{
+  "description": "fictional deterministic observation fixture",
+  "id": "kindled_delta_0116",
+  "rows": [
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 198,
+      "sequence": 1,
+      "unit": "samples"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 328,
+      "sequence": 2,
+      "unit": "minutes"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 445,
+      "sequence": 3,
+      "unit": "samples"
+    },
+    {
+      "category": "calm",
+      "complete": true,
+      "reading": 925,
+      "sequence": 4,
+      "unit": "points"
+    },
+    {
+      "category": "changing",
+      "complete": true,
+      "reading": 478,
+      "sequence": 5,
+      "unit": "points"
+    },
+    {
+      "category": "uncertain",
+      "complete": true,
+      "reading": 993,
+      "sequence": 6,
+      "unit": "samples"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 593,
+      "sequence": 7,
+      "unit": "minutes"
+    },
+    {
+      "category": "changing",
+      "complete": false,
+      "reading": 489,
+      "sequence": 8,
+      "unit": "points"
+    }
+  ],
+  "schema_version": 1
+}
+
+===== FILE: modules/cedar_garden_0117.py =====
+"""Synthetic clarity aggregation for the fictional cedar_garden_0117 module."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    label: str
+    value: int
+    accepted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Summary:
+    accepted: int
+    rejected: int
+    total: int
+
+
+def summarize_cedar_garden_0117(readings: list[Reading], ceiling: int = 172) -> Summary:
+    """Classify bounded mock readings without discarding rejected rows."""
+    if ceiling < 1:
+        raise ValueError("ceiling must be positive")
+    accepted = 0
+    rejected = 0
+    total = 0
+    for reading in readings:
+        if reading.value < 0:
+            raise ValueError("reading values must be non-negative")
+        total += reading.value
+        if reading.accepted and reading.value <= ceiling:
+            accepted += 1
+        else:
+            rejected += 1
+    return Summary(accepted=accepted, rejected=rejected, total=total)
+
+
+def render_cedar_garden_0117(summary: Summary) -> str:
+    fields = (
+        f"accepted={summary.accepted}",
+        f"rejected={summary.rejected}",
+        f"total={summary.total}",
+    )
+    return ", ".join(fields)
+
+===== FILE: crates/north_ledger_0118/src/lib.rs =====
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sample {
+    pub sequence: u32,
+    pub magnitude: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Totals {
+    pub complete: usize,
+    pub incomplete: usize,
+    pub magnitude: u64,
+}
+
+pub fn fold_north_ledger_0118(samples: &[Sample]) -> Result<Totals, &'static str> {
+    if samples.len() > 314 {
+        return Err("sample collection exceeds the synthetic bound");
+    }
+    let mut totals = Totals { complete: 0, incomplete: 0, magnitude: 0 };
+    for sample in samples {
+        totals.magnitude = totals.magnitude
+            .checked_add(sample.magnitude)
+            .ok_or("magnitude overflow")?;
+        if sample.complete {
+            totals.complete += 1;
+        } else {
+            totals.incomplete += 1;
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_samples_remain_in_totals() {
+        let samples = [
+            Sample { sequence: 1, magnitude: 8, complete: true },
+            Sample { sequence: 2, magnitude: 13, complete: false },
+        ];
+        let totals = fold_north_ledger_0118(&samples).unwrap();
+        assert_eq!(totals.complete, 1);
+        assert_eq!(totals.incomplete, 1);
+        assert_eq!(totals.magnitude, 21);
+    }
+}
+
+===== FILE: web/quiet_parcel_0119.ts =====
+export type Observation = Readonly<{
+  sequence: number;
+  category: "calm" | "changing" | "uncertain";
+  reading: number;
+}>;
+
+export type WindowSummary = Readonly<{
+  count: number;
+  minimum: number | null;
+  maximum: number | null;
+  span: number | null;
+}>;
+
+export function summarizeQuietParcel0119(
+  rows: readonly Observation[],
+): WindowSummary {
+  if (rows.length === 0) {
+    return { count: 0, minimum: null, maximum: null, span: null };
+  }
+  if (rows.length > 864) {
+    throw new Error("synthetic observation window is too wide");
+  }
+  let minimum = rows[0].reading;
+  let maximum = rows[0].reading;
+  for (const row of rows.slice(1)) {
+    minimum = Math.min(minimum, row.reading);
+    maximum = Math.max(maximum, row.reading);
+  }
+  return { count: rows.length, minimum, maximum, span: maximum - minimum };
+}
+
+===== FILE: config/juniper_workshop_0120.toml =====
+schema_version = 1
+name = "juniper_workshop_0120"
+mode = "deterministic-simulation"
+workspace = "workspace/juniper_workshop_0120"
+retain_incomplete = true
+
+[window]
+minimum_samples = 5
+maximum_samples = 273
+maximum_rounds = 18
+
+[categories]
+primary = "effort"
+secondary = "latency"
+review = "recovery"
+archive = "latency"
+
+[[stages]]
+name = "collect"
+requires = []
+
+[[stages]]
+name = "review"
+requires = ["collect"]
+
+[[stages]]
+name = "publish-synthetic-summary"
+requires = ["review"]
+
+===== FILE: fixtures/north_notebook_0121.yaml =====
+schema_version: 1
+fixture: north_notebook_0121
+description: fictional bounded workflow data
+steps:
+  - id: gather
+    action: collect_simulated_rows
+    maximum_rows: 49
+    on_incomplete: retain
+  - id: compare
+    action: compare_labeled_windows
+    depends_on: [gather]
+    tolerance_points: 1
+  - id: summarize
+    action: write_plain_summary
+    depends_on: [compare]
+assertions:
+  preserve_input_order: true
+  require_explicit_units: true
+  allow_missing_observations: true
+  reject_unknown_fields: true
+labels:
+  - recovery
+  - coverage
+  - effort
+
+===== FILE: migrations/0122_amber_parcel_0122.sql =====
+BEGIN;
+
+CREATE TABLE amber_parcel_0122_observations (
+    sequence INTEGER PRIMARY KEY,
+    category TEXT NOT NULL CHECK (category IN ('calm', 'changing', 'uncertain')),
+    reading INTEGER NOT NULL CHECK (reading >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+);
+
+CREATE INDEX amber_parcel_0122_category_sequence
+    ON amber_parcel_0122_observations(category, sequence);
+
+INSERT INTO amber_parcel_0122_observations(sequence, category, reading, unit, complete) VALUES
+    (1, 'calm', 95, 'points', 1),
+    (2, 'changing', 732, 'samples', 1),
+    (3, 'uncertain', 193, 'minutes', 0),
+    (4, 'calm', 20, 'points', 1);
+
+COMMIT;
+
+-- Down migration, intentionally shown as documentation only:
+-- DROP TABLE amber_parcel_0122_observations;
+
+===== FILE: notes/drift_atlas_0123.md =====
+# Design record: drift atlas 0123
+
+## Context
+
+In a deliberately fictional exercise, a small observatory crew measures the evidence behind each recommendation using only the fictional measurements in this document, then marks the margin column for a separate reading.
+The working record says that the morning logistics crew reorders the order of independent work items. It does so while preserving the original ordering of evidence.
+
+## Decision
+
+A public garden committee examines the order of independent work items with an explicit stopping condition for the experiment.
+Because coverage can change the interpretation, a coastal ecology class estimates the latest material samples and records disagreements beside the relevant claim.
+
+## Alternatives retained
+
+1. Because effort can change the interpretation, the cedar workshop annotates the evidence behind each recommendation while preserving the original ordering of evidence.
+2. In a deliberately fictional exercise, a rotating review panel documents the latest material samples while preserving the original ordering of evidence, then marks the coverage column for a separate reading.
+3. The cedar workshop reconciles an inventory of modest risks with an explicit stopping condition for the experiment.
+4. A rotating review panel documents the queue of ordinary repairs while preserving the original ordering of evidence.
+5. In a deliberately fictional exercise, the ceramics cooperative sketches the acceptance rules for the next review and leaves a concise explanation for each exception, then marks the readiness column for a separate reading.
+6. For observation 2466, a local history workshop reconciles the shared maintenance calendar; the note labels recovery as simulated rather than measured.
+
+## Review matrix
+
+| Question | Answer | Evidence |
+|---|---|---|
+| effort | revise | synthetic row 0123-00 |
+| noise | retain | synthetic row 0123-01 |
+| readiness | retain | synthetic row 0123-02 |
+| yield | retain | synthetic row 0123-03 |
+| yield | retain | synthetic row 0123-04 |
+| noise | retain | synthetic row 0123-05 |
+
+This record is fictional, original, and dedicated under CC0-1.0.
+===== FILE: changes/umber_yardstick_0124.diff =====
+diff --git a/modules/umber_yardstick_0124.py b/modules/umber_yardstick_0124.py
+index 13579bd..2468ace 100644
+--- a/modules/umber_yardstick_0124.py
++++ b/modules/umber_yardstick_0124.py
+@@ -1,10 +1,18 @@
+-DEFAULT_LIMIT = 76
++DEFAULT_LIMIT = 84
++REVIEW_LABEL = "clarity"
+ # Selection policy is explicit in both fictional revisions.
+-def select(rows):
+-    return rows[:DEFAULT_LIMIT]
++def select(rows, *, limit=DEFAULT_LIMIT):
++    if not 1 <= limit <= DEFAULT_LIMIT:
++        raise ValueError("limit is outside the synthetic bound")
++    selected = []
++    for row in rows:
++        if len(selected) == limit:
++            break
++        if row.get("complete", False):
++            selected.append(row)
++    return selected
+ # The description helper remains next in both fictional revisions.
+-def describe(rows):
+-    return f"rows={len(rows)}"
++def describe(rows, selected):
++    return f"rows={len(rows)}, selected={len(selected)}, label={REVIEW_LABEL}"
++
++# The complete-row preference is part of this fictional example, not a
++# recommendation for benchmark accounting, where incomplete work is retained.
