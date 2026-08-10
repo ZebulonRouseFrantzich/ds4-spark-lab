@@ -931,7 +931,7 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
 
     def test_pending_run_survives_ambiguous_serve_and_requires_matching_cleanup(self) -> None:
         from scripts.targetctl.lifecycle import CleanupResult
-        from scripts.targetctl.workflow import _pending_run, execute
+        from scripts.targetctl.workflow import _pending_run, _ready, _store_pending_run, execute
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -958,6 +958,14 @@ class WorkflowFinalCoverageTests(unittest.TestCase):
 
             matching = CleanupResult(observed[0], "succeeded", "cleared", "cleared", "not_found", "cleared")
             with patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.cleanup", return_value=matching):
+                execute(root, "local", "cleanup")
+            self.assertIsNone(_pending_run(root, "local"))
+
+            source, built = _ready(root, "local")
+            expired = "run-expired-owner-0001"
+            _store_pending_run(root, "local", source, built, expired)
+            absent = CleanupResult(None, "not_run", "not_found", "not_found", "not_found", "not_found")
+            with patch("scripts.targetctl.workflow.load_operational_target", return_value=fixture.config), patch("scripts.targetctl.workflow.select_transport"), patch("scripts.targetctl.workflow.cleanup", return_value=absent):
                 execute(root, "local", "cleanup")
             self.assertIsNone(_pending_run(root, "local"))
 

@@ -955,7 +955,11 @@ def execute(repo_root: str | os.PathLike[str], target: str, operation: str, *, a
                 "log_bytes": len(content),
             }
         result = stop(config, transport, runtime, run_id=pending_run_id) if operation == "stop" else cleanup(config, transport, runtime, run_id=pending_run_id)
-        if result.run_id == pending_run_id and result.status in {"succeeded", "not_run"}:
+        if (
+            pending_run_id is not None
+            and result.status in {"succeeded", "not_run"}
+            and (result.run_id == pending_run_id or (result.status == "not_run" and result.run_id is None))
+        ):
             _clear_pending_run(root, config.name, pending_run_id)
         payload = result.controller_payload()
         outcome = payload.pop("status")
