@@ -1240,7 +1240,7 @@ def _http_contract(port, timeout):
         parsed = json.loads(body.decode("utf-8")); models = isinstance(parsed, Mapping) and isinstance(parsed.get("data"), list)
         if not models: return True, False, False
         connection.close(); connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-        request = {"messages": [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}], "max_tokens": 64}
+        request = {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}], "max_tokens": 64, "stream": False}
         connection.request("POST", "/v1/chat/completions", body=json.dumps(request, separators=(",", ":")).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/json"}); response = connection.getresponse(); body = response.read(MAX_HTTP_BODY_BYTES + 1)
         if response.status != 200 or len(body) > MAX_HTTP_BODY_BYTES: return True, True, False
         content = json.loads(body.decode("utf-8"))["choices"][0]["message"]["content"]
