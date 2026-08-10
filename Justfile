@@ -233,3 +233,25 @@ flake-check:
     set -euo pipefail
     cd '{{ ROOT }}'
     nix flake check
+
+# Target operations — Phase 01
+target-doctor target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl doctor --target {{ quote(target) }}
+target-sync target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl sync --target {{ quote(target) }}
+target-build target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl build --target {{ quote(target) }}
+target-serve target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl serve --target {{ quote(target) }}
+target-status target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl status --target {{ quote(target) }}
+target-logs target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl logs --target {{ quote(target) }}
+target-stop target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl stop --target {{ quote(target) }}
+target-smoke target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl smoke --target {{ quote(target) }}
+target-cleanup target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl cleanup --target {{ quote(target) }}
+target-bundle target="spark":
+    cd '{{ ROOT }}' && python3 -m scripts.targetctl bundle --target {{ quote(target) }}

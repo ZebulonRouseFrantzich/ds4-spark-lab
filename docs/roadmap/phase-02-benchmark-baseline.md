@@ -180,6 +180,15 @@ Record aggregate and per-request throughput, TTFT, ITL distribution, completion
 time, fairness, peak memory, live rows, and graph-path data where currently
 available.
 
+The qualified S1 baseline uses the frozen release's shipped policy: DSpark is
+configured, `DS4_DSPARK_MAX_NLIVE=1`, terminal yield quench is enabled, and no
+speculative-controller overrides are applied. This describes configured policy,
+not a claim that every decode step speculates. While multiple requests are live,
+the current source falls back to plain batched decode; DSpark may re-engage
+after the live set drains to one, and quench may turn it off per request.
+Summaries must not label an entire concurrency run as DSpark execution without
+observed step evidence.
+
 #### S2 — realistic mixed-agent burst
 
 Start a heterogeneous burst approximating:
@@ -231,6 +240,14 @@ Use for current upstream engine microbenchmarks, localhost server reference
 runs, and small latency/path investigations. Any claimed millisecond-scale
 scheduler improvement in later phases must reproduce here.
 
+For S1 at concurrency 1, run paired target-local ship-policy versus plain-decode
+controls with identical prompts, sampling, output budgets, reset state, and
+paired ordering for both the short and approximately 32K cases. This attributes
+the complete current DSpark path, not the DFlash backbone in isolation. It is a
+control, not a sixth scenario ID, and does not authorize a Cartesian
+mode-by-scenario sweep. If a content-specific follow-up becomes necessary, reuse
+the existing repo-like corpus rather than adding code/prose scenario families.
+
 Do not merge local and LAN samples into one distribution.
 
 ### 7. Correctness baseline
@@ -265,6 +282,22 @@ telemetry.jsonl             # only collected fields
 summary.json
 summary.md
 ```
+
+`metadata.json` and the normalized scenario must distinguish configured
+speculation policy from observed execution. Retain at least:
+
+- the resolved configured decode/speculation policy and relevant launch
+  arguments;
+- `DS4_DSPARK_MAX_NLIVE`, quench enablement, and every non-default
+  speculative-controller override;
+- existing observed aggregates for speculative/plain steps, proposals,
+  verification width, accepts, and quench where the frozen source exposes them.
+
+A configured DSpark run may contain both speculative and plain steps, so one
+run-level mode value is not execution evidence. Represent an unavailable
+observed signal explicitly as unavailable, never as zero. Phase 02 must not add
+engine telemetry merely to fill these fields; any concrete unresolved
+attribution gap is handed to Phase 03.
 
 Raw results are normally gitignored. Baseline manifests, compact summaries, and
 approved reports may be tracked. Model paths, target addresses, usernames,
@@ -310,6 +343,8 @@ scenario, and vantage-point identity.
 - No new engine telemetry solely because it would be convenient.
 - No S4, S6, S7, S8, cache scenarios, chaos framework, or OMP end-to-end test.
 - No automatic tuning or Cartesian parameter sweep.
+- No standalone DFlash mode, forced-multisequence DSpark qualification matrix,
+  or speculative-policy tuning.
 - No dashboard or database.
 - No generic load-testing framework.
 - No performance target inferred from published Entrpi results.
@@ -354,27 +389,34 @@ On the exact frozen source:
 
 1. run the selected upstream correctness/quality gates;
 2. run target-local reference measurements;
-3. run S1/S2/S3/S5A/S5B from the controller;
-4. repeat enough times to characterize normal variance;
-5. inspect every failure/retry rather than dropping it;
-6. retain raw samples and a reviewed summary.
+3. run the paired S1 concurrency-1 ship-policy/plain controls for the short and
+   approximately 32K prompts;
+4. run S1/S2/S3/S5A/S5B from the controller under the shipped baseline policy;
+5. repeat enough times to characterize normal variance;
+6. inspect every failure/retry rather than dropping it;
+7. retain raw samples and a reviewed summary.
 
 ## Acceptance gate
 
 Phase 02 is Qualified only when:
 
 1. the exact engine/integration/lab/lock/model/drafter identities are retained;
-2. the relevant upstream correctness and quality gates pass or any explicit
+2. every qualified run records configured speculation policy and non-default
+   overrides, and summaries distinguish configuration from observed
+   speculative/plain execution without synthesizing absent counters;
+3. paired target-local S1 concurrency-1 ship-policy/plain controls complete for
+   the short and approximately 32K prompts;
+4. the relevant upstream correctness and quality gates pass or any explicit
    exception is documented without overstating coverage;
-3. all five V1 scenario IDs execute end to end and clean up the server;
-4. prompt hashes and frozen-token counts are stable and licensed for public use;
-5. LAN and target-local measurements are kept distinct;
-6. raw samples reproduce every summary statistic;
-7. failures, retry responses, and incomplete requests remain in results;
-8. baseline variance and proposed V1 decision thresholds are recorded before
-   scheduler candidate work;
-9. artifacts pass privacy/redaction checks;
-10. a clean umbrella baseline commit/tag pins the exact source pair.
+5. all five V1 scenario IDs execute end to end and clean up the server;
+6. prompt hashes and frozen-token counts are stable and licensed for public use;
+7. LAN and target-local measurements are kept distinct;
+8. raw samples reproduce every summary statistic;
+9. failures, retry responses, and incomplete requests remain in results;
+10. baseline variance and proposed V1 decision thresholds are recorded before
+    scheduler candidate work;
+11. artifacts pass privacy/redaction checks;
+12. a clean umbrella baseline commit/tag pins the exact source pair.
 
 ## Artifacts
 
@@ -385,6 +427,9 @@ Retain:
 - prompt provenance, hashes, and token counts;
 - every raw S1/S2/S3/S5A/S5B run;
 - target-local controls;
+- paired target-local S1 concurrency-1 ship-policy/plain controls;
+- resolved speculation configuration, existing observed execution aggregates,
+  and explicit unavailable-signal declarations;
 - baseline variance analysis;
 - frozen acceptance-threshold proposal;
 - compact reviewed baseline report;
@@ -398,6 +443,7 @@ Retain:
 | LAN noise is mistaken for engine behavior | Paired network path plus target-local controls |
 | Prompt corpus cannot be redistributed | Synthetic/permissive sources and explicit provenance |
 | Default output budget is misunderstood | Resolve and record it; keep S5A and S5B separate |
+| Configured DSpark is mislabeled as all-steps speculation | Separate configured policy from observed steps; retain live-count fallback and quench evidence |
 | Failed requests disappear from throughput | Include every scheduled request and failure in denominators |
 | Benchmark framework grows ahead of features | Reject scenarios/dependencies without a current gate |
 | Thermal or initialization drift biases results | Warm-up, alternation, repetitions, target state capture |
@@ -417,4 +463,6 @@ Phase 03 receives:
 - measured baseline behavior, including current deep-capacity outcomes;
 - baseline variance and predeclared V1 thresholds;
 - a list of observations the current server already exposes and the concrete
-  questions it cannot answer.
+  questions it cannot answer;
+- configured speculation policy, observed engagement/fallback evidence, and any
+  concrete attribution question the current signals cannot answer.

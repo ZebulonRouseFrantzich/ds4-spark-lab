@@ -1,10 +1,11 @@
-# Private local configuration and assets
+# Private local configuration, controller state, and assets
 /targets/
 /models/
 /drafters/
 
 # Raw, regenerable outputs
 /benchmarks/results/
+/artifacts/phase-01-runs/
 /build/
 /dist/
 

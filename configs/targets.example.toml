@@ -1,0 +1,21 @@
+# Documentation-only schema. Copy to `targets/targets.toml`, replace placeholders,
+# and set that private file to mode 0600; it is never committed or snapshotted.
+schema_version = 1
+
+[spark]
+name = "spark"
+mode = "ssh"
+ssh_host = "<logical-ssh-alias>"
+workdir = "<dedicated-disposable-work-directory>"
+run_dir = "<dedicated-process-and-log-directory>"
+api_base_url = "http://127.0.0.1:<port>"
+model_path = "<target-local-model-path>"
+drafter_path = "<target-local-drafter-path>"
+
+[local]
+name = "local"
+mode = "local"
+
+# Local runtime paths are invocation-only, never TOML or CLI values:
+# TARGETCTL_MODEL_PATH=/absolute/model TARGETCTL_DRAFTER_PATH=/absolute/drafter
+# Local lifecycle uses the documented fixed loopback port 8000.

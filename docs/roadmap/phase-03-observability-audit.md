@@ -46,6 +46,20 @@ observations without requiring a tracing platform or measurable hot-path cost.
 - Can scheduler/host decision cost be measured without high-frequency content
   tracing?
 
+### Speculation attribution
+
+This subsection becomes actionable only when Phase 02 records a concrete result
+that configured policy plus existing aggregates cannot explain.
+
+- Can existing evidence distinguish DSpark-eligible steps, live-count
+  plain-decode fallback and re-entry, proposal/verification width, accepted
+  prefixes, terminal quench, and the resulting graph path?
+- Does the frozen continuous path consume the loaded confidence-head output when
+  selecting verification width, or is another bounded controller the runtime
+  owner?
+- Can the gap be closed from run manifests and existing aggregates rather than
+  adding request- or token-level traces?
+
 ### Correlation
 
 - Can one benchmark run correlate client request IDs, server outcomes, capacity
@@ -66,6 +80,9 @@ observations without requiring a tracing platform or measurable hot-path cost.
 - The engine submodule is still based on exact V1 lineage.
 - Phase 02 identifies concrete unexplained observations; speculative convenience
   metrics are not sufficient justification.
+- A speculation-specific instrumentation gap is actionable only when Phase 02
+  names the S1 or graph-preservation result it prevents the project from
+  interpreting.
 - Relevant existing metrics and tests in the frozen source are inventoried
   before a new name or label is proposed.
 
@@ -83,7 +100,10 @@ Before editing, record the exact functions and structures responsible for:
 - cancellation/disconnect cleanup;
 - deep serial guard and HTTP error projection;
 - continuous prefill service;
-- decode packing and CUDA graph eligibility/replay/fallback;
+- DSpark eligibility, live-count fallback/re-entry, proposal and verification
+  width, accepted-prefix and quench ownership, and whether confidence-head
+  output participates in runtime width selection;
+- decode/speculative packing and CUDA graph eligibility/replay/fallback;
 - metrics declaration, update, export, and tests.
 
 Search every callsite before modifying exported symbols or shared enums. The
@@ -101,6 +121,10 @@ A gap is actionable only when it blocks Phase 04/05 attribution or acceptance.
 Prefer an existing metric, a derived value, or a one-time run manifest over a
 new hot-path counter.
 
+For speculation attribution, first combine the resolved run configuration with
+existing bounded counters, logs, and derived aggregates. Configuration alone is
+not evidence that each step used that execution path.
+
 ### 3. Add minimal fixed-cardinality observations
 
 Candidate concepts, only if the audit proves they are absent:
@@ -115,6 +139,9 @@ decode graph replay step
 decode eager fallback step by bounded reason
 prefill service quanta/tokens already performed by the frozen path
 scheduler/host decision duration when it can be measured cheaply
+speculative versus plain execution step by bounded class
+verification-width class and proposed/accepted aggregate
+terminal speculation quench aggregate
 ```
 
 Rules:
@@ -122,6 +149,11 @@ Rules:
 - Do not add a `capacity_deferred` event before deferred capacity exists; that
   observation belongs to Phase 04 if there is no meaningful current event.
 - Do not add a scheduler-policy counter before the scheduler exists.
+- Do not add a standalone DFlash mode, confidence-pruning policy,
+  verification-width policy, or quench-policy change under observability scope.
+- Run configuration belongs in the run manifest, not arbitrary metric labels.
+- Do not add per-token proposal/acceptance traces when bounded existing or
+  derived aggregates answer the named question.
 - Use bounded enums or fixed labels; never place request IDs, paths, prompt
   text, model text, error strings, or arbitrary configuration in metric labels.
 - Aggregate counters remain cheap and thread-safe under the source's existing
@@ -146,6 +178,7 @@ server route/lane outcome
 capacity/admission aggregate or bounded reason
 prefill progress
 graph path aggregate
+configured speculation policy and observed execution aggregate, when required
 ```
 
 A full per-epoch JSONL trace is not part of this phase. Add it later only if
@@ -166,7 +199,10 @@ Tests defend observable contracts:
 - label/reason sets are bounded;
 - cancellation and shed outcomes remain distinct;
 - metric export remains valid under concurrent requests;
-- feature-disabled or unsupported paths are represented honestly.
+- feature-disabled or unsupported paths are represented honestly;
+- configured DSpark with plain fallback is not reported as all-steps
+  speculation;
+- unavailable speculation signals remain distinct from observed zeroes.
 
 Do not write tests that merely search source text or assert an implementation
 constant without exercising the event.
@@ -176,6 +212,9 @@ constant without exercising the event.
 - No admission-state or queue behavior change.
 - No deferred-capacity implementation.
 - No scheduler policy or prefill-quantum change.
+- No DSpark/DFlash algorithm, eligibility, confidence-pruning,
+  verification-width, or quench-policy change.
+- No per-token speculative proposal/acceptance trace.
 - No tracing platform, database, dashboard, or OpenTelemetry rollout.
 - No prompt/token content in logs.
 - No unbounded metric labels.
@@ -241,16 +280,19 @@ allowed; access details are not.
 Phase 03 is Qualified only when:
 
 1. the frozen source ownership and existing observability are mapped;
-2. every added observation closes a named Phase 04/05 evidence gap;
-3. all new reasons/labels have bounded cardinality and documented semantics;
-4. no request, queue, scheduling, fallback, or execution behavior changes;
-5. relevant correctness and API tests pass;
-6. paired performance remains within the predeclared measurement-noise gate;
-7. S1/S3/S5 artifacts can distinguish the current admission/fallback and graph
+2. configured speculation policy is not presented as execution evidence and,
+   when Phase 02 names an attribution gap, existing or minimally added bounded
+   data distinguishes the relevant speculative/plain execution;
+3. every added observation closes a named Phase 04/05 evidence gap;
+4. all new reasons/labels have bounded cardinality and documented semantics;
+5. no request, queue, scheduling, fallback, or execution behavior changes;
+6. relevant correctness and API tests pass;
+7. paired performance remains within the predeclared measurement-noise gate;
+8. S1/S3/S5 artifacts can distinguish the current admission/fallback and graph
    behavior needed by the next phases;
-8. no content or private configuration leaks through metrics/logs/artifacts;
-9. no JSONL trace or broader telemetry platform was added without demonstrated
-   need.
+9. no content or private configuration leaks through metrics/logs/artifacts;
+10. no JSONL trace or broader telemetry platform was added without demonstrated
+    need.
 
 ## Artifacts
 
@@ -258,6 +300,8 @@ Retain:
 
 - source ownership map with exact engine commit;
 - observability matrix;
+- speculation-path source map and the retained decision to reuse, derive, add,
+  or reject each candidate execution signal;
 - final metrics/reason schema and semantics;
 - targeted test outcomes;
 - paired overhead measurements;
@@ -274,6 +318,7 @@ Retain:
 | Instrumentation changes ownership/races | Update at existing decision owner; focused concurrency tests |
 | Zero is mistaken for unavailable | Schema/source identity and explicit absence handling |
 | Audit becomes a telemetry project | Every addition maps to a Phase 04/05 question |
+| Audit expands into speculative-algorithm research | Require a named Phase 02 attribution gap; prohibit policy or mode changes |
 | Logs expose content or target details | Content-free correlation and artifact scan |
 
 Every instrumentation change is independently revertible. If it cannot stay
@@ -290,4 +335,6 @@ Phase 04 receives:
 - baseline counts for current deep-capacity and deep-serial behavior;
 - enough correlation to prove whether a transient request deferred, shed,
   failed, or completed;
-- unchanged baseline request semantics and measured instrumentation overhead.
+- unchanged baseline request semantics and measured instrumentation overhead;
+- the existing decode/speculative ownership boundary needed to preserve the
+  baseline path through Phase 05.

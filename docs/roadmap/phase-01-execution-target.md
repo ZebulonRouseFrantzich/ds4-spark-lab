@@ -2,7 +2,14 @@
 
 ## Status
 
-**Planned**
+**Qualified — 2026-08-09.** Retained evidence:
+[Phase 01 qualification record](phase-01-qualification.md).
+
+The qualified lab implementation candidate is
+`e82ed34b5bfd08bbc96031fa36c11eb2054d8e14`. The record proves the
+configured DGX Spark sync, doctor, native build, deterministic functional
+smoke, failure/interruption cleanup, artifact return, privacy gates, and
+independent reviews. No fork source or engine behavior changed.
 
 ## Depends on
 
@@ -87,7 +94,7 @@ mode = "ssh"
 ssh_host = "<logical-ssh-alias>"
 workdir = "<dedicated-disposable-work-directory>"
 run_dir = "<dedicated-process-and-log-directory>"
-api_base_url = "http://<target-address>:<port>"
+api_base_url = "http://127.0.0.1:<port>"
 model_path = "<target-local-model-path>"
 drafter_path = "<target-local-drafter-path>"
 ```
@@ -103,6 +110,11 @@ The committed example is documentation, not a working local target. It contains
 no real address, username, host alias, home directory, credential, or model
 path. Configuration parsing must fail clearly on missing required values and
 must never print secret-bearing values indiscriminately.
+
+Phase 01 deliberately supports loopback serving only. In `ssh` mode the
+controller functional smoke reaches that endpoint through a bounded,
+operation-owned SSH forward. Direct trusted-LAN measurement remains a Phase 02
+concern and is not enabled by a declarative configuration assertion.
 
 ### 2. Target doctor
 
@@ -127,6 +139,13 @@ supported path.
 
 Doctor output used in reports is sanitized before retention.
 
+The implemented doctor records a bounded `nix` status and version only. A
+present Nix installation evaluates the synchronized workspace flake with
+`--no-write-lock-file`; `nvcc`, `gcc`, and `g++` must resolve to the fixed
+target-native paths and report the same versions observed outside the shell.
+Path or version drift fails doctor. Nix absence is the only supported bypass.
+The aggregate bundle therefore synchronizes source before running doctor.
+
 ### 3. Source snapshot and synchronization
 
 Synchronize the actual controller worktrees, including supported dirty and
@@ -145,6 +164,13 @@ After transfer, compute an applied-source hash on the target and require it to
 match. A qualified clean baseline still requires committed worktrees; dirty
 support exists for development iteration and must identify itself honestly.
 
+The implementation records two versioned identities: a snapshot identity over
+repository state and exclusions, and an independently recomputable applied-tree
+hash over the transferred file inventory. Qualification is clean-only.
+Development builds from a dirty snapshot require an explicit per-invocation
+acknowledgement bound to that snapshot identity; hash agreement is attribution,
+not a sandbox for untrusted source.
+
 Exclude:
 
 - all Git metadata;
@@ -155,10 +181,14 @@ Exclude:
 - Nix store/cache data;
 - editor, Python, and tooling caches.
 
-If rsync deletion is used, its root is the dedicated disposable source
-directory. Never apply deletion to a parent directory, model directory, run
-directory, or arbitrary configurable path. Validate and reject unsafe roots
-before invocation.
+Remote deletion requires more than lexical path validation. The target must
+prove that the configured path is a non-symlink, target-user-owned directory
+carrying this workspace's versioned ownership marker. An absent root may be
+initialized only while empty; an existing non-empty unmarked root is never
+adopted. Canonical work, run, model, and drafter locations must not overlap.
+Every destructive invocation revalidates the marker and directory identity,
+holds the per-target operation lock, and confines deletion to that exact
+disposable source root.
 
 ### 4. Native target build
 
@@ -173,6 +203,11 @@ Implement target build operations that:
 V1 does not cross-compile on the controller. It does not replace the engine's
 Makefile or package CUDA through Nix.
 
+Sync and build are serialized with lifecycle transitions and refuse to mutate
+the source or binary while a validated server is running. Build and serve use
+the controller-supplied, isolated helper rather than importing orchestration
+code from the synchronized worktree.
+
 ### 5. Deterministic server lifecycle
 
 Add serve, status, log, and stop operations with explicit lifecycle state:
@@ -186,9 +221,11 @@ source/build identity
 sanitized launch configuration
 ```
 
-Prefer a user-level transient service where reliably available. Otherwise use
-a minimal detached process pattern with a PID file and process-identity
-validation. Never kill a PID solely because a stale file contains its number.
+Prefer a user-level transient service where reliably available. The portable
+fallback is a versioned, one-shot supervisor in the owned run directory with
+atomic state, a preallocated run identity, process/socket ownership validation,
+and a bounded startup or smoke lease. Never kill a PID solely because a stale
+file contains its number.
 
 Requirements:
 
@@ -200,40 +237,52 @@ Requirements:
 - logs are copied back to the controller and sanitized;
 - commands are idempotent where safe and fail explicitly where not.
 
+The owned run directory provides the single operation lock. Sync and build
+refuse while the validated server is running. Status and stop validate the
+recorded start identity and live socket owner; an ambiguous identity is stale
+and is never signaled. Smoke retains target-side cleanup ownership until stop,
+including across an ambiguous SSH result or controller interruption.
+
 ### 6. Network exposure
 
-The server binds only as broadly as required for the intended trusted-LAN
-measurement. Do not expose an unauthenticated development inference endpoint to
-the public Internet.
+Phase 01 binds the unauthenticated server to IP-literal loopback. Remote
+functional smoke uses an ephemeral SSH forward owned and cleaned up by the
+controller operation. It does not accept a wildcard, hostname, public address,
+or a configuration assertion as authorization for LAN exposure.
 
-SSH forwarding may support functional debugging when direct LAN exposure is
-undesired. Official LAN benchmarks in Phase 02 use the intended direct network
-path and record only generic network provenance.
+Official LAN benchmarks in Phase 02 use the intended direct network path after
+the operator's trusted-interface and firewall prerequisites are separately
+validated, and record only generic network provenance.
 
 ### 7. Local mode
 
 Every target-facing operation introduced here has a `local` equivalent with the
 same manifest, build, lifecycle, and artifact contracts, minus SSH and transfer.
-Avoid two independent implementations: isolate transport differences and reuse
-the operation semantics.
+Local source is the authoritative controller worktree: local sync only
+generates and verifies its manifest and never copies or deletes source. Shared
+operation semantics remain common while the genuine transport boundary stays
+explicit.
 
 ### 8. Root workflow
 
-Add only implemented recipes, expected to include equivalents of:
+The implemented `python3 -m scripts.targetctl` entry point owns every target
+operation. Just recipes delegate to it: `target-doctor`, `target-sync`,
+`target-build`, `target-serve`, `target-status`, `target-logs`, `target-stop`,
+`target-smoke`, `target-cleanup`, and `target-bundle`.
 
-```text
-target-doctor [target]
-target-sync [target]
-target-build [target]
-target-serve [target]
-target-status [target]
-target-logs [target]
-target-stop [target]
-target-smoke [target]
-```
+The only operational configuration path is ignored `targets/targets.toml`; it
+must be a current-user-owned regular mode-0600 file. Local mode keeps its
+minimal schema and receives model/drafter paths only through
+`TARGETCTL_MODEL_PATH` and `TARGETCTL_DRAFTER_PATH`; no CLI option accepts a
+private path. SSH derives its loopback port from `api_base_url`; local uses the
+documented fixed loopback port 8000. State is private under `targets/.state`,
+and a complete atomic bundle is returned under `artifacts/phase-01-runs/`.
 
-Normal users should not need to remember raw SSH, rsync, process, or internal
-script commands.
+The upstream deterministic smoke command retained for target use is
+`make proof-cuda-smoke` in `engine/ds4` (with its required
+`DS4_PROOF_BASE`); integration's serving smoke is
+`spark/ds4-on-spark/scripts/smoke-test.sh --port 8000`. The controller smoke
+also checks loopback `/v1/models` and the canonical Paris completion contract.
 
 ## Explicit non-goals
 
@@ -275,6 +324,11 @@ script commands.
 - Unsafe work/run roots are rejected.
 - Logs and manifests omit addresses, usernames, credentials, and private paths.
 - A tracked-file scan finds no real target instance.
+
+The isolated test battery and focused security review must pass before the
+first destructive remote qualification run. Any later runtime correction
+invalidates affected target evidence and requires that remote chain to run
+again against the new clean candidate.
 
 ### Doctor
 
@@ -350,14 +404,14 @@ Retain:
 
 | Risk | Mitigation / rollback |
 |---|---|
-| Sync deletes unrelated target data | Dedicated validated root; refusal tests; no deletion outside it |
-| Dirty worktree cannot be reproduced | Binary-safe content manifest and target hash; qualified baselines remain clean |
-| Stale PID stops the wrong process | Validate executable/start identity before signaling |
-| SSH session death kills or strands server | Explicit detached lifecycle plus cleanup tests |
+| Sync deletes unrelated target data | Canonical marked root, operation lock, identity recheck, and refusal tests; no deletion outside it |
+| Dirty worktree executes untrusted code | Remote execution refuses dirty source by default; development opt-in is bound to the manifest and never qualifies |
+| Stale PID stops the wrong process | Atomic owned state plus process and socket ownership validation before signaling |
+| SSH session death kills or strands server | Preallocated run identity, target-side supervisor/lease, reconciliation, and interruption cleanup tests |
 | Nix changes CUDA/compiler attribution | Doctor compares paths/versions; fail qualification on drift |
-| LAN endpoint is exposed too broadly | Trusted-interface/firewall requirement; SSH forwarding for debug |
-| Logs leak paths or addresses | Structured sanitization and retained-artifact scan |
-| Local and remote modes drift | Shared operation semantics with transport-only differences |
+| LAN endpoint is exposed too broadly | Phase 01 is loopback-only and owns its temporary SSH forward |
+| Logs leak paths or addresses | Producer-side structured sanitization, bounded streaming redaction, and retained-artifact scan |
+| Local and remote modes drift | Shared operation/state contracts with an explicit no-transfer local source path |
 
 Rollback removes the Phase 01 scripts/config schema/recipes and target disposable
 work directory. It does not alter models, target system packages, or fork
